@@ -1,3 +1,5 @@
+export WANDB_PROJECT=${WANDB_PROJECT:-NonStopZO2}
+
 MODEL=${MODEL:-facebook/opt-1.3b}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
@@ -13,13 +15,68 @@ STEPS=${STEPS:-20000}
 EVAL_STEPS=${EVAL_STEPS:-4000}
 
 MODE=${MODE:-ft}
+SAVE_STEPS=${SAVE_STEPS:-20000}
+
+# 实验层级配置:
+# L0 Baseline (默认): BATCHDIFF_CKPT=-1，按 SAVE_STEPS 固定频率保存完整 checkpoint
+# L1 Batch Differential Checkpoint:
+#   BATCHDIFF_CKPT=0: Incremental (accumulate all updates from base)
+#   BATCHDIFF_CKPT=1: Pure Differential (only current step's update)
+#   BATCHDIFF_CKPT=N (N>=2): Batch Differential (new full checkpoint every N steps)
+# L2 CPU Shadow (ENABLE_SHADOW=1, 需要 BATCHDIFF_CKPT>=0): CPU 端实时维护 shadow model
+# L3 即时恢复 (INSTANT_RECOVER=1, 需要 L2+GPU_FAIL_STEP): 故障后立即恢复
+# GPU 故障注入 (GPU_FAIL_STEP=N, 旁路): 在第 N 步模拟 GPU 故障，可单独使用
+# BATCHDIFF_RESUME: 从指定的 full checkpoint 恢复，自动扫描并重放后续的 differential checkpoints
+BATCHDIFF_CKPT=${BATCHDIFF_CKPT:--1}
+ENABLE_SHADOW=${ENABLE_SHADOW:-0}
+INSTANT_RECOVER=${INSTANT_RECOVER:-0}
+GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
+BATCHDIFF_RESUME=${BATCHDIFF_RESUME:-""}
+
+TRAIN_NAME=${TRAIN_NAME:-"Test"}
+RESUME_CKPT=${RESUME_CKPT:-""}
+DO_EVAL=${DO_EVAL:-1}
+
 EXTRA_ARGS=""
+# 全局规则: 持久化阶段永远不触发 replacement，不设置 save_total_limit
+
+# Batch Differential Checkpoint
+if [ "$BATCHDIFF_CKPT" != "-1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --batchdiff_ckpt $BATCHDIFF_CKPT"
+
+    # L2: CPU Shadow (必须在 BATCHDIFF_CKPT>=0 上)
+    if [ "$ENABLE_SHADOW" == "1" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --enable_shadow"
+
+        # L3: 即时恢复 (必须在 L2+GPU故障 上)
+        if [ "$INSTANT_RECOVER" == "1" ] && [ "$GPU_FAIL_STEP" != "-1" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --instant_recover"
+        fi
+    fi
+fi
+
+# GPU 故障注入 (旁路，可单独使用或叠加在任意层级)
+if [ "$GPU_FAIL_STEP" != "-1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --gpu_fail_step $GPU_FAIL_STEP"
+fi
+
+# Batch Diff Resume (优先于 RESUME_CKPT)
+if [ -n "$BATCHDIFF_RESUME" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --batchdiff_resume $BATCHDIFF_RESUME"
+elif [ -n "$RESUME_CKPT" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --resume_from_checkpoint $RESUME_CKPT"
+fi
+
+# 跳过训练后的评估阶段
+if [ "$DO_EVAL" == "0" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --no_eval"
+fi
 if [ "$MODE" == "prefix" ]; then
     EXTRA_ARGS="--prefix_tuning --num_prefix 5 --no_reparam --prefix_init_by_real_act"
 elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
 fi
-TAG=mezo-$MODE-$STEPS-$BS-$LR-$EPS-$SEED
+TAG=mezo-$MODE-$LR-$EPS-$SEED
 
 TASK_ARGS=""
 case $TASK in
@@ -42,25 +99,43 @@ case $TASK in
         ;;
 esac
 
-echo $TAG
-echo "BS: $BS"
-echo "LR: $LR"
-echo "EPS: $EPS"
-echo "SEED: $SEED"
-echo "TRAIN/EVAL STEPS: $STEPS/$EVAL_STEPS"
-echo "MODE: $MODE"
+echo "========== Configuration =========="
+echo "TAG: $TAG"
+echo "BS: $BS, LR: $LR, EPS: $EPS, SEED: $SEED"
+echo "STEPS: $STEPS, EVAL_STEPS: $EVAL_STEPS, SAVE_STEPS: $SAVE_STEPS"
+echo "MODE: $MODE, DO_EVAL: $DO_EVAL"
+echo "--- Batch Differential Checkpoint ---"
+echo "BATCHDIFF_CKPT: $BATCHDIFF_CKPT (-1=disabled, 0=incremental, 1=pure diff, N>=2=batch diff)"
+echo "ENABLE_SHADOW: $ENABLE_SHADOW"
+echo "INSTANT_RECOVER: $INSTANT_RECOVER"
+echo "GPU_FAIL_STEP: $GPU_FAIL_STEP"
+echo "BATCHDIFF_RESUME: $BATCHDIFF_RESUME"
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
+echo "===================================="
 
-python run.py \
+python /home/users/u0001609/NonStopZO2/example/mezo_runner/run.py \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir result/$TASK-${MODEL_NAME}-$TAG --tag $TAG --train_set_seed $SEED --num_train $TRAIN --num_dev $DEV --num_eval $EVAL --logging_steps 10 \
+    --output_dir /lvs0/rccs-hpbdrt/minqiu/ZO_ckpt/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
+    --tag $TAG \
+    --train_set_seed $SEED \
+    --num_train $TRAIN \
+    --num_dev $DEV \
+    --num_eval $EVAL \
+    --logging_steps 10 \
     --max_steps $STEPS \
-    --trainer zo --load_float16 \
-    --learning_rate $LR --zo_eps $EPS --per_device_train_batch_size $BS --lr_scheduler_type "constant" \
-    --load_best_model_at_end --eval_strategy steps --save_strategy steps --save_total_limit 1 \
-    --eval_steps $EVAL_STEPS --save_steps $EVAL_STEPS \
+    --trainer zo \
+    --load_float16 \
+    --learning_rate $LR \
+    --zo_eps $EPS \
+    --per_device_train_batch_size $BS \
+    --lr_scheduler_type "constant" \
+    --eval_strategy steps \
+    --save_strategy steps \
+    --eval_steps $EVAL_STEPS \
+    --save_steps $SAVE_STEPS \
     --train_as_classification \
+    --report_to wandb \
     $EXTRA_ARGS \
     $TASK_ARGS \
     "$@"

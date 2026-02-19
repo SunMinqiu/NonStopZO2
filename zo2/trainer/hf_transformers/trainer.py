@@ -355,6 +355,54 @@ class ZOTrainer(Trainer):
             self.zo2_training_step_pre_hooks = []
             self.zo2_training_step_post_hooks = []
 
+        # ZO2 added: incremental checkpoint flag
+        self.use_incremental_checkpoint = False
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        """
+        Override to skip model saving when using incremental checkpoint.
+        ALL checkpoints (including first) skip Trainer's default model save.
+        Model saving is handled entirely by IncrementalCheckpointCallback.
+        """
+        import time as time_module
+        from .batch_differential_checkpoint import BatchDiffCheckpointCallback
+
+        # Check if batch differential checkpoint callback is registered
+        batchdiff_callback = None
+        for callback in self.callback_handler.callbacks:
+            if isinstance(callback, BatchDiffCheckpointCallback):
+                batchdiff_callback = callback
+                self.use_incremental_checkpoint = True
+                break
+
+        if self.use_incremental_checkpoint and batchdiff_callback is not None:
+            # Skip Trainer's default model save for ALL checkpoints (including first)
+            # Model saving is handled entirely by BatchDiffCheckpointCallback
+            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+            run_dir = self._get_output_dir(trial=trial)
+            output_dir = os.path.join(run_dir, checkpoint_folder)
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            # Save trainer state only (no model!)
+            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+
+            # Call on_save callbacks - BatchDiffCheckpointCallback handles model saving
+            t_start = time_module.time()
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            t_elapsed = time_module.time() - t_start
+
+            # Determine checkpoint type based on callback's internal logic
+            is_full = batchdiff_callback._should_save_full_checkpoint(self.state.global_step) or batchdiff_callback.save_count <= 1
+            checkpoint_type = "Full" if is_full else "Differential"
+            logger.info(f"[ZOTrainer] {checkpoint_type} checkpoint at step {self.state.global_step}, callback took {t_elapsed:.3f}s")
+            return
+
+        # Default behavior: save full checkpoint (when NOT using incremental checkpoint)
+        t_start = time_module.time()
+        super()._save_checkpoint(model, trial, metrics)
+        t_elapsed = time_module.time() - t_start
+        logger.info(f"[Checkpoint Timing] Full checkpoint (Trainer._save_checkpoint) took {t_elapsed:.3f}s at step {self.state.global_step}")
 
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None

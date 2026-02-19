@@ -648,6 +648,7 @@ class OptimizerQwen3ForCausalLM(MeZO2SGD):
                         inputs1=([self.model], {"input_ids": input_ids, "logits": logits, "labels": labels}),
                         inputs2=None)
         
+        loss = None
         if labels is not None:
             # loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
             if self.model.zo_custom_eval_loss_fn:

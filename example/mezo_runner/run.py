@@ -34,6 +34,7 @@ from utils import *
 import random
 
 from zo2.trainer.hf_transformers.trainer import ZOTrainer
+from zo2.trainer.hf_transformers.batch_differential_checkpoint import BatchDiffCheckpointCallback, resume_from_batch_diff
 from zo2 import zo_hf_init, ZOConfig
 
 @dataclass
@@ -114,6 +115,23 @@ class OurArguments(TrainingArguments):
 
     # Auto saving when interrupted
     save_on_interrupt: bool = False # save model when interrupted (useful for long training)
+
+    # Batch Differential Checkpoint (实验层级配置)
+    # BATCHDIFF_CKPT: batch differential checkpoint mode
+    #   -1: Disabled (L0 baseline, uses default Trainer checkpoint)
+    #   0: Every step accumulative (incremental, all updates from base)
+    #   1: Pure differential (only current step's update)
+    #   >=2: Batch differential (every N steps, clear history and save new full checkpoint)
+    batchdiff_ckpt: int = -1  # batch differential checkpoint mode
+    # L2: CPU Shadow (需要 batchdiff_ckpt >= 0)
+    enable_shadow: bool = False  # enable real-time shadow model on CPU
+    # L3: 即时恢复 (需要 batchdiff_ckpt >= 0 + enable_shadow + gpu_fail_step)
+    instant_recover: bool = False  # instantly recover from shadow model when GPU failure occurs
+    # GPU 故障注入 (旁路，可单独使用)
+    gpu_fail_step: int = -1  # simulate GPU failure at this step (-1 = disabled)
+    # Batch Diff Resume: specify the full checkpoint path to resume from
+    # Will automatically scan parent directory for checkpoints and replay them
+    batchdiff_resume: str = ""  # path to base full checkpoint for resuming
 
     # ZO2 added -> ZO2 configs
     zo_method: str = "mezo-sgd"
@@ -486,11 +504,90 @@ class Framework:
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
+        # GPU 故障注入 (旁路，可单独使用或叠加在任意层级)
+        gpu_fail_step = self.args.gpu_fail_step
+
+        if self.args.batchdiff_ckpt >= 0:
+            # Batch Differential Checkpoint enabled
+            batchdiff_callback = BatchDiffCheckpointCallback(
+                batch_size=self.args.batchdiff_ckpt,
+                enable_shadow=self.args.enable_shadow,  # L2: CPU Shadow
+                instant_recover=self.args.instant_recover  # L3: 即时恢复
+            )
+
+            # 打印层级配置
+            if self.args.batchdiff_ckpt == 0:
+                mode_desc = "Incremental (accumulate all)"
+            elif self.args.batchdiff_ckpt == 1:
+                mode_desc = "Pure Differential (current step only)"
+            else:
+                mode_desc = f"Batch Differential (every {self.args.batchdiff_ckpt} steps)"
+
+            level = f"L1 ({mode_desc})"
+            if self.args.enable_shadow:
+                level = f"L2 (CPU Shadow) + {mode_desc}"
+                if self.args.instant_recover and gpu_fail_step > 0:
+                    level = f"L3 (Instant Recovery) + {mode_desc}"
+            logger.info(f"[BatchDiff] Experiment level: {level}")
+
+            trainer.add_callback(batchdiff_callback)
+            # 这里是注册一个 post hook，用于在每次 ZO（Zero-Order）训练步完成后，记录本次参数更新的相关信息
+            if hasattr(trainer, 'zo') and trainer.zo:
+                trainer.register_zo2_training_step_post_hook(batchdiff_callback._zo_update_hook)
+                batchdiff_callback.trainer = trainer
+                batchdiff_callback._hook_registered = True
+
+            # 设置 GPU 故障注入
+            if gpu_fail_step > 0:
+                batchdiff_callback.failure_simulator.set_fail_step(gpu_fail_step)
+                logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step}")
+        else:
+            # L0: Baseline (batchdiff_ckpt=-1)，也可以单独使用 GPU 故障注入
+            logger.info("[BatchDiff] Disabled (L0 baseline), using default Trainer checkpoint")
+            if gpu_fail_step > 0:
+                logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step} (L0 baseline, no recovery)")
+
         # Resume training from a last checkpoint
         last_checkpoint = None
         from transformers.trainer_utils import get_last_checkpoint
-        if os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
+
+        # Handle batch differential resume
+        if self.args.batchdiff_resume:
+            logger.info(f"[BatchDiff Resume] Resuming from batch differential checkpoint: {self.args.batchdiff_resume}")
+            t_resume_start = time.time()
+
+            # Use resume_from_batch_diff to reconstruct the model
+            recovered_state = resume_from_batch_diff(
+                base_checkpoint_path=self.args.batchdiff_resume,
+                output_dir=self.args.output_dir
+            )
+
+            # Load recovered state into model
+            self.model.load_state_dict(recovered_state)
+            t_resume = time.time() - t_resume_start
+            logger.info(f"[BatchDiff Resume] Model recovered in {t_resume:.3f}s")
+
+            # Find the last checkpoint step to continue from
+            import re
+            import glob as glob_module
+            checkpoint_pattern = os.path.join(self.args.output_dir, "checkpoint-*")
+            all_checkpoints = glob_module.glob(checkpoint_pattern)
+            max_step = 0
+            last_ckpt = None
+            for ckpt_dir in all_checkpoints:
+                match = re.search(r'checkpoint-(\d+)', ckpt_dir)
+                if match:
+                    step = int(match.group(1))
+                    if step > max_step:
+                        max_step = step
+                        last_ckpt = ckpt_dir
+
+            if last_ckpt:
+                last_checkpoint = last_ckpt
+                logger.info(f"[BatchDiff Resume] Will continue from step {max_step}")
+        elif os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
             last_checkpoint = get_last_checkpoint(self.args.output_dir)
+
         if last_checkpoint is not None and self.args.resume_from_checkpoint is None:
             logger.info(
                 f"Checkpoint detected, resuming training at {last_checkpoint}. To avoid this behavior, change "
