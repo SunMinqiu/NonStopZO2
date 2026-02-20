@@ -39,6 +39,8 @@ zo2/optimizer/mezo_sgd/utils/com.py
 zo2/optimizer/mezo_sgd/utils/comm.py
 zo2/trainer/__init__.py
 zo2/trainer/hf_transformers/__init__.py
+zo2/trainer/hf_transformers/batch_differential_checkpoint.py
+zo2/trainer/hf_transformers/incremental_checkpoint.py
 zo2/trainer/hf_transformers/trainer.py
 zo2/trainer/hf_trl/__init__.py
 zo2/trainer/hf_trl/sft_trainer.py

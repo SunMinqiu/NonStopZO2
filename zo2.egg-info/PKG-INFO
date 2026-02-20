@@ -1,4 +1,4 @@
-Metadata-Version: 2.4
+Metadata-Version: 2.1
 Name: zo2
 Version: 0.1.1
 Summary: ZO2 (Zeroth-Order Offloading), a framework for full parameter fine-tuning 175B LLMs with 18GB GPU memory
@@ -60,15 +60,6 @@ Requires-Dist: yarl==1.9.4
 Requires-Dist: nvidia-ml-py==12.570.86
 Requires-Dist: trl==0.17.0
 Requires-Dist: safetensors==0.5.2
-Dynamic: author
-Dynamic: author-email
-Dynamic: classifier
-Dynamic: description
-Dynamic: description-content-type
-Dynamic: license-file
-Dynamic: requires-dist
-Dynamic: requires-python
-Dynamic: summary
 
 # ZO2 (Zeroth-Order Offloading): Full Parameter Fine-Tuning 175B LLMs with 18GB GPU Memory
 
