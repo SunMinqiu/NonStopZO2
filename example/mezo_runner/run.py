@@ -5,6 +5,15 @@
 Modified from https://github.com/princeton-nlp/MeZO/blob/main/large_models/run.py
 """
 
+import os
+# GPU 选择: 只使用 GPU 0 (在导入 torch 之前设置)
+# 注意: 这个脚本通常通过 mezo.sh 调用,GPU 选择已在 shell 脚本中设置
+# 如果直接运行此脚本,可以通过环境变量覆盖: GPU_ID=1 python run.py
+if "CUDA_VISIBLE_DEVICES" not in os.environ:
+    gpu_id = os.environ.get("GPU_ID", "0")
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+    print(f"[run.py] Using GPU: {gpu_id}")
+
 import sys
 sys.path.append("../../../zo2")
 
@@ -132,6 +141,7 @@ class OurArguments(TrainingArguments):
     # Batch Diff Resume: specify the full checkpoint path to resume from
     # Will automatically scan parent directory for checkpoints and replay them
     batchdiff_resume: str = ""  # path to base full checkpoint for resuming
+    batchdiff_replay_device: str = "cpu"  # device for replay computation: 'cpu' or 'cuda'
 
     # ZO2 added -> ZO2 configs
     zo_method: str = "mezo-sgd"
@@ -558,8 +568,10 @@ class Framework:
 
             # Use resume_from_batch_diff to reconstruct the model
             recovered_state = resume_from_batch_diff(
-                base_checkpoint_path=self.args.batchdiff_resume,
-                output_dir=self.args.output_dir
+                checkpoint_path=self.args.batchdiff_resume,
+                output_dir=self.args.output_dir,
+                pretrained_model_name=self.args.model_name,
+                device=self.args.batchdiff_replay_device
             )
 
             # Load recovered state into model
@@ -567,24 +579,13 @@ class Framework:
             t_resume = time.time() - t_resume_start
             logger.info(f"[BatchDiff Resume] Model recovered in {t_resume:.3f}s")
 
-            # Find the last checkpoint step to continue from
+            # Use the batchdiff checkpoint itself to resume trainer state (global_step, scheduler, etc.)
+            # Model weights are already loaded above, so _load_from_checkpoint will be skipped by ZOTrainer.
+            last_checkpoint = self.args.batchdiff_resume
             import re
-            import glob as glob_module
-            checkpoint_pattern = os.path.join(self.args.output_dir, "checkpoint-*")
-            all_checkpoints = glob_module.glob(checkpoint_pattern)
-            max_step = 0
-            last_ckpt = None
-            for ckpt_dir in all_checkpoints:
-                match = re.search(r'checkpoint-(\d+)', ckpt_dir)
-                if match:
-                    step = int(match.group(1))
-                    if step > max_step:
-                        max_step = step
-                        last_ckpt = ckpt_dir
-
-            if last_ckpt:
-                last_checkpoint = last_ckpt
-                logger.info(f"[BatchDiff Resume] Will continue from step {max_step}")
+            match = re.search(r'checkpoint-(\d+)', last_checkpoint)
+            resumed_step = int(match.group(1)) if match else 0
+            logger.info(f"[BatchDiff Resume] Will continue training from step {resumed_step}")
         elif os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
             last_checkpoint = get_last_checkpoint(self.args.output_dir)
 

@@ -81,7 +81,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
     - L3 Instant Recovery (instant_recover=True): Recover from shadow on GPU failure
     """
 
-    def __init__(self, batch_size=0, enable_shadow=True, instant_recover=False):
+    def __init__(self, batch_size=0, enable_shadow=True, instant_recover=False, save_full_model=False):
         """
         Args:
             batch_size: Checkpoint mode
@@ -91,10 +91,13 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 >=2: Batch differential (new full checkpoint every N steps)
             enable_shadow: L2 - Enable real-time shadow model on CPU
             instant_recover: L3 - Instantly recover from shadow on GPU failure
+            save_full_model: For batch_size >= 2, whether to save physical full model at periodic checkpoints
+                           (calls Trainer._save_checkpoint to save standard checkpoint)
         """
         self.batch_size = batch_size
         self.enable_shadow = enable_shadow
         self.instant_recover = instant_recover
+        self.save_full_model = save_full_model
 
         # Base checkpoint state (CPU)
         self.base_checkpoint_state: OrderedDict = None
@@ -123,6 +126,9 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         # Trainer reference
         self.trainer = None
         self._hook_registered = False
+
+        # Flag to prevent recursion when calling Trainer._save_checkpoint
+        self._saving_full_via_trainer = False
 
         # GPU failure simulator
         self.failure_simulator = GPUFailureSimulator()
@@ -174,7 +180,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             return f"Batch Differential (every {self.batch_size} steps)"
 
     def _cache_initial_model(self, model):
-        """Cache initial model to CPU memory"""
+        """Cache initial model to CPU memory (no disk save for pure differential mode)"""
         logger.info("[BatchDiff] Caching initial model to CPU memory...")
         t_start = time.time()
 
@@ -192,9 +198,13 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             self.shadow_step = 0
 
         self.base_checkpoint_step = 0
+        # For differential modes (batch_size >= 0), we don't save initial model to disk
+        # Recovery will use the original pretrained model + replay updates
+        self.base_checkpoint_path = "__initial__"  # Special marker for initial state
+
         mem_mb = self._get_memory_size()
         t_elapsed = time.time() - t_start
-        logger.info(f"[BatchDiff] Initial model cached ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
+        logger.info(f"[BatchDiff] Initial model cached ({mem_mb:.1f} MB) in {t_elapsed:.3f}s (no disk save)")
         self._log_memory_status()
 
     def _start_shadow_thread(self):
@@ -281,15 +291,17 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             lr = getattr(opt, 'lr', 0)
             wd = getattr(opt, 'weight_decay', 0)
 
-            update = {
-                'step': self.current_step,
-                'seed': int(seed) if seed is not None else 0,
-                'grad': float(grad) if not isinstance(grad, float) else grad,
-                'lr': float(lr),
-                'wd': float(wd)
-            }
-
             with self.update_lock:
+                # Use current_step + 1 since this hook is called BEFORE global_step is incremented
+                # This ensures update step matches the checkpoint step it belongs to
+                actual_step = self.current_step + 1
+                update = {
+                    'step': actual_step,
+                    'seed': int(seed) if seed is not None else 0,
+                    'grad': float(grad) if not isinstance(grad, float) else grad,
+                    'lr': float(lr),
+                    'wd': float(wd)
+                }
                 self.update_history.append(update)
 
         return model, inputs, loss
@@ -486,6 +498,11 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         if model is None:
             return
 
+        # Skip if we're being called recursively from Trainer._save_checkpoint
+        if self._saving_full_via_trainer:
+            logger.info(f"[BatchDiff] Skipping on_save (called from Trainer._save_checkpoint)")
+            return
+
         self.save_count += 1
         checkpoint_dir = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
 
@@ -502,7 +519,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             checkpoint_type = "Differential"
 
         t_elapsed = time.time() - t_start
-        logger.info(f"[Checkpoint Timing] {checkpoint_type} checkpoint save took {t_elapsed:.3f}s at step {state.global_step}")
+        logger.info(f"[Checkpoint Timing] {checkpoint_type} checkpoint save took {t_elapsed:.4f}s at step {state.global_step}")
 
         self.timing_stats['checkpoint_saves'].append({
             'type': checkpoint_type.lower(),
@@ -512,17 +529,14 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 
     def _should_save_full_checkpoint(self, step: int) -> bool:
         """Determine if we should save a full checkpoint"""
-        if self.is_first_save:
-            return True
-
         if self.batch_size == -1:
             # Disabled mode - always full (but this callback shouldn't be used)
             return True
         elif self.batch_size == 0:
-            # Incremental mode - only first is full
+            # Incremental mode - NEVER save full (initial model already cached)
             return False
         elif self.batch_size == 1:
-            # Pure differential - only first is full
+            # Pure differential - NEVER save full (initial model already cached)
             return False
         else:
             # Batch differential - full checkpoint every batch_size steps since last full
@@ -530,7 +544,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             return steps_since_base >= self.batch_size
 
     def _save_full_checkpoint(self, model, checkpoint_dir, step):
-        """Save full checkpoint (including writing to disk)"""
+        """Save full checkpoint (update base state and optionally call Trainer._save_checkpoint)"""
         logger.info(f"[BatchDiff] Saving full checkpoint at step {step}")
 
         t_start = time.time()
@@ -559,22 +573,30 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                     self.shadow_model[key] = value.clone()
                 self.shadow_step = len(self.update_history)  # Shadow is now caught up
 
-        # Step 4: Save to disk
-        t_disk_start = time.time()
-        model_path = os.path.join(checkpoint_dir, "model.safetensors")
-        try:
-            from safetensors.torch import save_file
-            cpu_state_dict = {k: v.cpu() for k, v in state_dict.items()}
-            save_file(cpu_state_dict, model_path)
-            logger.info(f"[Checkpoint Timing] Saved model using safetensors")
-        except ImportError:
-            model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
-            torch.save(state_dict, model_path)
-            logger.info(f"[Checkpoint Timing] Saved model using torch.save")
-        t_disk = time.time() - t_disk_start
+        # Step 4: Conditionally save to disk via Trainer (only if save_full_model=True)
+        t_disk = 0.0
+        if self.save_full_model and self.trainer is not None:
+            logger.info(f"[BatchDiff] Calling Trainer._save_checkpoint to save full model...")
+            t_disk_start = time.time()
 
-        model_size_mb = os.path.getsize(model_path) / (1024 * 1024)
-        logger.info(f"[Checkpoint Timing] Write to disk took {t_disk:.3f}s ({model_size_mb:.1f} MB)")
+            # Set flag to prevent recursion
+            self._saving_full_via_trainer = True
+
+            # Call original Trainer._save_checkpoint (which will skip our on_save hook)
+            # This saves model, optimizer, scheduler, trainer_state, etc.
+            from transformers import Trainer
+            Trainer._save_checkpoint(self.trainer, model, trial=None, metrics=None)
+
+            # Reset flag
+            self._saving_full_via_trainer = False
+
+            t_disk = time.time() - t_disk_start
+            logger.info(f"[Checkpoint Timing] Trainer._save_checkpoint took {t_disk:.3f}s")
+        else:
+            if not self.save_full_model:
+                logger.info(f"[Checkpoint Timing] Skipped writing full model to disk (save_full_model=False)")
+            else:
+                logger.warning(f"[Checkpoint Timing] Trainer not available, cannot save full model")
 
         self.base_checkpoint_path = checkpoint_dir
         self.base_checkpoint_step = step
@@ -591,16 +613,24 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         t_total = time.time() - t_start
         logger.info(f"[BatchDiff] Full checkpoint cached ({mem_mb:.1f} MB)")
         logger.info(f"[Checkpoint Timing] Full checkpoint total: state_dict={t_state_dict:.3f}s, "
-                   f"copy_to_cpu={t_copy:.3f}s, write_to_disk={t_disk:.3f}s, total={t_total:.3f}s")
+                   f"copy_to_cpu={t_copy:.3f}s, trainer_save={t_disk:.3f}s, total={t_total:.3f}s")
 
-        # Save metadata
-        metadata = {
+        # Save metadata in JSON format (merged with history format)
+        # For full checkpoint, we save an empty updates array
+        history = {
             "is_batch_diff": True,
             "is_full_checkpoint": True,
-            "step": step,
+            "base_checkpoint": checkpoint_dir,  # This checkpoint is now the base
+            "base_step": step,
+            "current_step": step,
             "batch_size": self.batch_size,
+            "save_full_model": self.save_full_model,
+            "num_updates": 0,
+            "updates": []
         }
-        torch.save(metadata, os.path.join(checkpoint_dir, "batch_diff_meta.pt"))
+        history_path = os.path.join(checkpoint_dir, "zo_replay_history.json")
+        with open(history_path, 'w') as f:
+            json.dump(history, f, indent=2)
 
     def _save_diff_checkpoint(self, checkpoint_dir, step):
         """Save differential checkpoint"""
@@ -616,17 +646,21 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         with self.update_lock:
             if self.batch_size == 1:
                 # Pure differential: only save the updates since last checkpoint
-                # For pure diff, we save only updates from last_saved_step to current step
+                # update['step'] now correctly matches the checkpoint step (1-indexed)
                 updates_to_save = [u for u in self.update_history if u['step'] > self.last_saved_step]
             else:
                 # Incremental (batch_size=0): save all updates from base
                 updates_to_save = self.update_history.copy()
 
             history = {
+                'is_batch_diff': True,
+                'is_full_checkpoint': False,
                 'base_checkpoint': self.base_checkpoint_path,
                 'base_step': self.base_checkpoint_step,
                 'current_step': step,
                 'batch_size': self.batch_size,
+                'save_full_model': self.save_full_model,
+                'num_updates': len(updates_to_save),
                 'updates': updates_to_save
             }
         t_copy = time.time() - t_copy_start
@@ -634,24 +668,12 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         t_json_start = time.time()
         history_path = os.path.join(checkpoint_dir, "zo_replay_history.json")
         with open(history_path, 'w') as f:
-            json.dump(history, f)
+            json.dump(history, f, indent=2)
         t_json = time.time() - t_json_start
 
         history_size = os.path.getsize(history_path) / 1024
         logger.info(f"[BatchDiff] Saved {len(history['updates'])} updates ({history_size:.1f} KB)")
         logger.info(f"[Checkpoint Timing] History copy took {t_copy:.3f}s, JSON write took {t_json:.3f}s")
-
-        t_meta_start = time.time()
-        metadata = {
-            "base_checkpoint": self.base_checkpoint_path,
-            "step": step,
-            "is_batch_diff": True,
-            "is_full_checkpoint": False,
-            "batch_size": self.batch_size,
-            "num_updates": len(history['updates']),
-        }
-        torch.save(metadata, os.path.join(checkpoint_dir, "batch_diff_meta.pt"))
-        t_meta = time.time() - t_meta_start
 
         # Delete large files that may have been created by Trainer
         t_delete_start = time.time()
@@ -667,7 +689,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 
         t_total = time.time() - t_start
         logger.info(f"[Checkpoint Timing] Differential checkpoint internal: mkdir={t_mkdir:.3f}s, copy={t_copy:.3f}s, "
-                   f"json={t_json:.3f}s, meta={t_meta:.3f}s, delete={t_delete:.3f}s, total={t_total:.3f}s")
+                   f"json={t_json:.3f}s, delete={t_delete:.3f}s, total={t_total:.3f}s")
 
     def _get_memory_size(self):
         if self.base_checkpoint_state is None:
@@ -726,18 +748,69 @@ ZOReplayCheckpointCallback = BatchDiffCheckpointCallback
 IncrementalCheckpointCallback = BatchDiffCheckpointCallback
 
 
-def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None):
-    """Load batch differential checkpoint"""
+def _replay_updates_on_state(state: OrderedDict, updates: list, device: str = 'cpu', move_to_device: bool = True) -> OrderedDict:
+    """
+    Replay ZO updates on a state dict.
+
+    Args:
+        state: The state dict to modify (will be modified in-place)
+        updates: List of update dicts with keys: seed, grad, lr, wd
+        device: Device to perform computation on ('cpu' or 'cuda')
+        move_to_device: If True and device='cuda', move state to GPU before replay.
+                        If False, assume state is already on the correct device.
+
+    Returns:
+        The modified state dict (stays on the device where computation was done)
+    """
+    if not updates:
+        return state
+
+    # Move to target device if needed
+    if move_to_device and device == 'cuda' and torch.cuda.is_available():
+        for key in state:
+            if state[key].device.type != 'cuda':
+                state[key] = state[key].cuda()
+
+    for update in updates:
+        seed = update['seed']
+        grad = update['grad']
+        lr = update['lr']
+        wd = update.get('wd', 0.0)
+
+        torch.manual_seed(seed)
+        for name, param in state.items():
+            z = torch.normal(mean=0, std=1, size=param.size(), dtype=param.dtype, device=param.device)
+            if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
+                param.sub_(lr * (grad * z + wd * param))
+            else:
+                param.sub_(lr * grad * z)
+
+    # Don't move back to CPU - keep on GPU for training
+    return state
+
+
+def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None, device='cpu'):
+    """
+    Load batch differential checkpoint.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory
+        base_checkpoint_dir: Optional. Path to base model (required for "__initial__" mode)
+        device: Device for replay computation ('cpu' or 'cuda'). Default 'cpu'.
+
+    Returns:
+        Reconstructed state_dict (on CPU)
+    """
     # Check for full model first
     full_model_path = os.path.join(checkpoint_dir, "pytorch_model_full.bin")
     if os.path.exists(full_model_path):
         return torch.load(full_model_path, map_location='cpu', weights_only=True)
 
-    meta_path = os.path.join(checkpoint_dir, "batch_diff_meta.pt")
     history_path = os.path.join(checkpoint_dir, "zo_replay_history.json")
 
-    # Check if this is a regular checkpoint (not batch diff)
-    if not os.path.exists(meta_path):
+    # Check if this is a batch diff checkpoint (has zo_replay_history.json)
+    if not os.path.exists(history_path):
+        # Not a batch diff checkpoint, try loading as regular checkpoint
         model_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
         if os.path.exists(model_path):
             return torch.load(model_path, map_location='cpu', weights_only=True)
@@ -747,11 +820,12 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None):
             return load_file(safe_path)
         return None
 
-    # Load metadata
-    metadata = torch.load(meta_path, map_location='cpu', weights_only=True)
+    # Load metadata from JSON
+    with open(history_path, 'r') as f:
+        history = json.load(f)
 
     # If this is a full checkpoint, load directly
-    if metadata.get('is_full_checkpoint', False):
+    if history.get('is_full_checkpoint', False):
         safe_path = os.path.join(checkpoint_dir, "model.safetensors")
         if os.path.exists(safe_path):
             from safetensors.torch import load_file
@@ -760,11 +834,27 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None):
         if os.path.exists(model_path):
             return torch.load(model_path, map_location='cpu', weights_only=True)
 
-    # Load differential checkpoint
-    with open(history_path, 'r') as f:
-        history = json.load(f)
+        # If save_full_model=False, there's no physical model file
+        # This is expected for full checkpoints that only update base state
+        logger.warning(f"Full checkpoint at {checkpoint_dir} has no model file (save_full_model=False)")
+        return None
 
-    base_dir = base_checkpoint_dir or history["base_checkpoint"]
+    # Load differential checkpoint - history already loaded above
+
+    base_checkpoint_ref = history.get("base_checkpoint")
+
+    # If base_checkpoint is "__initial__", user must provide the pretrained model path
+    if base_checkpoint_ref == "__initial__":
+        if base_checkpoint_dir is None:
+            raise ValueError(
+                "This checkpoint uses differential mode from initial model. "
+                "You must provide base_checkpoint_dir (path to original pretrained model) to load it. "
+                "Example: load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir='Qwen/Qwen2.5-1.5B')"
+            )
+        base_dir = base_checkpoint_dir
+    else:
+        base_dir = base_checkpoint_dir or base_checkpoint_ref
+
     base_path = os.path.join(base_dir, "model.safetensors")
 
     if os.path.exists(base_path):
@@ -775,162 +865,302 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None):
         if os.path.exists(base_path):
             base_state = torch.load(base_path, map_location='cpu', weights_only=True)
         else:
-            raise FileNotFoundError(f"Cannot find base checkpoint at {base_dir}")
+            # Try loading from HuggingFace model hub
+            try:
+                from transformers import AutoModelForCausalLM
+                logger.info(f"Trying to load base model from HuggingFace: {base_dir}")
+                base_model = AutoModelForCausalLM.from_pretrained(base_dir)
+                base_state = base_model.state_dict()
+                del base_model
+            except Exception as e:
+                raise FileNotFoundError(
+                    f"Cannot find base checkpoint at {base_dir}. "
+                    f"Tried local files and HuggingFace hub. Error: {e}"
+                )
 
-    logger.info(f"Replaying {len(history['updates'])} ZO updates...")
+    updates = history.get('updates', [])
+    logger.info(f"Replaying {len(updates)} ZO updates on {device}...")
 
     reconstructed = OrderedDict()
     for key, value in base_state.items():
         reconstructed[key] = value.clone()
+    del base_state
 
-    for update in history['updates']:
-        seed = update['seed']
-        grad = update['grad']
-        lr = update['lr']
-        wd = update.get('wd', 0.0)
-
-        torch.manual_seed(seed)
-        for name, param in reconstructed.items():
-            if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
-                z = torch.normal(mean=0, std=1, size=param.size(), dtype=param.dtype)
-                param.sub_(lr * (grad * z + wd * param))
-            else:
-                z = torch.normal(mean=0, std=1, size=param.size(), dtype=param.dtype)
-                param.sub_(lr * grad * z)
+    # Use the shared replay function with device support
+    _replay_updates_on_state(reconstructed, updates, device=device)
 
     return reconstructed
 
 
-def resume_from_batch_diff(base_checkpoint_path: str, output_dir: str = None) -> OrderedDict:
+def resume_from_batch_diff(
+    checkpoint_path: str,
+    output_dir: str = None,
+    pretrained_model_name: str = None,
+    device: str = 'cpu'
+) -> OrderedDict:
     """
     Resume from batch differential checkpoints.
 
     Args:
-        base_checkpoint_path: Path to the full checkpoint to use as base
-        output_dir: Optional. Directory containing checkpoints. If None, uses parent of base_checkpoint_path
+        checkpoint_path: Path to the checkpoint to resume from (will find latest if directory given)
+        output_dir: Optional. Directory containing checkpoints. If None, uses parent of checkpoint_path
+        pretrained_model_name: Optional. Name of pretrained model for differential mode (e.g., "Qwen/Qwen2.5-1.5B")
+                               Required if checkpoints use "__initial__" as base
+        device: Device for replay computation ('cpu' or 'cuda'). Default 'cpu'.
+                Use 'cuda' for faster replay if GPU memory is available.
 
     Returns:
-        Reconstructed state_dict at the latest checkpoint
+        Reconstructed state_dict at the checkpoint (on CPU)
 
-    This function:
-    1. Loads the base checkpoint
-    2. Scans the parent directory for all checkpoints with step > base_step
-    3. Replays all differential checkpoints in order
+    Replay strategies based on batch_size:
+    - batch_size=0 (Incremental): Each checkpoint contains ALL updates from base.
+                                  Just load the latest checkpoint and replay its updates.
+    - batch_size=1 (Pure Differential): Each checkpoint only contains updates since last checkpoint.
+                                        Must traverse ALL checkpoints from base to target.
+    - batch_size>=2 (Batch Differential): Similar to incremental within each batch.
     """
     t_start = time.time()
 
-    # Extract step from base checkpoint path
-    base_dir = os.path.dirname(base_checkpoint_path) if os.path.isfile(base_checkpoint_path) else base_checkpoint_path
+    # Determine checkpoint directory
+    ckpt_dir = os.path.dirname(checkpoint_path) if os.path.isfile(checkpoint_path) else checkpoint_path
 
     # Get the output directory (parent of checkpoint directories)
     if output_dir is None:
-        output_dir = os.path.dirname(base_dir)
+        output_dir = os.path.dirname(ckpt_dir)
 
-    # Extract step number from base checkpoint
-    match = re.search(r'checkpoint-(\d+)', base_dir)
+    # Extract step number from checkpoint
+    match = re.search(r'checkpoint-(\d+)', ckpt_dir)
     if not match:
-        raise ValueError(f"Cannot extract step from checkpoint path: {base_dir}")
-    base_step = int(match.group(1))
+        raise ValueError(f"Cannot extract step from checkpoint path: {ckpt_dir}")
+    target_step = int(match.group(1))
 
-    logger.info(f"[Resume] Base checkpoint: {base_dir} (step {base_step})")
+    logger.info(f"[Resume] Target checkpoint: {ckpt_dir} (step {target_step})")
+    logger.info(f"[Resume] Replay device: {device}")
 
-    # Load base checkpoint
-    t_load_base_start = time.time()
-    base_state = load_batch_diff_checkpoint(base_dir)
-    if base_state is None:
-        raise FileNotFoundError(f"Cannot load base checkpoint from {base_dir}")
-    t_load_base = time.time() - t_load_base_start
-    logger.info(f"[Resume] Loaded base checkpoint in {t_load_base:.3f}s")
+    # Load the target checkpoint's history to determine batch_size mode
+    history_path = os.path.join(ckpt_dir, "zo_replay_history.json")
+    if not os.path.exists(history_path):
+        # Not a batch diff checkpoint, try loading directly
+        logger.info(f"[Resume] No zo_replay_history.json found, loading as regular checkpoint")
+        return load_batch_diff_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
 
-    # Find all checkpoint directories
-    checkpoint_pattern = os.path.join(output_dir, "checkpoint-*")
-    all_checkpoints = glob.glob(checkpoint_pattern)
+    with open(history_path, 'r') as f:
+        target_history = json.load(f)
 
-    # Extract step numbers and sort
-    checkpoint_steps = []
-    for ckpt_dir in all_checkpoints:
-        match = re.search(r'checkpoint-(\d+)', ckpt_dir)
-        if match:
-            step = int(match.group(1))
-            if step > base_step:
-                checkpoint_steps.append((step, ckpt_dir))
+    batch_size = target_history.get('batch_size', 0)
+    base_checkpoint_ref = target_history.get('base_checkpoint')
 
-    checkpoint_steps.sort(key=lambda x: x[0])
+    logger.info(f"[Resume] Checkpoint mode: batch_size={batch_size}, base_checkpoint={base_checkpoint_ref}")
 
-    if not checkpoint_steps:
-        logger.info(f"[Resume] No checkpoints found after step {base_step}")
-        return base_state
+    # ========== INCREMENTAL MODE (batch_size=0) ==========
+    # Each checkpoint has ALL updates from base, just load this one checkpoint
+    if batch_size == 0:
+        logger.info(f"[Resume] Incremental mode: loading single checkpoint with all updates")
 
-    logger.info(f"[Resume] Found {len(checkpoint_steps)} checkpoints to replay after step {base_step}")
+        # Load base model
+        t_load_base_start = time.time()
+        if base_checkpoint_ref == "__initial__":
+            if pretrained_model_name is None:
+                raise ValueError(
+                    "This checkpoint uses differential mode from initial model. "
+                    "You must provide pretrained_model_name to load it."
+                )
+            # Load from HuggingFace
+            try:
+                from transformers import AutoModelForCausalLM
+                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name}")
+                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
+                base_state = base_model.state_dict()
+                del base_model
+            except Exception as e:
+                raise FileNotFoundError(f"Cannot load pretrained model {pretrained_model_name}: {e}")
+        else:
+            base_state = load_batch_diff_checkpoint(base_checkpoint_ref, base_checkpoint_dir=pretrained_model_name)
+            if base_state is None:
+                raise FileNotFoundError(f"Cannot load base checkpoint from {base_checkpoint_ref}")
 
-    # Copy base state for modification
-    reconstructed = OrderedDict()
-    for key, value in base_state.items():
-        reconstructed[key] = value.clone()
+        t_load_base = time.time() - t_load_base_start
+        logger.info(f"[Resume] Loaded base model in {t_load_base:.3f}s")
 
-    # Replay each differential checkpoint
-    total_updates = 0
-    t_replay_start = time.time()
+        # Copy and replay
+        reconstructed = OrderedDict()
+        for key, value in base_state.items():
+            reconstructed[key] = value.clone()
+        del base_state
 
-    for step, ckpt_dir in checkpoint_steps:
-        history_path = os.path.join(ckpt_dir, "zo_replay_history.json")
-        meta_path = os.path.join(ckpt_dir, "batch_diff_meta.pt")
+        updates = target_history.get('updates', [])
+        logger.info(f"[Resume] Replaying {len(updates)} updates from single checkpoint")
 
-        if os.path.exists(meta_path):
-            metadata = torch.load(meta_path, map_location='cpu', weights_only=True)
+        t_replay_start = time.time()
+        _replay_updates_on_state(reconstructed, updates, device=device)
+        t_replay = time.time() - t_replay_start
 
-            # If this is a full checkpoint, use it as new base
-            if metadata.get('is_full_checkpoint', False):
+        t_total = time.time() - t_start
+        logger.info(f"[Resume] Completed! Recovered to step {target_step}")
+        logger.info(f"[Resume Timing] Load base: {t_load_base:.4f}s, Replay {len(updates)} updates: {t_replay:.4f}s, "
+                   f"Total: {t_total:.4f}s")
+        return reconstructed
+
+    # ========== PURE DIFFERENTIAL MODE (batch_size=1) ==========
+    # Each checkpoint only has updates since the PREVIOUS checkpoint
+    # Must traverse all checkpoints from base to target
+    elif batch_size == 1:
+        logger.info(f"[Resume] Pure differential mode: traversing all checkpoints")
+
+        # Find base step
+        if base_checkpoint_ref == "__initial__":
+            base_step = 0
+        else:
+            match = re.search(r'checkpoint-(\d+)', base_checkpoint_ref)
+            base_step = int(match.group(1)) if match else 0
+
+        # Load base model
+        t_load_base_start = time.time()
+        if base_checkpoint_ref == "__initial__":
+            if pretrained_model_name is None:
+                raise ValueError(
+                    "This checkpoint uses differential mode from initial model. "
+                    "You must provide pretrained_model_name to load it."
+                )
+            try:
+                from transformers import AutoModelForCausalLM
+                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name}")
+                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
+                base_state = base_model.state_dict()
+                del base_model
+            except Exception as e:
+                raise FileNotFoundError(f"Cannot load pretrained model {pretrained_model_name}: {e}")
+        else:
+            base_state = load_batch_diff_checkpoint(base_checkpoint_ref, base_checkpoint_dir=pretrained_model_name)
+            if base_state is None:
+                raise FileNotFoundError(f"Cannot load base checkpoint from {base_checkpoint_ref}")
+
+        t_load_base = time.time() - t_load_base_start
+        logger.info(f"[Resume] Loaded base model in {t_load_base:.3f}s")
+
+        # Copy base state
+        reconstructed = OrderedDict()
+        for key, value in base_state.items():
+            reconstructed[key] = value.clone()
+        del base_state
+
+        # Find all checkpoints between base and target (inclusive of target)
+        # For pure differential mode, always use parent of ckpt_dir to find sibling checkpoints
+        diff_output_dir = os.path.dirname(ckpt_dir)
+        checkpoint_pattern = os.path.join(diff_output_dir, "checkpoint-*")
+        all_checkpoints = glob.glob(checkpoint_pattern)
+        logger.info(f"[Resume] Searching for checkpoints in: {diff_output_dir}")
+
+        checkpoint_steps = []
+        for ckpt in all_checkpoints:
+            match = re.search(r'checkpoint-(\d+)', ckpt)
+            if match:
+                step = int(match.group(1))
+                if base_step < step <= target_step:
+                    checkpoint_steps.append((step, ckpt))
+
+        checkpoint_steps.sort(key=lambda x: x[0])
+        logger.info(f"[Resume] Found {len(checkpoint_steps)} checkpoints to traverse (steps {base_step+1} to {target_step})")
+
+        # Move to GPU once before traversing all checkpoints
+        t_replay_start = time.time()
+        if device == 'cuda' and torch.cuda.is_available():
+            logger.info(f"[Resume] Moving state to GPU for replay...")
+            for key in reconstructed:
+                reconstructed[key] = reconstructed[key].cuda()
+
+        # Traverse and replay each checkpoint's updates (already on GPU)
+        total_updates = 0
+
+        for step, ckpt in checkpoint_steps:
+            hist_path = os.path.join(ckpt, "zo_replay_history.json")
+            if not os.path.exists(hist_path):
+                logger.warning(f"[Resume] Step {step}: No history file found, skipping")
+                continue
+
+            with open(hist_path, 'r') as f:
+                hist = json.load(f)
+
+            # Check if this is a full checkpoint (shouldn't happen in pure diff mode, but handle it)
+            if hist.get('is_full_checkpoint', False):
                 logger.info(f"[Resume] Step {step}: Found full checkpoint, loading as new base")
-                new_base = load_batch_diff_checkpoint(ckpt_dir)
+                new_base = load_batch_diff_checkpoint(ckpt)
                 if new_base is not None:
                     reconstructed = OrderedDict()
                     for key, value in new_base.items():
-                        reconstructed[key] = value.clone()
-                    base_step = step
+                        if device == 'cuda' and torch.cuda.is_available():
+                            reconstructed[key] = value.cuda()
+                        else:
+                            reconstructed[key] = value.clone()
                 continue
 
-        if not os.path.exists(history_path):
-            logger.warning(f"[Resume] Step {step}: No history file found, skipping")
-            continue
+            updates = hist.get('updates', [])
+            if updates:
+                logger.info(f"[Resume] Step {step}: Replaying {len(updates)} updates")
+                # Don't move to device again, already on GPU
+                _replay_updates_on_state(reconstructed, updates, device=device, move_to_device=False)
+                total_updates += len(updates)
 
-        with open(history_path, 'r') as f:
-            history = json.load(f)
+        t_replay = time.time() - t_replay_start
+        t_total = time.time() - t_start
 
-        updates = history.get('updates', [])
-        if not updates:
-            continue
+        logger.info(f"[Resume] Completed! Recovered to step {target_step}")
+        logger.info(f"[Resume Timing] Load base: {t_load_base:.3f}s, Replay {total_updates} updates: {t_replay:.3f}s, "
+                   f"Total: {t_total:.3f}s")
+        return reconstructed
 
-        # Check if this is pure differential (batch_size=1)
-        batch_size = history.get('batch_size', 0)
+    # ========== BATCH DIFFERENTIAL MODE (batch_size>=2) ==========
+    # Similar to incremental, but may have intermediate full checkpoints
+    else:
+        logger.info(f"[Resume] Batch differential mode (batch_size={batch_size})")
 
-        logger.info(f"[Resume] Step {step}: Replaying {len(updates)} updates (batch_size={batch_size})")
+        # If this is a full checkpoint, load directly
+        if target_history.get('is_full_checkpoint', False):
+            logger.info(f"[Resume] Target is a full checkpoint, loading directly")
+            return load_batch_diff_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
 
-        for update in updates:
-            seed = update['seed']
-            grad = update['grad']
-            lr = update['lr']
-            wd = update.get('wd', 0.0)
+        # Otherwise load base and replay this checkpoint's updates
+        t_load_base_start = time.time()
+        if base_checkpoint_ref == "__initial__":
+            if pretrained_model_name is None:
+                raise ValueError(
+                    "This checkpoint uses differential mode from initial model. "
+                    "You must provide pretrained_model_name to load it."
+                )
+            try:
+                from transformers import AutoModelForCausalLM
+                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name}")
+                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
+                base_state = base_model.state_dict()
+                del base_model
+            except Exception as e:
+                raise FileNotFoundError(f"Cannot load pretrained model {pretrained_model_name}: {e}")
+        else:
+            base_state = load_batch_diff_checkpoint(base_checkpoint_ref, base_checkpoint_dir=pretrained_model_name)
+            if base_state is None:
+                raise FileNotFoundError(f"Cannot load base checkpoint from {base_checkpoint_ref}")
 
-            torch.manual_seed(seed)
-            for name, param in reconstructed.items():
-                z = torch.normal(mean=0, std=1, size=param.size(), dtype=param.dtype)
-                if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
-                    param.sub_(lr * (grad * z + wd * param))
-                else:
-                    param.sub_(lr * grad * z)
+        t_load_base = time.time() - t_load_base_start
+        logger.info(f"[Resume] Loaded base model in {t_load_base:.3f}s")
 
-        total_updates += len(updates)
+        # Copy and replay
+        reconstructed = OrderedDict()
+        for key, value in base_state.items():
+            reconstructed[key] = value.clone()
+        del base_state
 
-    t_replay = time.time() - t_replay_start
-    t_total = time.time() - t_start
+        updates = target_history.get('updates', [])
+        logger.info(f"[Resume] Replaying {len(updates)} updates")
 
-    final_step = checkpoint_steps[-1][0] if checkpoint_steps else base_step
-    logger.info(f"[Resume] Completed! Recovered to step {final_step}")
-    logger.info(f"[Resume Timing] Load base: {t_load_base:.3f}s, Replay {total_updates} updates: {t_replay:.3f}s, "
-               f"Total: {t_total:.3f}s")
+        t_replay_start = time.time()
+        _replay_updates_on_state(reconstructed, updates, device=device)
+        t_replay = time.time() - t_replay_start
 
-    return reconstructed
+        t_total = time.time() - t_start
+        logger.info(f"[Resume] Completed! Recovered to step {target_step}")
+        logger.info(f"[Resume Timing] Load base: {t_load_base:.3f}s, Replay {len(updates)} updates: {t_replay:.3f}s, "
+                   f"Total: {t_total:.3f}s")
+        return reconstructed
 
 
 # Backward compatibility

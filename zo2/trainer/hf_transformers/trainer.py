@@ -358,6 +358,22 @@ class ZOTrainer(Trainer):
         # ZO2 added: incremental checkpoint flag
         self.use_incremental_checkpoint = False
 
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        """
+        Override: skip model weight loading when batchdiff resume is active,
+        since the model weights have already been recovered via replay.
+        For standard resume (RESUME_CKPT), add timing measurement.
+        """
+        if getattr(self.args, "batchdiff_resume", ""):
+            logger.info("[BatchDiff Resume] Skipping _load_from_checkpoint (model already recovered via replay)")
+            return
+        import time as time_module
+        t_start = time_module.time()
+        result = super()._load_from_checkpoint(resume_from_checkpoint, model)
+        t_elapsed = time_module.time() - t_start
+        logger.info(f"[Resume] Model loaded from checkpoint in {t_elapsed:.3f}s")
+        return result
+
     def _save_checkpoint(self, model, trial, metrics=None):
         """
         Override to skip model saving when using incremental checkpoint.

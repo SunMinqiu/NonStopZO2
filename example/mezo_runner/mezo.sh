@@ -1,5 +1,10 @@
 export WANDB_PROJECT=${WANDB_PROJECT:-NonStopZO2}
 
+# GPU 选择: 只使用指定的 GPU (默认使用 GPU 0)
+# 可以通过环境变量覆盖: GPU_ID=1 bash mezo.sh
+export CUDA_VISIBLE_DEVICES=${GPU_ID:-0}
+echo "Using GPU: $CUDA_VISIBLE_DEVICES"
+
 MODEL=${MODEL:-facebook/opt-1.3b}
 MODEL_NAME=(${MODEL//\// })
 MODEL_NAME="${MODEL_NAME[-1]}"
@@ -113,10 +118,10 @@ echo "BATCHDIFF_RESUME: $BATCHDIFF_RESUME"
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 echo "===================================="
 
-python /home/users/u0001609/NonStopZO2/example/mezo_runner/run.py \
+python /home/ubuntu/NonStopZO2/example/mezo_runner/run.py \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir /lvs0/rccs-hpbdrt/minqiu/ZO_ckpt/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
+    --output_dir /home/ubuntu/ZO_ckpt/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
     --tag $TAG \
     --train_set_seed $SEED \
     --num_train $TRAIN \

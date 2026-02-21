@@ -1,6 +1,13 @@
 # Copyright (c) 2025 liangyuwang
 # Licensed under the Apache License, Version 2.0
 
+import os
+# GPU 选择: 只使用 GPU 0 (在导入 torch 之前设置)
+# 如果要使用其他 GPU，可以通过环境变量覆盖: GPU_ID=1 python train_zo2_with_hf_opt.py
+gpu_id = os.environ.get("GPU_ID", "0")
+os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
+print(f"Using GPU: {gpu_id}")
+
 import sys
 sys.path.append("../zo2")
 
