@@ -27,6 +27,61 @@ import glob
 logger = logging.getLogger(__name__)
 
 
+def _detect_tied_weights(model) -> list:
+    """
+    Detect groups of tied (shared) parameters in a model by checking data_ptr equality.
+
+    Uses named_modules + _parameters to bypass PyTorch's named_parameters() deduplication,
+    which would hide tied weights (e.g. embed_tokens.weight and lm_head.weight).
+
+    Returns:
+        List of lists, where each inner list contains parameter names that share
+        the same underlying tensor. Only groups with 2+ parameters are returned.
+    """
+    ptr_to_names = {}
+    for module_name, module in model.named_modules():
+        for param_name, param in module._parameters.items():
+            if param is None:
+                continue
+            full_name = f"{module_name}.{param_name}" if module_name else param_name
+            ptr = param.data_ptr()
+            if ptr not in ptr_to_names:
+                ptr_to_names[ptr] = []
+            ptr_to_names[ptr].append(full_name)
+
+    return [names for names in ptr_to_names.values() if len(names) > 1]
+
+
+def _tie_state_dict_inplace(state: OrderedDict, tied_groups: list) -> None:
+    """
+    Make tied parameter groups share the same tensor in a state dict.
+
+    During ZO training, tied weights (e.g. embed_tokens.weight and lm_head.weight)
+    are the same tensor, so updates to both accumulate. When replaying from a cloned
+    state dict, they become separate tensors and updates don't accumulate correctly.
+    This function re-ties them so replay matches training behavior.
+
+    Args:
+        state: State dict to modify in-place
+        tied_groups: List of lists of parameter names that should share the same tensor
+    """
+    for group in tied_groups:
+        # Find the primary key (first one present in state)
+        primary = None
+        for name in group:
+            if name in state:
+                primary = name
+                break
+
+        if primary is None:
+            continue
+
+        # Make all other keys in the group reference the primary tensor
+        for name in group:
+            if name != primary and name in state:
+                state[name] = state[primary]
+
+
 class GPUFailureSimulator:
     """GPU failure simulator"""
 
@@ -134,6 +189,9 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         self.failure_simulator = GPUFailureSimulator()
         self.failure_simulator.callback = self
 
+        # Model dtype (detected at training start for replay consistency)
+        self.model_dtype = None
+
         # Timing statistics
         self.timing_stats = {
             'checkpoint_saves': [],
@@ -152,6 +210,13 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 self.trainer.register_zo2_training_step_post_hook(self._zo_update_hook)
                 self._hook_registered = True
                 logger.info("[BatchDiff] Registered post-hook")
+
+        # Detect model dtype for replay consistency
+        if model is not None and self.model_dtype is None:
+            for p in model.parameters():
+                self.model_dtype = str(p.dtype)  # e.g. "torch.float16"
+                break
+            logger.info(f"[BatchDiff] Detected model dtype: {self.model_dtype}")
 
         # Cache initial model
         if self.base_checkpoint_state is None and model is not None:
@@ -184,6 +249,11 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         logger.info("[BatchDiff] Caching initial model to CPU memory...")
         t_start = time.time()
 
+        # Detect tied weights (e.g. embed_tokens.weight <-> lm_head.weight)
+        self._tied_weight_groups = _detect_tied_weights(model)
+        if self._tied_weight_groups:
+            logger.info(f"[BatchDiff] Detected tied weight groups: {self._tied_weight_groups}")
+
         state_dict = model.state_dict()
 
         self.base_checkpoint_state = OrderedDict()
@@ -195,6 +265,9 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             self.shadow_model = OrderedDict()
             for key, value in self.base_checkpoint_state.items():
                 self.shadow_model[key] = value.clone()
+            # Tie weights in shadow model so ZO updates accumulate correctly
+            if self._tied_weight_groups:
+                _tie_state_dict_inplace(self.shadow_model, self._tied_weight_groups)
             self.shadow_step = 0
 
         self.base_checkpoint_step = 0
@@ -508,6 +581,14 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 
         t_start = time.time()
 
+        # batch_size=0 (log-based): full checkpoint already saved by Trainer._save_checkpoint.
+        # Just update internal state (base_checkpoint, shadow model) for L2/L3 features.
+        if self.batch_size == 0:
+            self._update_base_and_shadow(model, checkpoint_dir, state.global_step)
+            t_elapsed = time.time() - t_start
+            logger.info(f"[Checkpoint Timing] Internal state update took {t_elapsed:.4f}s at step {state.global_step}")
+            return
+
         # Determine if we need to save a full checkpoint
         should_save_full = self._should_save_full_checkpoint(state.global_step)
 
@@ -526,6 +607,34 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             'step': state.global_step,
             'time': t_elapsed
         })
+
+    def _update_base_and_shadow(self, model, checkpoint_dir, step):
+        """Update internal state (base checkpoint + shadow model) without saving to disk.
+        Used by batch_size=0 mode where full checkpoint is already saved by Trainer."""
+        t_start = time.time()
+
+        state_dict = model.state_dict()
+
+        self.base_checkpoint_state = OrderedDict()
+        for key, value in state_dict.items():
+            self.base_checkpoint_state[key] = value.detach().cpu().clone()
+
+        if self.enable_shadow:
+            with self.shadow_lock:
+                self.shadow_model = OrderedDict()
+                for key, value in self.base_checkpoint_state.items():
+                    self.shadow_model[key] = value.clone()
+                if hasattr(self, '_tied_weight_groups') and self._tied_weight_groups:
+                    _tie_state_dict_inplace(self.shadow_model, self._tied_weight_groups)
+                self.shadow_step = len(self.update_history)
+
+        # Don't update base_checkpoint_path for batch_size=0 — it always replays from __initial__
+        self.last_saved_step = step
+        self.is_first_save = False
+
+        t_elapsed = time.time() - t_start
+        mem_mb = self._get_memory_size()
+        logger.info(f"[BatchDiff] Internal state updated at step {step} ({mem_mb:.1f} MB, {t_elapsed:.3f}s)")
 
     def _should_save_full_checkpoint(self, step: int) -> bool:
         """Determine if we should save a full checkpoint"""
@@ -571,6 +680,9 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 self.shadow_model = OrderedDict()
                 for key, value in self.base_checkpoint_state.items():
                     self.shadow_model[key] = value.clone()
+                # Re-tie weights in shadow model for correct update accumulation
+                if hasattr(self, '_tied_weight_groups') and self._tied_weight_groups:
+                    _tie_state_dict_inplace(self.shadow_model, self._tied_weight_groups)
                 self.shadow_step = len(self.update_history)  # Shadow is now caught up
 
         # Step 4: Conditionally save to disk via Trainer (only if save_full_model=True)
@@ -625,6 +737,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             "current_step": step,
             "batch_size": self.batch_size,
             "save_full_model": self.save_full_model,
+            "model_dtype": self.model_dtype,
             "num_updates": 0,
             "updates": []
         }
@@ -660,7 +773,9 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 'current_step': step,
                 'batch_size': self.batch_size,
                 'save_full_model': self.save_full_model,
+                'model_dtype': self.model_dtype,
                 'num_updates': len(updates_to_save),
+                'tied_weights': getattr(self, '_tied_weight_groups', []),
                 'updates': updates_to_save
             }
         t_copy = time.time() - t_copy_start
@@ -841,6 +956,17 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None, device=
 
     # Load differential checkpoint - history already loaded above
 
+    # Extract model dtype for replay consistency
+    model_dtype_str = history.get('model_dtype', None)
+    _dtype_map = {
+        'torch.float16': torch.float16,
+        'torch.bfloat16': torch.bfloat16,
+        'torch.float32': torch.float32,
+    }
+    model_dtype = _dtype_map.get(model_dtype_str, None)
+    if model_dtype is not None:
+        logger.info(f"[load_batch_diff_checkpoint] Model dtype from metadata: {model_dtype}")
+
     base_checkpoint_ref = history.get("base_checkpoint")
 
     # If base_checkpoint is "__initial__", user must provide the pretrained model path
@@ -868,8 +994,9 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None, device=
             # Try loading from HuggingFace model hub
             try:
                 from transformers import AutoModelForCausalLM
-                logger.info(f"Trying to load base model from HuggingFace: {base_dir}")
-                base_model = AutoModelForCausalLM.from_pretrained(base_dir)
+                _dtype_kwargs = {'torch_dtype': model_dtype} if model_dtype is not None else {}
+                logger.info(f"Trying to load base model from HuggingFace: {base_dir} (dtype={model_dtype})")
+                base_model = AutoModelForCausalLM.from_pretrained(base_dir, **_dtype_kwargs)
                 base_state = base_model.state_dict()
                 del base_model
             except Exception as e:
@@ -878,6 +1005,9 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None, device=
                     f"Tried local files and HuggingFace hub. Error: {e}"
                 )
 
+    # Get tied weight groups from checkpoint metadata
+    tied_groups = history.get('tied_weights', [])
+
     updates = history.get('updates', [])
     logger.info(f"Replaying {len(updates)} ZO updates on {device}...")
 
@@ -885,6 +1015,10 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None, device=
     for key, value in base_state.items():
         reconstructed[key] = value.clone()
     del base_state
+
+    # Tie weights before replay so updates accumulate correctly (like during training)
+    if tied_groups:
+        _tie_state_dict_inplace(reconstructed, tied_groups)
 
     # Use the shared replay function with device support
     _replay_updates_on_state(reconstructed, updates, device=device)
@@ -938,24 +1072,64 @@ def resume_from_batch_diff(
     logger.info(f"[Resume] Replay device: {device}")
 
     # Load the target checkpoint's history to determine batch_size mode
+    # Check optimizer.pt first (log-based mode), then zo_replay_history.json (differential mode)
+    optimizer_path = os.path.join(ckpt_dir, "optimizer.pt")
     history_path = os.path.join(ckpt_dir, "zo_replay_history.json")
-    if not os.path.exists(history_path):
-        # Not a batch diff checkpoint, try loading directly
-        logger.info(f"[Resume] No zo_replay_history.json found, loading as regular checkpoint")
-        return load_batch_diff_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
 
-    with open(history_path, 'r') as f:
-        target_history = json.load(f)
+    if os.path.exists(optimizer_path):
+        optimizer_state = torch.load(optimizer_path, map_location='cpu', weights_only=False)
+        if isinstance(optimizer_state, dict) and 'zo_update_history' in optimizer_state:
+            # Log-based checkpoint: replay from optimizer.pt
+            logger.info(f"[Resume] Found log-based checkpoint (optimizer.pt with zo_update_history)")
+            target_history = {
+                'batch_size': optimizer_state.get('batch_size', 0),
+                'base_checkpoint': optimizer_state.get('base_checkpoint', '__initial__'),
+                'updates': optimizer_state['zo_update_history'],
+                'tied_weights': optimizer_state.get('tied_weights', []),
+                'model_dtype': optimizer_state.get('model_dtype', None),
+            }
+        else:
+            optimizer_state = None  # Regular optimizer.pt, not log-based
+
+    if 'target_history' not in locals():
+        if os.path.exists(history_path):
+            with open(history_path, 'r') as f:
+                target_history = json.load(f)
+        else:
+            # Not a batch diff checkpoint, try loading directly
+            logger.info(f"[Resume] No optimizer.pt or zo_replay_history.json found, loading as regular checkpoint")
+            return load_batch_diff_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
 
     batch_size = target_history.get('batch_size', 0)
     base_checkpoint_ref = target_history.get('base_checkpoint')
+    tied_groups = target_history.get('tied_weights', [])
+    model_dtype_str = target_history.get('model_dtype', None)
+
+    # Parse model dtype for from_pretrained consistency
+    _dtype_map = {
+        'torch.float16': torch.float16,
+        'torch.bfloat16': torch.bfloat16,
+        'torch.float32': torch.float32,
+    }
+    model_dtype = _dtype_map.get(model_dtype_str, None)
 
     logger.info(f"[Resume] Checkpoint mode: batch_size={batch_size}, base_checkpoint={base_checkpoint_ref}")
+    if model_dtype is not None:
+        logger.info(f"[Resume] Model dtype from checkpoint: {model_dtype}")
+    if tied_groups:
+        logger.info(f"[Resume] Tied weight groups from checkpoint: {tied_groups}")
 
-    # ========== INCREMENTAL MODE (batch_size=0) ==========
+    # ========== LOG-BASED MODE (batch_size=0) ==========
     # Each checkpoint has ALL updates from base, just load this one checkpoint
     if batch_size == 0:
-        logger.info(f"[Resume] Incremental mode: loading single checkpoint with all updates")
+        # batch_size=0 always accumulates from initial pretrained model
+        if base_checkpoint_ref != "__initial__":
+            logger.warning(
+                f"[Resume] batch_size=0 but base_checkpoint={base_checkpoint_ref}, "
+                f"overriding to __initial__ (batch_size=0 always replays from initial model)"
+            )
+            base_checkpoint_ref = "__initial__"
+        logger.info(f"[Resume] Log-based mode: loading single checkpoint with all updates")
 
         # Load base model
         t_load_base_start = time.time()
@@ -968,8 +1142,14 @@ def resume_from_batch_diff(
             # Load from HuggingFace
             try:
                 from transformers import AutoModelForCausalLM
-                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name}")
-                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
+                _dtype_kwargs = {'torch_dtype': model_dtype} if model_dtype is not None else {}
+                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name} (dtype={model_dtype})")
+                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, **_dtype_kwargs)
+                # Detect tied weights from model if not in checkpoint metadata
+                if not tied_groups:
+                    tied_groups = _detect_tied_weights(base_model)
+                    if tied_groups:
+                        logger.info(f"[Resume] Detected tied weight groups from model: {tied_groups}")
                 base_state = base_model.state_dict()
                 del base_model
             except Exception as e:
@@ -987,6 +1167,10 @@ def resume_from_batch_diff(
         for key, value in base_state.items():
             reconstructed[key] = value.clone()
         del base_state
+
+        # Tie weights before replay so updates accumulate correctly (like during training)
+        if tied_groups:
+            _tie_state_dict_inplace(reconstructed, tied_groups)
 
         updates = target_history.get('updates', [])
         logger.info(f"[Resume] Replaying {len(updates)} updates from single checkpoint")
@@ -1024,8 +1208,14 @@ def resume_from_batch_diff(
                 )
             try:
                 from transformers import AutoModelForCausalLM
-                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name}")
-                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
+                _dtype_kwargs = {'torch_dtype': model_dtype} if model_dtype is not None else {}
+                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name} (dtype={model_dtype})")
+                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, **_dtype_kwargs)
+                # Detect tied weights from model if not in checkpoint metadata
+                if not tied_groups:
+                    tied_groups = _detect_tied_weights(base_model)
+                    if tied_groups:
+                        logger.info(f"[Resume] Detected tied weight groups from model: {tied_groups}")
                 base_state = base_model.state_dict()
                 del base_model
             except Exception as e:
@@ -1043,6 +1233,10 @@ def resume_from_batch_diff(
         for key, value in base_state.items():
             reconstructed[key] = value.clone()
         del base_state
+
+        # Tie weights before replay so updates accumulate correctly (like during training)
+        if tied_groups:
+            _tie_state_dict_inplace(reconstructed, tied_groups)
 
         # Find all checkpoints between base and target (inclusive of target)
         # For pure differential mode, always use parent of ckpt_dir to find sibling checkpoints
@@ -1092,6 +1286,9 @@ def resume_from_batch_diff(
                             reconstructed[key] = value.cuda()
                         else:
                             reconstructed[key] = value.clone()
+                    # Re-tie weights after loading new base
+                    if tied_groups:
+                        _tie_state_dict_inplace(reconstructed, tied_groups)
                 continue
 
             updates = hist.get('updates', [])
@@ -1129,8 +1326,14 @@ def resume_from_batch_diff(
                 )
             try:
                 from transformers import AutoModelForCausalLM
-                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name}")
-                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name)
+                _dtype_kwargs = {'torch_dtype': model_dtype} if model_dtype is not None else {}
+                logger.info(f"[Resume] Loading base model from HuggingFace: {pretrained_model_name} (dtype={model_dtype})")
+                base_model = AutoModelForCausalLM.from_pretrained(pretrained_model_name, **_dtype_kwargs)
+                # Detect tied weights from model if not in checkpoint metadata
+                if not tied_groups:
+                    tied_groups = _detect_tied_weights(base_model)
+                    if tied_groups:
+                        logger.info(f"[Resume] Detected tied weight groups from model: {tied_groups}")
                 base_state = base_model.state_dict()
                 del base_model
             except Exception as e:
@@ -1148,6 +1351,10 @@ def resume_from_batch_diff(
         for key, value in base_state.items():
             reconstructed[key] = value.clone()
         del base_state
+
+        # Tie weights before replay so updates accumulate correctly (like during training)
+        if tied_groups:
+            _tie_state_dict_inplace(reconstructed, tied_groups)
 
         updates = target_history.get('updates', [])
         logger.info(f"[Resume] Replaying {len(updates)} updates")
