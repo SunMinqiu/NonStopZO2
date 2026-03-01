@@ -4,15 +4,22 @@ zo_checkpoint_model.py
 ZO Checkpoint 成本模型：计算 + 画图
 被 cell 脚本 import 调用，不要直接运行。
 
-数据结构：统一的 experiment_groups 列表，每组包含:
-  - name:             组名（如 "Log-based (GPU)"）
-  - avg_ckpt_time:    每步 checkpoint 写入时间 → 自动用作 tl
-  - total_ckpts:      checkpoint 总数（用于 strategy comparison）
-  - e2e_time_seconds: 端到端训练时间
-  - replay_data:      [{replay_steps, replay_time, full_resume_time}, ...]
-                      至少 2 个点，用斜率拟合 U；每个点都有对应的 full_resume_time
-  - color / ls:       可选，画图样式
-  - ckpt_label:       可选，strategy comparison 去重用的标签
+数据结构（嵌套）：
+  EXPERIMENTS = {
+    "Model / Task": {
+      "C":  full checkpoint 写入时间,
+      "ts": 每步训练时间,
+      "total_steps": 总训练步数,
+      "strategies": [
+        { "name", "avg_ckpt_time", "total_ckpts", "e2e_time_seconds",
+          "replay_data": [{replay_steps, replay_time, full_resume_time}, ...],
+          "color"?, "ls"?, "ckpt_label"? },
+        ...
+      ],
+    },
+  }
+
+  底层函数也兼容扁平的 experiment_groups 列表（向后兼容）。
 
 恢复公式:
   对每个数据点: cold_start_i = full_resume_time_i - U * replay_steps_i
@@ -159,6 +166,191 @@ def get_unique_checkpoint_modes(experiment_groups):
 
 
 # ============================================================
+#  嵌套数据结构 → 筛选 / 画图
+# ============================================================
+
+def select_experiments(experiments, models=None, strategies=None):
+    """
+    从嵌套的 EXPERIMENTS dict 筛选，返回扁平 experiment_groups + model params。
+
+    Parameters
+    ----------
+    experiments : dict
+        嵌套结构 {model_key: {"C", "ts", "total_steps", "strategies": [...]}}
+    models : list[str] or None
+        要包含的 model key（None = 全部）
+    strategies : list[str] or None
+        要包含的策略名（None = 全部）
+
+    Returns
+    -------
+    dict with keys:
+        "groups"       : list[dict]  — 扁平 experiment_groups，现有函数直接用
+        "model_params" : dict        — {model_key: {"C", "ts", "total_steps"}}
+    """
+    selected_keys = list(experiments.keys()) if models is None else models
+    multi_model = len(selected_keys) > 1
+
+    groups = []
+    model_params = {}
+
+    for mk in selected_keys:
+        cfg = experiments[mk]
+        model_params[mk] = {k: cfg[k] for k in ("C", "ts", "total_steps")}
+        # 生成短前缀：取 "/" 前的部分再取最后的 token，如 "Qwen3-1.7B"
+        prefix = mk.split("/")[0].strip().split()[-1] if multi_model else ""
+
+        for s in cfg["strategies"]:
+            name = s["name"]
+            if strategies is not None and name not in strategies:
+                continue
+            entry = dict(s)
+            entry["name"] = f"{prefix}-{name}" if prefix else name
+            # 附带 model 级参数，方便后续使用
+            entry["_model_key"] = mk
+            entry["_C"] = cfg["C"]
+            entry["_ts"] = cfg["ts"]
+            groups.append(entry)
+
+    return {"groups": groups, "model_params": model_params}
+
+
+def _default_mtbf_config():
+    return {
+        "range_hours": (0.5, 24),
+        "demo_hours": 4,
+        "table_values": [1, 2, 4, 8, 12, 24],
+    }
+
+
+def plot_model(experiments, model_key, mtbf_config=None):
+    """
+    单模型一键分析：print_summary + cost_model + strategy_comparison + replay_speed。
+    """
+    mc = mtbf_config or _default_mtbf_config()
+    cfg = experiments[model_key]
+    C, ts, total_steps = cfg["C"], cfg["ts"], cfg["total_steps"]
+    groups = cfg["strategies"]
+
+    params = compute_replay_params(groups)
+    scenarios = list(params.values())
+
+    print(f"\n{'='*60}")
+    print(f"  Model: {model_key}")
+    print(f"{'='*60}")
+    print_summary(C, ts, scenarios, groups, total_steps, mc["table_values"])
+
+    figs = []
+    figs.append(plot_cost_model(C, ts, scenarios, mc["range_hours"], mc["demo_hours"]))
+    figs[-1].suptitle(model_key, fontsize=14, y=1.02)
+
+    figs.append(plot_strategy_comparison(groups, total_steps))
+    figs[-1].suptitle(model_key, fontsize=14, y=1.02)
+
+    figs.append(plot_replay_speed(groups))
+    if figs[-1]:
+        figs[-1].suptitle(model_key, fontsize=14, y=1.02)
+
+    return figs
+
+
+def plot_comparison(experiments, models=None, strategies=None,
+                    mtbf_config=None, overlay=False):
+    """
+    跨模型对比。
+
+    overlay=False（默认）: 每个模型单独一组 cost_model 图 + 合并的 replay_speed 柱状图
+    overlay=True:          所有模型的线叠在同一组 cost_model 图上
+    """
+    mc = mtbf_config or _default_mtbf_config()
+    sel = select_experiments(experiments, models=models, strategies=strategies)
+    groups = sel["groups"]
+    mp = sel["model_params"]
+
+    figs = []
+
+    if overlay:
+        # 叠加模式：收集所有 scenario，用第一个模型的 C/ts 做 x 轴（每条线用自己的 C/ts）
+        all_scenarios = []
+        for g in groups:
+            params = compute_replay_params([g])
+            for p in params.values():
+                p["_C"] = g["_C"]
+                p["_ts"] = g["_ts"]
+                all_scenarios.append(p)
+
+        if all_scenarios:
+            # 绘制 overlay cost model
+            mtbf_h = np.linspace(mc["range_hours"][0], mc["range_hours"][1], 500)
+            mtbf_s = mtbf_h * 3600
+
+            fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+            for i, s in enumerate(all_scenarios):
+                U_s, cs = s['U'], s['cold_start']
+                C_s, ts_s = s['_C'], s['_ts']
+                tl = s.get('tl', 0)
+                color = s.get('color', _DEFAULT_COLORS[i % len(_DEFAULT_COLORS)])
+                ls = s.get('ls', _DEFAULT_LS[i % len(_DEFAULT_LS)])
+                label = s['name']
+
+                K_opt = K_star(C_s, U_s, mtbf_s, ts_s, tl)
+                axes[0].plot(mtbf_h, K_opt, color=color, ls=ls, lw=2.5, label=label)
+
+                oh = np.array([overhead(k, C_s, U_s, m, ts_s, tl, cs)
+                               for k, m in zip(K_opt, mtbf_s)]) * 100
+                axes[1].plot(mtbf_h, oh, color=color, ls=ls, lw=2.5, label=label)
+
+                M_demo = mc["demo_hours"] * 3600
+                K_range = np.linspace(50, 16000, 1000)
+                ovh = np.array([overhead(K, C_s, U_s, M_demo, ts_s, tl, cs) for K in K_range])
+                Kopt = K_star(C_s, U_s, M_demo, ts_s, tl)
+                axes[2].plot(K_range, ovh, color=color, ls=ls, lw=2, label=label)
+                axes[2].axvline(x=Kopt, color=color, ls=':', alpha=0.4)
+                axes[2].plot(Kopt, overhead(Kopt, C_s, U_s, M_demo, ts_s, tl, cs), 'o',
+                             color=color, ms=7)
+                axes[2].annotate(f'K*={Kopt:.0f}',
+                                 xy=(Kopt, overhead(Kopt, C_s, U_s, M_demo, ts_s, tl, cs)),
+                                 fontsize=12, color=color, ha='left', va='bottom',
+                                 xytext=(Kopt + 100,
+                                         overhead(Kopt, C_s, U_s, M_demo, ts_s, tl, cs) + 0.002))
+
+            axes[0].set_xlabel('MTBF (hours)'); axes[0].set_ylabel('Optimal K*')
+            axes[0].set_title('(a) K* vs MTBF', fontweight='bold')
+            axes[0].legend(); axes[0].grid(True, alpha=0.3)
+            axes[1].set_xlabel('MTBF (hours)'); axes[1].set_ylabel('Overhead %')
+            axes[1].set_title('(b) Overhead at Optimal K*', fontweight='bold')
+            axes[1].legend(); axes[1].grid(True, alpha=0.3); axes[1].set_ylim(bottom=0)
+            axes[2].set_xlabel('K (steps)'); axes[2].set_ylabel('Overhead')
+            axes[2].set_title(f'(c) Overhead vs K (MTBF={mc["demo_hours"]}h)', fontweight='bold')
+            axes[2].legend(); axes[2].grid(True, alpha=0.3); axes[2].set_ylim(bottom=0)
+            plt.tight_layout(pad=2.0)
+            figs.append(fig)
+    else:
+        # 非叠加：每个模型单独 cost_model
+        for mk, mp_cfg in mp.items():
+            model_groups = [g for g in groups if g["_model_key"] == mk]
+            params = compute_replay_params(model_groups)
+            scenarios = list(params.values())
+            if scenarios:
+                fig = plot_cost_model(mp_cfg["C"], mp_cfg["ts"], scenarios,
+                                      mc["range_hours"], mc["demo_hours"])
+                fig.suptitle(mk, fontsize=14, y=1.02)
+                figs.append(fig)
+
+    # 合并的 replay_speed 柱状图
+    fig_replay = plot_replay_speed(groups)
+    if fig_replay:
+        figs.append(fig_replay)
+
+    # 合并的 strategy_comparison 柱状图
+    total_steps = max(c["total_steps"] for c in mp.values())
+    fig_strat = plot_strategy_comparison(groups, total_steps)
+    figs.append(fig_strat)
+
+    return figs
+
+
+# ============================================================
 #  打印计算结果
 # ============================================================
 
@@ -247,7 +439,7 @@ def plot_cost_model(C, ts, replay_scenarios,
 
         # (c) overhead(K) at fixed MTBF
         M_demo = mtbf_demo_hours * 3600
-        K_range = np.linspace(50, 8000, 1000)
+        K_range = np.linspace(50, 16000, 1000)
         ovh = np.array([overhead(K, C, U_s, M_demo, ts, tl, cs) for K in K_range])
         Kopt = K_star(C, U_s, M_demo, ts, tl)
         axes[2].plot(K_range, ovh, color=color, ls=ls, lw=2, label=label)
