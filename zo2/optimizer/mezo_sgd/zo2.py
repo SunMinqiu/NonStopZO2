@@ -8,10 +8,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from collections import deque
+import logging
 
 from .zo import MeZOSGD
 from ...config.mezo_sgd import MeZOSGDConfig
 from .utils import *
+
+logger = logging.getLogger(__name__)
 
 
 class MeZO2SGD(MeZOSGD):
@@ -171,6 +174,11 @@ class MeZO2SGD(MeZOSGD):
         """
         self._update_lr()
         self.zo_random_seed = seed if seed else np.random.randint(self.max_zo_random_seed)
+        # Save the grad that will actually be applied in this step's zo_update.
+        # In ZO2's pipelined design, zo_update runs BEFORE compute_grad, so it uses
+        # the projected_grad from the PREVIOUS step. We capture it here for correct
+        # checkpoint recording (seed_N pairs with grad_{N-1}, not grad_N).
+        self._applied_update_grad = self.projected_grad
         torch.manual_seed(self.zo_random_seed)
         torch.cuda.manual_seed(self.zo_random_seed)
         self.rstate = torch.cuda.get_rng_state()
@@ -181,6 +189,7 @@ class MeZO2SGD(MeZOSGD):
         loss1, loss2 = self.inner_zo_forward(*args, **kwargs)
         torch.cuda.synchronize()    # global sync to make sure all tasks finish
         self.projected_grad = self.compute_grad(loss1, loss2)
+        logger.info(f"[OPT] seed={self.zo_random_seed}, applied_grad={self._applied_update_grad}, new_grad={self.projected_grad}")
         return loss1.detach()
     
     #*********************** tasks ***********************#

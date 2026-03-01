@@ -9,8 +9,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ..base import BaseOptimizer
 import numpy as np
+import logging
 
 from ...config.mezo_sgd import MeZOSGDConfig
+
+logger = logging.getLogger(__name__)
 
 
 class MeZOSGD(BaseOptimizer):
@@ -117,6 +120,9 @@ class MeZOSGD(BaseOptimizer):
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[1])
         loss2 = self.inner_zo_forward(*args, **kwargs)
         self.projected_grad = self.compute_grad(loss1, loss2)
+        # In base ZO (synchronous), the update uses the grad just computed in the SAME step.
+        # Record it so the checkpoint hook can pair (seed_N, grad_N) correctly.
+        self._applied_update_grad = self.projected_grad
         torch.manual_seed(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[2])
         torch.manual_seed(self.zo_random_seed)

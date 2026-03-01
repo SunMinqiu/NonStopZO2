@@ -38,8 +38,9 @@ INSTANT_RECOVER=${INSTANT_RECOVER:-0}
 GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
 BATCHDIFF_RESUME=${BATCHDIFF_RESUME:-""}
 BATCHDIFF_REPLAY_DEVICE=${BATCHDIFF_REPLAY_DEVICE:-cpu}
+BATCHDIFF_SIMULATE_PERTURBATION=${BATCHDIFF_SIMULATE_PERTURBATION:-1}
 
-TRAIN_NAME=${TRAIN_NAME:-"Amz/Test"}
+TRAIN_NAME=${TRAIN_NAME:-"Test_staging_8"}
 RESUME_CKPT=${RESUME_CKPT:-""}
 DO_EVAL=${DO_EVAL:-1}
 
@@ -69,6 +70,9 @@ fi
 # Batch Diff Resume (优先于 RESUME_CKPT)
 if [ -n "$BATCHDIFF_RESUME" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --batchdiff_resume $BATCHDIFF_RESUME --batchdiff_replay_device $BATCHDIFF_REPLAY_DEVICE"
+    if [ "$BATCHDIFF_SIMULATE_PERTURBATION" == "0" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --batchdiff_simulate_perturbation False"
+    fi
 elif [ -n "$RESUME_CKPT" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --resume_from_checkpoint $RESUME_CKPT"
 fi
@@ -117,13 +121,14 @@ echo "INSTANT_RECOVER: $INSTANT_RECOVER"
 echo "GPU_FAIL_STEP: $GPU_FAIL_STEP"
 echo "BATCHDIFF_RESUME: $BATCHDIFF_RESUME"
 echo "BATCHDIFF_REPLAY_DEVICE: $BATCHDIFF_REPLAY_DEVICE"
+echo "BATCHDIFF_SIMULATE_PERTURBATION: $BATCHDIFF_SIMULATE_PERTURBATION (0=skip ~4x faster, 1=bitwise exact)"
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 echo "===================================="
 
-python /home/ubuntu/NonStopZO2/example/mezo_runner/run.py \
+python /home/users/u0001609/NonStopZO2/example/mezo_runner/run.py \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir /home/ubuntu/ZO_ckpt/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
+    --output_dir /lvs0/rccs-hpbdrt/minqiu/ZO_ckpt/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
     --run_name $TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
     --tag $TAG \
     --train_set_seed $SEED \

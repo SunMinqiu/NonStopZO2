@@ -142,6 +142,7 @@ class OurArguments(TrainingArguments):
     # Will automatically scan parent directory for checkpoints and replay them
     batchdiff_resume: str = ""  # path to base full checkpoint for resuming
     batchdiff_replay_device: str = "cpu"  # device for replay computation: 'cpu' or 'cuda'
+    batchdiff_simulate_perturbation: bool = True  # simulate fp16 perturbation loop during replay (disable for ~4x speedup)
 
     # ZO2 added -> ZO2 configs
     zo_method: str = "mezo-sgd"
@@ -163,6 +164,9 @@ def set_seed(seed: int):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+    # 确保 cuDNN 确定性行为
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 class Framework:
@@ -222,7 +226,8 @@ class Framework:
             # Set up ZO configuration
             self.zo_config = ZOConfig(
                 method="mezo-sgd",
-                zo2=(self.args.zo_mode == "zo2"),
+                # zo2=(self.args.zo_mode == "zo2"),
+                zo2=False,
                 lr=self.args.learning_rate,
                 weight_decay=self.args.weight_decay,
                 eps=self.args.zo_eps,
@@ -558,26 +563,25 @@ class Framework:
                 logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step} (L0 baseline, no recovery)")
 
         # Resume training from a last checkpoint
+        t_full_resume_start = time.time()
         last_checkpoint = None
         from transformers.trainer_utils import get_last_checkpoint
 
         # Handle batch differential resume
         if self.args.batchdiff_resume:
             logger.info(f"[BatchDiff Resume] Resuming from batch differential checkpoint: {self.args.batchdiff_resume}")
-            t_resume_start = time.time()
 
             # Use resume_from_batch_diff to reconstruct the model
             recovered_state = resume_from_batch_diff(
                 checkpoint_path=self.args.batchdiff_resume,
                 output_dir=self.args.output_dir,
                 pretrained_model_name=self.args.model_name,
-                device=self.args.batchdiff_replay_device
+                device=self.args.batchdiff_replay_device,
+                simulate_perturbation=self.args.batchdiff_simulate_perturbation,
             )
 
             # Load recovered state into model
             self.model.load_state_dict(recovered_state)
-            t_resume = time.time() - t_resume_start
-            logger.info(f"[BatchDiff Resume] Model recovered in {t_resume:.3f}s")
 
             # Use the batchdiff checkpoint itself to resume trainer state (global_step, scheduler, etc.)
             # Model weights are already loaded above, so _load_from_checkpoint will be skipped by ZOTrainer.
@@ -597,7 +601,9 @@ class Framework:
         if self.args.resume_from_checkpoint is not None:
             last_checkpoint = self.args.resume_from_checkpoint
 
-        trainer.train(resume_from_checkpoint=last_checkpoint) 
+        if last_checkpoint is not None:
+            trainer._t_full_resume_start = t_full_resume_start
+        trainer.train(resume_from_checkpoint=last_checkpoint)
 
         # Explicitly save the model
         if self.args.save_model:
