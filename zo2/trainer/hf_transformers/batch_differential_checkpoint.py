@@ -923,6 +923,7 @@ def _replay_updates_on_state(
     trainable_param_names: list = None,
     default_zo_eps: float = 0.0,
     simulate_perturbation: bool = True,
+    replay_in_fp32: bool = False,
 ) -> OrderedDict:
     """
     Replay ZO updates on a state dict.
@@ -945,6 +946,9 @@ def _replay_updates_on_state(
                         to enable fp16 perturbation residual simulation for old checkpoints.
         simulate_perturbation: If True (default), simulate the [+1, -2, +1] perturbation
                         loop for bitwise-exact fp16 replay. If False, skip it (~4x faster).
+        replay_in_fp32: If True, upcast fp16 state to fp32 before replay and downcast back
+                        after. This avoids the ~7x penalty of torch.normal(dtype=fp16) on CPU.
+                        Only affects CPU replay with fp16 models. Default False.
 
     Returns:
         The modified state dict (stays on the device where computation was done)
@@ -962,8 +966,18 @@ def _replay_updates_on_state(
     elif len(state) > 0:
         actual_device = str(next(iter(state.values())).device)
 
+    # Upcast fp16 → fp32 on CPU to avoid slow torch.normal(dtype=fp16) on CPU
+    original_dtype = None
+    if replay_in_fp32 and actual_device == 'cpu':
+        sample = next(iter(state.values()))
+        if sample.dtype == torch.float16 or sample.dtype == torch.bfloat16:
+            original_dtype = sample.dtype
+            for key in state:
+                state[key] = state[key].float()
+            logger.info(f"[Replay] Upcast {original_dtype} → fp32 for CPU replay")
+
     logger.info(f"[Replay] Replaying {len(updates)} updates on device={actual_device}"
-                f" (simulate_perturbation={simulate_perturbation})")
+                f" (simulate_perturbation={simulate_perturbation}, replay_in_fp32={replay_in_fp32})")
     if actual_device == 'cpu' and torch.cuda.is_available():
         logger.warning("[Replay] WARNING: Replaying on CPU but CUDA is available. "
                        "CPU and CUDA RNG produce different z for the same seed. "
@@ -983,6 +997,12 @@ def _replay_updates_on_state(
                         f"zo_eps={update.get('zo_eps', default_zo_eps)}")
         elif i == 3:
             logger.info(f"[Replay] ... ({len(updates) - 4} more updates) ...")
+
+    # Downcast fp32 → original dtype
+    if original_dtype is not None:
+        for key in state:
+            state[key] = state[key].to(original_dtype)
+        logger.info(f"[Replay] Downcast fp32 → {original_dtype}")
 
     # Don't move back to CPU - keep on GPU for training
     return state
@@ -1006,7 +1026,7 @@ def _restore_tied_weights(state_dict, checkpoint_dir):
 
 
 def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None, device='cpu',
-                               simulate_perturbation=True):
+                               simulate_perturbation=True, replay_in_fp32=False):
     """
     Load batch differential checkpoint.
 
@@ -1134,7 +1154,8 @@ def load_batch_diff_checkpoint(checkpoint_dir, base_checkpoint_dir=None, device=
     _replay_updates_on_state(reconstructed, updates, device=device,
                              trainable_param_names=trainable_param_names,
                              default_zo_eps=default_zo_eps_val,
-                             simulate_perturbation=simulate_perturbation)
+                             simulate_perturbation=simulate_perturbation,
+                             replay_in_fp32=replay_in_fp32)
 
     # Fix tied weights that may have diverged during replay
     _tie_state_dict_inplace(reconstructed, tied_groups)
@@ -1181,6 +1202,7 @@ def resume_from_batch_diff(
     pretrained_model_name: str = None,
     device: str = 'cpu',
     simulate_perturbation: bool = True,
+    replay_in_fp32: bool = False,
 ) -> OrderedDict:
     """
     Resume from batch differential checkpoints.
@@ -1195,6 +1217,8 @@ def resume_from_batch_diff(
         simulate_perturbation: If True (default), simulate the [+1, -2, +1] fp16 perturbation
                 loop during replay for bitwise-exact reconstruction. If False, skip it for
                 ~4x faster replay with negligible (~1e-6) parameter differences.
+        replay_in_fp32: If True, upcast fp16 state to fp32 during CPU replay to avoid
+                the ~7x penalty of torch.normal(dtype=fp16) on CPU. Default False.
 
     Returns:
         Reconstructed state_dict at the checkpoint (on CPU)
@@ -1366,7 +1390,8 @@ def resume_from_batch_diff(
                                          move_to_device=False,
                                          trainable_param_names=sub_tpn,
                                          default_zo_eps=default_zo_eps,
-                                         simulate_perturbation=simulate_perturbation)
+                                         simulate_perturbation=simulate_perturbation,
+                                         replay_in_fp32=replay_in_fp32)
                 total_updates += len(updates)
 
         if device == 'cuda' and torch.cuda.is_available():
@@ -1394,7 +1419,8 @@ def resume_from_batch_diff(
                                  move_to_device=False,
                                  trainable_param_names=trainable_param_names,
                                  default_zo_eps=default_zo_eps,
-                                 simulate_perturbation=simulate_perturbation)
+                                 simulate_perturbation=simulate_perturbation,
+                                 replay_in_fp32=replay_in_fp32)
         if device == 'cuda' and torch.cuda.is_available():
             torch.cuda.synchronize()
         t_replay = time.time() - t_replay_start

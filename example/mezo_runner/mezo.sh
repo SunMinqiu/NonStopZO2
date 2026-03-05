@@ -73,6 +73,9 @@ if [ -n "$BATCHDIFF_RESUME" ]; then
     if [ "$BATCHDIFF_SIMULATE_PERTURBATION" == "0" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --batchdiff_simulate_perturbation False"
     fi
+    if [ "$BATCHDIFF_REPLAY_FP32" == "1" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --batchdiff_replay_fp32"
+    fi
 elif [ -n "$RESUME_CKPT" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --resume_from_checkpoint $RESUME_CKPT"
 fi

@@ -43,6 +43,7 @@ export GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
 export BATCHDIFF_RESUME=${BATCHDIFF_RESUME:-""}
 export BATCHDIFF_REPLAY_DEVICE=${BATCHDIFF_REPLAY_DEVICE:-cpu}
 export BATCHDIFF_SIMULATE_PERTURBATION=${BATCHDIFF_SIMULATE_PERTURBATION:-1}
+export BATCHDIFF_REPLAY_FP32=${BATCHDIFF_REPLAY_FP32:-0}
 export RESUME_CKPT=${RESUME_CKPT:-""}
 
 # GPU 设置 (SLURM 已分配，不需要手动设置 CUDA_VISIBLE_DEVICES)
@@ -75,6 +76,9 @@ if [ -n "$BATCHDIFF_RESUME" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --batchdiff_resume $BATCHDIFF_RESUME --batchdiff_replay_device $BATCHDIFF_REPLAY_DEVICE"
     if [ "$BATCHDIFF_SIMULATE_PERTURBATION" == "0" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --batchdiff_simulate_perturbation False"
+    fi
+    if [ "$BATCHDIFF_REPLAY_FP32" == "1" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --batchdiff_replay_fp32"
     fi
 elif [ -n "$RESUME_CKPT" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --resume_from_checkpoint $RESUME_CKPT"

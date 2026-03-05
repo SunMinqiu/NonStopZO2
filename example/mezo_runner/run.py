@@ -143,6 +143,7 @@ class OurArguments(TrainingArguments):
     batchdiff_resume: str = ""  # path to base full checkpoint for resuming
     batchdiff_replay_device: str = "cpu"  # device for replay computation: 'cpu' or 'cuda'
     batchdiff_simulate_perturbation: bool = True  # simulate fp16 perturbation loop during replay (disable for ~4x speedup)
+    batchdiff_replay_fp32: bool = False  # upcast fp16→fp32 during CPU replay to avoid slow torch.normal(fp16) on CPU (~7x speedup)
 
     # ZO2 added -> ZO2 configs
     zo_method: str = "mezo-sgd"
@@ -578,6 +579,7 @@ class Framework:
                 pretrained_model_name=self.args.model_name,
                 device=self.args.batchdiff_replay_device,
                 simulate_perturbation=self.args.batchdiff_simulate_perturbation,
+                replay_in_fp32=self.args.batchdiff_replay_fp32,
             )
 
             # Load recovered state into model
