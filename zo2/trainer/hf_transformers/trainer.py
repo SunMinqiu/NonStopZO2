@@ -377,11 +377,8 @@ class ZOTrainer(Trainer):
                 or os.path.isfile(os.path.join(resume_from_checkpoint, "pytorch_model.bin"))
             )
             if not has_model:
-                has_zo_history = os.path.isfile(
-                    os.path.join(resume_from_checkpoint, "zo_replay_history.json")
-                )
                 opt_path = os.path.join(resume_from_checkpoint, "optimizer.pt")
-                if has_zo_history or os.path.isfile(opt_path):
+                if os.path.isfile(opt_path):
                     raise ValueError(
                         f"[Resume Error] The checkpoint at {resume_from_checkpoint} appears to be "
                         f"a differential checkpoint (no model files, but has ZO replay metadata). "
@@ -446,9 +443,9 @@ class ZOTrainer(Trainer):
 
     def _save_checkpoint(self, model, trial, metrics=None):
         """
-        Override to skip model saving when using incremental checkpoint.
-        ALL checkpoints (including first) skip Trainer's default model save.
-        Model saving is handled entirely by IncrementalCheckpointCallback.
+        Override: for batch_size >= 0, save log-based checkpoint (optimizer.pt with
+        zo_update_history). On full checkpoint steps, also save model files via Trainer.
+        For batch_size = -1 (disabled), falls through to default Trainer save.
         """
         from .batch_differential_checkpoint import BatchDiffCheckpointCallback
 
@@ -460,7 +457,7 @@ class ZOTrainer(Trainer):
                 self.use_incremental_checkpoint = True
                 break
 
-        if self.use_incremental_checkpoint and batchdiff_callback is not None:
+        if self.use_incremental_checkpoint and batchdiff_callback is not None and batchdiff_callback.batch_size >= 0:
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             run_dir = self._get_output_dir(trial=trial)
             output_dir = os.path.join(run_dir, checkpoint_folder)
@@ -476,47 +473,76 @@ class ZOTrainer(Trainer):
             # Save RNG state for deterministic resume
             self._save_rng_state(output_dir)
 
-            if batchdiff_callback.batch_size == 0:
-                # Log-based mode: save DEFAULT optimizer state + update history
-                # This ensures optimizer internal state (e.g. momentum) is restored correctly on resume
+            # Unified log-based save for all batch_size >= 0 modes
+            batch_size = batchdiff_callback.batch_size
+
+            # Determine if this is a full checkpoint step (batch_size >= 1 only)
+            is_full_step = False
+            if batch_size >= 1:
+                steps_since_base = self.state.global_step - batchdiff_callback.base_checkpoint_step
+                is_full_step = (steps_since_base >= batch_size)
+
+            with batchdiff_callback.update_lock:
+                updates = batchdiff_callback.update_history.copy()
+
+            # Detect model dtype for replay consistency
+            model_dtype = None
+            for p in model.parameters():
+                model_dtype = str(p.dtype)  # e.g. "torch.float16"
+                break
+
+            # Get the default optimizer state dict
+            optimizer_state = self.optimizer.state_dict()
+
+            # Add zo_update_history and metadata for replay
+            optimizer_state['zo_update_history'] = updates
+            if batch_size == 0:
+                optimizer_state['base_checkpoint'] = '__initial__'
+            else:
+                optimizer_state['base_checkpoint'] = batchdiff_callback.base_checkpoint_path
+            optimizer_state['current_step'] = self.state.global_step
+            optimizer_state['batch_size'] = batch_size
+            optimizer_state['num_updates'] = len(updates)
+            optimizer_state['tied_weights'] = getattr(batchdiff_callback, '_tied_weight_groups', [])
+            optimizer_state['model_dtype'] = model_dtype
+            optimizer_state['pending_grad'] = getattr(batchdiff_callback, '_pending_grad', 0.0)
+            optimizer_state['trainable_param_names'] = getattr(batchdiff_callback, '_trainable_param_names', None)
+            optimizer_state['is_full_checkpoint'] = is_full_step
+
+            # Save zo_eps for replay: needed to simulate fp16 perturbation residuals
+            zo_eps = getattr(model.opt, 'zo_eps', 0.0) if hasattr(model, 'opt') else 0.0
+            optimizer_state['zo_eps'] = zo_eps
+
+            # Save rng_device for replay: ensures replay uses same RNG device as training
+            rng_device = getattr(model.opt, 'rng_device', 'native') if hasattr(model, 'opt') else 'native'
+            optimizer_state['rng_device'] = rng_device
+
+            opt_path = os.path.join(output_dir, OPTIMIZER_NAME)
+            torch.save(optimizer_state, opt_path)
+            from .batch_differential_checkpoint import _fsync_file
+            _fsync_file(opt_path)
+            logger.info(f"[ZOTrainer] Saved {len(updates)} updates, pending_grad={optimizer_state['pending_grad']:.6e}"
+                        f", is_full_step={is_full_step}")
+
+            if is_full_step:
+                # Full checkpoint step: save model files via Trainer, then clear history
+                super()._save_checkpoint(model, trial)
+                # Update callback state
+                batchdiff_callback.base_checkpoint_path = output_dir
+                batchdiff_callback.base_checkpoint_step = self.state.global_step
                 with batchdiff_callback.update_lock:
-                    updates = batchdiff_callback.update_history.copy()
-
-                # Detect model dtype for replay consistency
-                model_dtype = None
-                for p in model.parameters():
-                    model_dtype = str(p.dtype)  # e.g. "torch.float16"
-                    break
-
-                # Get the default optimizer state dict
-                optimizer_state = self.optimizer.state_dict()
-
-                # Add zo_update_history and metadata for replay
-                optimizer_state['zo_update_history'] = updates
-                optimizer_state['base_checkpoint'] = '__initial__'  # batch_size=0 always accumulates from initial model
-                optimizer_state['current_step'] = self.state.global_step
-                optimizer_state['batch_size'] = 0
-                optimizer_state['num_updates'] = len(updates)
-                optimizer_state['tied_weights'] = getattr(batchdiff_callback, '_tied_weight_groups', [])
-                optimizer_state['model_dtype'] = model_dtype
-                optimizer_state['pending_grad'] = getattr(batchdiff_callback, '_pending_grad', 0.0)
-
-                # Save zo_eps for replay: needed to simulate fp16 perturbation residuals
-                zo_eps = getattr(model.opt, 'zo_eps', 0.0) if hasattr(model, 'opt') else 0.0
-                optimizer_state['zo_eps'] = zo_eps
-
-                torch.save(optimizer_state, os.path.join(output_dir, OPTIMIZER_NAME))
-                logger.info(f"[ZOTrainer] Saved pending_grad={optimizer_state['pending_grad']:.6e}")
-
-                # Delete model files if they exist (Trainer may have created them)
-                for fname in ["model.safetensors", "pytorch_model.bin"]:
-                    fpath = os.path.join(output_dir, fname)
-                    if os.path.exists(fpath):
-                        os.remove(fpath)
+                    batchdiff_callback.update_history = []
+                logger.info(f"[ZOTrainer] Full checkpoint at step {self.state.global_step}, cleared update history")
+            # Log checkpoint step: only optimizer.pt + metadata saved above, no model files created
             return
 
         # Default behavior: save full checkpoint (when NOT using incremental checkpoint)
         super()._save_checkpoint(model, trial)
+        # Fsync full checkpoint directory for L0 baseline
+        from .batch_differential_checkpoint import _fsync_directory
+        run_dir = self._get_output_dir(trial=trial)
+        ckpt_dir = os.path.join(run_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
+        _fsync_directory(ckpt_dir)
 
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -846,9 +872,19 @@ class ZOTrainer(Trainer):
 
                     # Log full resume time on first real training step
                     if hasattr(self, '_t_full_resume_start'):
-                        t_full_resume = time.time() - self._t_full_resume_start
+                        now = time.time()
+                        t_full_resume = now - self._t_full_resume_start
                         logger.info(f"[Full Resume] Total checkpoint resume time: {t_full_resume:.3f}s")
                         del self._t_full_resume_start
+                        if hasattr(self, '_t_program_start'):
+                            t_from_program = now - self._t_program_start
+                            t_setup = self._t_program_start  # will be subtracted below
+                            logger.info(f"[Full Resume] Total time from program start to first step: {t_from_program:.3f}s")
+                            del self._t_program_start
+                    elif hasattr(self, '_t_program_start'):
+                        t_from_program = time.time() - self._t_program_start
+                        logger.info(f"[No Resume] Total time from program start to first step: {t_from_program:.3f}s")
+                        del self._t_program_start
 
                     # ZO2 added -> estimate gradient and updates
                     if self.zo:
@@ -1055,13 +1091,21 @@ class ZOTrainer(Trainer):
             optimizer_path = os.path.join(checkpoint, OPTIMIZER_NAME)
             if os.path.exists(optimizer_path):
                 try:
-                    opt_state = torch.load(optimizer_path, map_location='cpu', weights_only=False)
+                    # Use cached optimizer state if available (avoids double loading from disk)
+                    if hasattr(self, '_cached_optimizer_state') and self._cached_optimizer_state is not None:
+                        opt_state = self._cached_optimizer_state
+                        del self._cached_optimizer_state
+                        logger.info("[ZOTrainer] Using cached optimizer state (skipped disk I/O)")
+                    else:
+                        opt_state = torch.load(optimizer_path, map_location='cpu', weights_only=False)
                     if isinstance(opt_state, dict) and 'zo_update_history' in opt_state:
                         logger.info("[ZOTrainer] Detected log-based checkpoint with zo_update_history")
 
                         # Extract and remove zo metadata, keep only standard optimizer state
                         zo_metadata_keys = ['zo_update_history', 'base_checkpoint', 'current_step',
-                                           'batch_size', 'num_updates', 'tied_weights', 'model_dtype']
+                                           'batch_size', 'num_updates', 'tied_weights', 'model_dtype',
+                                           'pending_grad', 'trainable_param_names', 'zo_eps',
+                                           'rng_device', 'is_full_checkpoint']
                         for key in zo_metadata_keys:
                             opt_state.pop(key, None)
 

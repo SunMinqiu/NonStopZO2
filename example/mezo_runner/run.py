@@ -4,6 +4,8 @@
 """
 Modified from https://github.com/princeton-nlp/MeZO/blob/main/large_models/run.py
 """
+import time as _time
+_PROGRAM_START = _time.time()
 
 import os
 # GPU 选择: 只使用 GPU 0 (在导入 torch 之前设置)
@@ -13,6 +15,12 @@ if "CUDA_VISIBLE_DEVICES" not in os.environ:
     gpu_id = os.environ.get("GPU_ID", "0")
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
     print(f"[run.py] Using GPU: {gpu_id}")
+
+# cuBLAS 确定性: 必须在 import torch 之前设置
+# 仅在 DETERMINISTIC=1 时启用，避免改变默认 cuBLAS 算法选择
+if os.environ.get("DETERMINISTIC", "0") == "1":
+    if os.environ.get("CUBLAS_WORKSPACE_CONFIG") is None:
+        os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 import sys
 sys.path.append("../../../zo2")
@@ -128,9 +136,8 @@ class OurArguments(TrainingArguments):
     # Batch Differential Checkpoint (实验层级配置)
     # BATCHDIFF_CKPT: batch differential checkpoint mode
     #   -1: Disabled (L0 baseline, uses default Trainer checkpoint)
-    #   0: Every step accumulative (incremental, all updates from base)
-    #   1: Pure differential (only current step's update)
-    #   >=2: Batch differential (every N steps, clear history and save new full checkpoint)
+    #   0: Log-based (accumulate all updates from base)
+    #   >=1: Full + Log (full checkpoint every N steps, log checkpoints in between)
     batchdiff_ckpt: int = -1  # batch differential checkpoint mode
     # L2: CPU Shadow (需要 batchdiff_ckpt >= 0)
     enable_shadow: bool = False  # enable real-time shadow model on CPU
@@ -141,9 +148,13 @@ class OurArguments(TrainingArguments):
     # Batch Diff Resume: specify the full checkpoint path to resume from
     # Will automatically scan parent directory for checkpoints and replay them
     batchdiff_resume: str = ""  # path to base full checkpoint for resuming
-    batchdiff_replay_device: str = "cpu"  # device for replay computation: 'cpu' or 'cuda'
+    batchdiff_replay_device: str = "cuda"  # device for replay computation: 'cpu' or 'cuda' (must match training device for correct RNG)
     batchdiff_simulate_perturbation: bool = True  # simulate fp16 perturbation loop during replay (disable for ~4x speedup)
     batchdiff_replay_fp32: bool = False  # upcast fp16→fp32 during CPU replay to avoid slow torch.normal(fp16) on CPU (~7x speedup)
+
+    # Deterministic reproducibility
+    deterministic: bool = False  # enable torch.use_deterministic_algorithms for cross-process reproducibility
+    zo_rng_device: str = "native"  # "native": use param's device (fast), "cpu": always generate z on CPU (cross-GPU portable, ~30% slower)
 
     # ZO2 added -> ZO2 configs
     zo_method: str = "mezo-sgd"
@@ -160,14 +171,19 @@ def parse_args():
     return args
 
 
-def set_seed(seed: int):
+def set_seed(seed: int, deterministic: bool = False):
     random.seed(seed)
+    os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     # 确保 cuDNN 确定性行为
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    # 确保 cuBLAS 确定性行为 (跨进程/跨GPU一致)
+    if deterministic:
+        torch.use_deterministic_algorithms(True)
+        logger.info("[set_seed] torch.use_deterministic_algorithms(True) enabled")
 
 
 class Framework:
@@ -234,13 +250,18 @@ class Framework:
                 eps=self.args.zo_eps,
                 offloading_device=self.args.offloading_device,
                 working_device=self.args.working_device,
+                rng_device=self.args.zo_rng_device,
             )
+            # Always load from model_name. from_pretrained happens before the timer
+            # and benefits equally from page cache for both resume paths.
+            model_load_path = self.args.model_name
+
             # Initialize model within zo_hf_init context
             with zo_hf_init(self.zo_config):
                 if "opt" in self.args.model_name:
                     from transformers import OPTForCausalLM
                     model = OPTForCausalLM.from_pretrained(
-                        self.args.model_name, 
+                        model_load_path,
                         config=config,
                         torch_dtype=torch_dtype,
                         max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
@@ -249,7 +270,7 @@ class Framework:
                 elif "Qwen3" in self.args.model_name:
                     from transformers import Qwen3ForCausalLM
                     model = Qwen3ForCausalLM.from_pretrained(
-                        self.args.model_name,
+                        model_load_path,
                         config=config,
                         torch_dtype=torch_dtype,
                         max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
@@ -531,18 +552,16 @@ class Framework:
                 instant_recover=self.args.instant_recover  # L3: 即时恢复
             )
 
-            # 打印层级配置
+            # 打印层级配置 (use actual callback state — shadow is forced off for batch_size<=0)
             if self.args.batchdiff_ckpt == 0:
-                mode_desc = "Incremental (accumulate all)"
-            elif self.args.batchdiff_ckpt == 1:
-                mode_desc = "Pure Differential (current step only)"
+                mode_desc = "Log-based (accumulate all)"
             else:
-                mode_desc = f"Batch Differential (every {self.args.batchdiff_ckpt} steps)"
+                mode_desc = f"Full + Log (every {self.args.batchdiff_ckpt} steps)"
 
             level = f"L1 ({mode_desc})"
-            if self.args.enable_shadow:
+            if batchdiff_callback.enable_shadow:
                 level = f"L2 (CPU Shadow) + {mode_desc}"
-                if self.args.instant_recover and gpu_fail_step > 0:
+                if batchdiff_callback.instant_recover and gpu_fail_step > 0:
                     level = f"L3 (Instant Recovery) + {mode_desc}"
             logger.info(f"[BatchDiff] Experiment level: {level}")
 
@@ -564,15 +583,18 @@ class Framework:
                 logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step} (L0 baseline, no recovery)")
 
         # Resume training from a last checkpoint
-        t_full_resume_start = time.time()
         last_checkpoint = None
         from transformers.trainer_utils import get_last_checkpoint
 
         # Handle batch differential resume
+        # Timer starts here — from_pretrained is before this (same for both paths).
+        t_full_resume_start = time.time()
         if self.args.batchdiff_resume:
             logger.info(f"[BatchDiff Resume] Resuming from batch differential checkpoint: {self.args.batchdiff_resume}")
 
-            # Use resume_from_batch_diff to reconstruct the model
+            # Both full and log-based go through resume_from_batch_diff.
+            # Full: loads checkpoint from disk, returns state_dict
+            # Log-based: loads base from _load_base_state (page cache hit) + replay
             recovered_state = resume_from_batch_diff(
                 checkpoint_path=self.args.batchdiff_resume,
                 output_dir=self.args.output_dir,
@@ -580,13 +602,10 @@ class Framework:
                 device=self.args.batchdiff_replay_device,
                 simulate_perturbation=self.args.batchdiff_simulate_perturbation,
                 replay_in_fp32=self.args.batchdiff_replay_fp32,
+                rng_device=self.args.zo_rng_device,
             )
-
-            # Load recovered state into model
             self.model.load_state_dict(recovered_state)
 
-            # Use the batchdiff checkpoint itself to resume trainer state (global_step, scheduler, etc.)
-            # Model weights are already loaded above, so _load_from_checkpoint will be skipped by ZOTrainer.
             last_checkpoint = self.args.batchdiff_resume
             import re
             match = re.search(r'checkpoint-(\d+)', last_checkpoint)
@@ -602,7 +621,7 @@ class Framework:
             )
         if self.args.resume_from_checkpoint is not None:
             last_checkpoint = self.args.resume_from_checkpoint
-
+        trainer._t_program_start = _PROGRAM_START
         if last_checkpoint is not None:
             trainer._t_full_resume_start = t_full_resume_start
         trainer.train(resume_from_checkpoint=last_checkpoint)
@@ -644,7 +663,7 @@ def result_file_tag(args):
 def main():
     args = parse_args()
 
-    set_seed(args.seed)
+    set_seed(args.seed, deterministic=args.deterministic)
     task = get_task(args.task_name)
     train_sets = task.sample_train_sets(num_train=args.num_train, num_dev=args.num_dev, num_eval=args.num_eval, num_train_sets=args.num_train_sets, seed=args.train_set_seed)
 

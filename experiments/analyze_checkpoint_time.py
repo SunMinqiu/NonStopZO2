@@ -8,6 +8,9 @@ Extracts times from lines like:
 Also detects resume info:
   [Resume Replay] 100 updates replayed in 7.781s (device=cuda)
   [Full Resume] Total checkpoint resume time: 14.883s
+  [Full Resume] Total time from program start to first step: 25.123s
+And train_runtime:
+  'train_runtime': 144.1797
 """
 
 import re
@@ -16,15 +19,16 @@ import statistics
 from pathlib import Path
 
 
-def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]], list[dict]]:
+def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]], list[dict], float | None]:
     """
     Extract checkpoint step numbers, times, and types from a log file.
-    Also extract resume information.
+    Also extract resume information and train_runtime.
 
     Returns:
         Tuple of:
         - List of (step, time_seconds, checkpoint_type) tuples
         - List of resume info dicts
+        - train_runtime in seconds (or None)
     """
     # Pattern 1: [Checkpoint Timing] <type> checkpoint save took <time>s at step <step>
     pattern1 = r'\[Checkpoint Timing\] (\w+) checkpoint save took ([\d.]+)s at step (\d+)'
@@ -33,9 +37,13 @@ def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]
     # Resume patterns
     resume_replay_pattern = r'\[Resume Replay\] (\d+) updates replayed in ([\d.]+)s \(device=(\w+)\)'
     full_resume_pattern = r'\[Full Resume\] Total checkpoint resume time: ([\d.]+)s'
+    full_resume_start_pattern = r'(?:\[Full Resume\] )?Total time from program start to first step: ([\d.]+)s'
+    # Train runtime pattern: 'train_runtime': 144.1797
+    train_runtime_pattern = r"'train_runtime':\s*([\d.]+)"
 
     results = []
     resume_info = []
+    train_runtime = None
 
     with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
         for line in f:
@@ -70,8 +78,21 @@ def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]
                     'type': 'Full Resume',
                     'time': float(match.group(1)),
                 })
+                continue
 
-    return results, resume_info
+            match = re.search(full_resume_start_pattern, line)
+            if match:
+                resume_info.append({
+                    'type': 'Full Resume Start',
+                    'time': float(match.group(1)),
+                })
+                continue
+
+            match = re.search(train_runtime_pattern, line)
+            if match:
+                train_runtime = float(match.group(1))
+
+    return results, resume_info, train_runtime
 
 
 def analyze_times(checkpoints: list[tuple[int, float, str]]) -> dict:
@@ -117,14 +138,76 @@ def analyze_by_type(checkpoints: list[tuple[int, float, str]]) -> dict:
     return stats_by_type
 
 
+def analyze_one_file(log_file: str, verbose: bool = False, by_type: bool = False):
+    """Analyze a single log file and print results."""
+    log_path = Path(log_file)
+    if not log_path.exists():
+        print(f"Error: File not found: {log_file}")
+        return 1
+
+    checkpoints, resume_info, train_runtime = extract_checkpoint_times(log_file)
+
+    if not checkpoints and not resume_info and train_runtime is None:
+        print(f"No checkpoint, resume, or runtime entries found in {log_file}")
+        return 0
+
+    print(f"{'=' * 50}")
+    print(f"Log file: {log_file}")
+    print(f"{'=' * 50}")
+
+    if train_runtime is not None:
+        print(f"Train runtime (e2e): {train_runtime:.4f}s")
+
+    if checkpoints:
+        stats = analyze_times(checkpoints)
+        print(f"Total checkpoints:  {stats['count']}")
+        print(f"Average time:       {stats['mean']:.4f}s")
+        print(f"Median time:        {stats['median']:.4f}s")
+        print(f"Standard deviation: {stats['stdev']:.4f}s")
+        print(f"Total time spent:   {stats['total']:.4f}s")
+
+        # Show statistics by checkpoint type
+        if by_type:
+            stats_by_type = analyze_by_type(checkpoints)
+            print(f"\nStatistics by Checkpoint Type:")
+            for checkpoint_type, type_stats in sorted(stats_by_type.items()):
+                print(f"\n{checkpoint_type} Checkpoints:")
+                print(f"  Count:              {type_stats['count']}")
+                print(f"  Average time:       {type_stats['mean']:.4f}s")
+                print(f"  Median time:        {type_stats['median']:.4f}s")
+                print(f"  Standard deviation: {type_stats['stdev']:.4f}s")
+                print(f"  Total time spent:   {type_stats['total']:.4f}s")
+
+        if verbose:
+            print("\nIndividual checkpoint times:")
+            print("-" * 50)
+            for step, time_sec, checkpoint_type in checkpoints:
+                print(f"  Step {step:>6} [{checkpoint_type:>15}]: {time_sec:.4f}s")
+
+    # Print resume information
+    if resume_info:
+        print(f"\nResume Information:")
+        for info in resume_info:
+            if info['type'] == 'Resume Replay':
+                print(f"  [Resume Replay] {info['updates']} updates replayed in {info['time']:.3f}s (device={info['device']})")
+            elif info['type'] == 'Full Resume':
+                print(f"  [Full Resume] Total checkpoint resume time: {info['time']:.3f}s")
+            elif info['type'] == 'Full Resume Start':
+                print(f"  [Full Resume] Total time from program start to first step: {info['time']:.3f}s")
+
+    print(f"{'=' * 50}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Analyze checkpoint times from log files'
     )
     parser.add_argument(
-        'log_file',
+        'log_files',
         type=str,
-        help='Path to the log file to analyze'
+        nargs='+',
+        help='Path(s) to the log file(s) to analyze'
     )
     parser.add_argument(
         '-v', '--verbose',
@@ -138,66 +221,15 @@ def main():
     )
     args = parser.parse_args()
 
-    log_path = Path(args.log_file)
-    if not log_path.exists():
-        print(f"Error: File not found: {args.log_file}")
-        return 1
+    ret = 0
+    for i, log_file in enumerate(args.log_files):
+        if i > 0:
+            print()
+        result = analyze_one_file(log_file, verbose=args.verbose, by_type=args.by_type)
+        if result != 0:
+            ret = result
 
-    checkpoints, resume_info = extract_checkpoint_times(args.log_file)
-
-    if not checkpoints and not resume_info:
-        print("No checkpoint or resume entries found in the log file.")
-        return 0
-
-    if checkpoints:
-        stats = analyze_times(checkpoints)
-
-        print(f"=" * 50)
-        print(f"Checkpoint Time Analysis")
-        print(f"Log file: {args.log_file}")
-        print(f"=" * 50)
-        print(f"Total checkpoints:  {stats['count']}")
-        print(f"Average time:       {stats['mean']:.4f}s")
-        print(f"Median time:        {stats['median']:.4f}s")
-        print(f"Standard deviation: {stats['stdev']:.4f}s")
-        print(f"Total time spent:   {stats['total']:.4f}s")
-        print(f"=" * 50)
-
-        # Show statistics by checkpoint type
-        if args.by_type:
-            stats_by_type = analyze_by_type(checkpoints)
-            print(f"\nStatistics by Checkpoint Type:")
-            print(f"=" * 50)
-            for checkpoint_type, type_stats in sorted(stats_by_type.items()):
-                print(f"\n{checkpoint_type} Checkpoints:")
-                print(f"  Count:              {type_stats['count']}")
-                print(f"  Average time:       {type_stats['mean']:.4f}s")
-                print(f"  Median time:        {type_stats['median']:.4f}s")
-                print(f"  Standard deviation: {type_stats['stdev']:.4f}s")
-                print(f"  Total time spent:   {type_stats['total']:.4f}s")
-            print(f"=" * 50)
-
-        if args.verbose:
-            print("\nIndividual checkpoint times:")
-            print("-" * 50)
-            for step, time_sec, checkpoint_type in checkpoints:
-                print(f"  Step {step:>6} [{checkpoint_type:>15}]: {time_sec:.4f}s")
-    else:
-        print("No checkpoint entries found in the log file.")
-
-    # Print resume information
-    if resume_info:
-        print(f"\n{'=' * 50}")
-        print(f"Resume Information")
-        print(f"{'=' * 50}")
-        for info in resume_info:
-            if info['type'] == 'Resume Replay':
-                print(f"  [Resume Replay] {info['updates']} updates replayed in {info['time']:.3f}s (device={info['device']})")
-            elif info['type'] == 'Full Resume':
-                print(f"  [Full Resume] Total checkpoint resume time: {info['time']:.3f}s")
-        print(f"{'=' * 50}")
-
-    return 0
+    return ret
 
 
 if __name__ == '__main__':

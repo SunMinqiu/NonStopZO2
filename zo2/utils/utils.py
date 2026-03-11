@@ -41,7 +41,7 @@ def cal_self_reg_loss(logits, labels):
     )
     return loss
 
-def seed_everything(seed):
+def seed_everything(seed, deterministic=False):
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
@@ -49,3 +49,5 @@ def seed_everything(seed):
     torch.cuda.manual_seed(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
+    if deterministic:
+        torch.use_deterministic_algorithms(True)

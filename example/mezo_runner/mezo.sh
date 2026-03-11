@@ -1,4 +1,4 @@
-export WANDB_PROJECT=${WANDB_PROJECT:-NonStopZO2}
+export WANDB_PROJECT=${WANDB_PROJECT:-NonStopZO2_New}
 
 # GPU 选择: 只使用指定的 GPU (默认使用 GPU 0)
 # 可以通过环境变量覆盖: GPU_ID=1 bash mezo.sh
@@ -37,8 +37,12 @@ ENABLE_SHADOW=${ENABLE_SHADOW:-0}
 INSTANT_RECOVER=${INSTANT_RECOVER:-0}
 GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
 BATCHDIFF_RESUME=${BATCHDIFF_RESUME:-""}
-BATCHDIFF_REPLAY_DEVICE=${BATCHDIFF_REPLAY_DEVICE:-cpu}
+BATCHDIFF_REPLAY_DEVICE=${BATCHDIFF_REPLAY_DEVICE:-cuda}
 BATCHDIFF_SIMULATE_PERTURBATION=${BATCHDIFF_SIMULATE_PERTURBATION:-1}
+# 确定性随机数: DETERMINISTIC=1 启用 torch.use_deterministic_algorithms (跨进程/跨GPU可复现)
+DETERMINISTIC=${DETERMINISTIC:-0}
+# ZO RNG 设备: "native" (用参数所在设备, 快) 或 "cpu" (跨GPU可移植, 慢~30%)
+ZO_RNG_DEVICE=${ZO_RNG_DEVICE:-native}
 
 TRAIN_NAME=${TRAIN_NAME:-"Test_staging_8"}
 RESUME_CKPT=${RESUME_CKPT:-""}
@@ -78,6 +82,14 @@ if [ -n "$BATCHDIFF_RESUME" ]; then
     fi
 elif [ -n "$RESUME_CKPT" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --resume_from_checkpoint $RESUME_CKPT"
+fi
+
+# 确定性随机数控制
+if [ "$DETERMINISTIC" == "1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --deterministic"
+fi
+if [ "$ZO_RNG_DEVICE" != "native" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --zo_rng_device $ZO_RNG_DEVICE"
 fi
 
 # 跳过训练后的评估阶段
@@ -122,16 +134,18 @@ echo "BATCHDIFF_CKPT: $BATCHDIFF_CKPT (-1=disabled, 0=incremental, 1=pure diff, 
 echo "ENABLE_SHADOW: $ENABLE_SHADOW"
 echo "INSTANT_RECOVER: $INSTANT_RECOVER"
 echo "GPU_FAIL_STEP: $GPU_FAIL_STEP"
-echo "BATCHDIFF_RESUME: $BATCHDIFF_RESUME"
-echo "BATCHDIFF_REPLAY_DEVICE: $BATCHDIFF_REPLAY_DEVICE"
-echo "BATCHDIFF_SIMULATE_PERTURBATION: $BATCHDIFF_SIMULATE_PERTURBATION (0=skip ~4x faster, 1=bitwise exact)"
+if [ -n "$BATCHDIFF_RESUME" ]; then
+    echo "BATCHDIFF_RESUME: $BATCHDIFF_RESUME"
+    echo "BATCHDIFF_REPLAY_DEVICE: $BATCHDIFF_REPLAY_DEVICE"
+    echo "BATCHDIFF_SIMULATE_PERTURBATION: $BATCHDIFF_SIMULATE_PERTURBATION (0=skip ~4x faster, 1=bitwise exact)"
+fi
 echo "Extra args: $EXTRA_ARGS $TASK_ARGS"
 echo "===================================="
 
 python /home/users/u0001609/NonStopZO2/example/mezo_runner/run.py \
     --model_name $MODEL \
     --task_name $TASK \
-    --output_dir /lvs0/rccs-hpbdrt/minqiu/ZO_ckpt/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
+    --output_dir ${OUTPUT_ROOT:-/lvs0/rccs-hpbdrt/minqiu/ZO_ckpt_New}/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
     --run_name $TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG \
     --tag $TAG \
     --train_set_seed $SEED \

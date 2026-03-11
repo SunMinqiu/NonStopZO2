@@ -36,6 +36,7 @@ class MeZOSGD(BaseOptimizer):
         self.zo_eps = config.eps
         self.max_zo_random_seed = config.max_zo_random_seed
         self.debug_mode = config.debug_mode
+        self.rng_device = getattr(config, 'rng_device', 'native')  # "native" or "cpu"
         defaults = dict(
             lr=self.lr,
             weight_decay=self.weight_decay,
@@ -46,6 +47,16 @@ class MeZOSGD(BaseOptimizer):
         )
         super().__init__(model.parameters(), defaults)
         
+    def _generate_z(self, param):
+        """Generate z noise for a parameter, respecting rng_device setting."""
+        if self.debug_mode:
+            return torch.ones_like(param.data)
+        if self.rng_device == "cpu" and param.data.device.type != "cpu":
+            z = torch.normal(mean=0, std=1, size=param.data.size(), dtype=torch.float32, device='cpu')
+            return z.to(dtype=param.data.dtype, device=param.data.device)
+        else:
+            return torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+
     @torch.inference_mode
     def zo_perturb_parameters(self, module: nn.Module, scaling_factor: float=1):
         """
@@ -57,11 +68,7 @@ class MeZOSGD(BaseOptimizer):
         """
         for _, param in module.named_parameters():
             if param.requires_grad:
-                # Resample z
-                if self.debug_mode:
-                    z = torch.ones_like(param.data) # for debug
-                else:
-                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                z = self._generate_z(param)
                 param.data.add_(scaling_factor * z * self.zo_eps)
 
     @torch.inference_mode
@@ -75,11 +82,7 @@ class MeZOSGD(BaseOptimizer):
         """
         for name, param in module.named_parameters():
             if param.requires_grad:
-                # Resample z
-                if self.debug_mode:
-                    z = torch.ones_like(param.data) # for debug
-                else:
-                    z = torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
+                z = self._generate_z(param)
                 if weight_decay != None:
                     param.data.sub_(
                         self.lr * (self.projected_grad * z + weight_decay * param.data))
