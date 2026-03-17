@@ -47,10 +47,22 @@ class MeZOSGD(BaseOptimizer):
         )
         super().__init__(model.parameters(), defaults)
         
+    def _reset_rng(self, seed):
+        """Reset RNG state for z generation. Called before each perturb/update block."""
+        if self.rng_device == "zo_rng":
+            import zo_rng
+            self._zo_gen = zo_rng.Generator(seed)
+        else:
+            torch.manual_seed(seed)
+
     def _generate_z(self, param):
         """Generate z noise for a parameter, respecting rng_device setting."""
         if self.debug_mode:
             return torch.ones_like(param.data)
+        if self.rng_device == "zo_rng":
+            # Cross-device deterministic: bit-exact same output on CPU and GPU
+            return self._zo_gen.randn(
+                param.data.shape, dtype=param.data.dtype, device=param.data.device)
         if self.rng_device == "cpu" and param.data.device.type != "cpu":
             z = torch.normal(mean=0, std=1, size=param.data.size(), dtype=torch.float32, device='cpu')
             return z.to(dtype=param.data.dtype, device=param.data.device)
@@ -116,19 +128,19 @@ class MeZOSGD(BaseOptimizer):
         """
         self._update_lr()
         self.zo_random_seed = zo_random_seed if zo_random_seed else np.random.randint(self.max_zo_random_seed)
-        torch.manual_seed(self.zo_random_seed)
+        self._reset_rng(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[0])
         loss1 = self.inner_zo_forward(*args, **kwargs)
-        torch.manual_seed(self.zo_random_seed)
+        self._reset_rng(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[1])
         loss2 = self.inner_zo_forward(*args, **kwargs)
         self.projected_grad = self.compute_grad(loss1, loss2)
         # In base ZO (synchronous), the update uses the grad just computed in the SAME step.
         # Record it so the checkpoint hook can pair (seed_N, grad_N) correctly.
         self._applied_update_grad = self.projected_grad
-        torch.manual_seed(self.zo_random_seed)
+        self._reset_rng(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[2])
-        torch.manual_seed(self.zo_random_seed)
+        self._reset_rng(self.zo_random_seed)
         self.zo_update(self.model)
         return loss1
 

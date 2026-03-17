@@ -30,7 +30,8 @@ class MeZOSGDConfig:
     precision_on_working_device: torch.dtype = torch.float32    # precision on working device, valid when using amp
     amp_compress_method: str = 'naive'  # currently only support naive amp compress, valid when using amp
 
-    # RNG device for z generation: "native" (use param's device, fast) or "cpu" (cross-GPU portable, ~30% slower)
+    # RNG device for z generation: "native" (param's device, fast), "cpu" (cross-GPU portable, ~30% slower),
+    # or "zo_rng" (cross-device bit-exact via zo_rng library — enables CPU replay of GPU training)
     rng_device: str = "native"
 
     # debug

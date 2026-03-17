@@ -9,6 +9,8 @@ Also detects resume info:
   [Resume Replay] 100 updates replayed in 7.781s (device=cuda)
   [Full Resume] Total checkpoint resume time: 14.883s
   [Full Resume] Total time from program start to first step: 25.123s
+And queued anchor enqueue info:
+  Queued anchor step 852 (lock=0.000s, state_dict=0.001s, copy=0.001s, total_enqueue=0.002s)
 And train_runtime:
   'train_runtime': 144.1797
 """
@@ -19,15 +21,16 @@ import statistics
 from pathlib import Path
 
 
-def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]], list[dict], float | None]:
+def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]], list[dict], list[float], float | None]:
     """
     Extract checkpoint step numbers, times, and types from a log file.
-    Also extract resume information and train_runtime.
+    Also extract resume information, queued anchor enqueue times, and train_runtime.
 
     Returns:
         Tuple of:
         - List of (step, time_seconds, checkpoint_type) tuples
         - List of resume info dicts
+        - List of queued anchor total_enqueue times (seconds)
         - train_runtime in seconds (or None)
     """
     # Pattern 1: [Checkpoint Timing] <type> checkpoint save took <time>s at step <step>
@@ -38,11 +41,14 @@ def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]
     resume_replay_pattern = r'\[Resume Replay\] (\d+) updates replayed in ([\d.]+)s \(device=(\w+)\)'
     full_resume_pattern = r'\[Full Resume\] Total checkpoint resume time: ([\d.]+)s'
     full_resume_start_pattern = r'(?:\[Full Resume\] )?Total time from program start to first step: ([\d.]+)s'
+    # Queued anchor pattern
+    queued_anchor_pattern = r'Queued anchor step \d+ \(.*?total_enqueue=([\d.]+)s\)'
     # Train runtime pattern: 'train_runtime': 144.1797
     train_runtime_pattern = r"'train_runtime':\s*([\d.]+)"
 
     results = []
     resume_info = []
+    enqueue_times = []
     train_runtime = None
 
     with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
@@ -88,11 +94,16 @@ def extract_checkpoint_times(log_file: str) -> tuple[list[tuple[int, float, str]
                 })
                 continue
 
+            match = re.search(queued_anchor_pattern, line)
+            if match:
+                enqueue_times.append(float(match.group(1)))
+                continue
+
             match = re.search(train_runtime_pattern, line)
             if match:
                 train_runtime = float(match.group(1))
 
-    return results, resume_info, train_runtime
+    return results, resume_info, enqueue_times, train_runtime
 
 
 def analyze_times(checkpoints: list[tuple[int, float, str]]) -> dict:
@@ -145,9 +156,9 @@ def analyze_one_file(log_file: str, verbose: bool = False, by_type: bool = False
         print(f"Error: File not found: {log_file}")
         return 1
 
-    checkpoints, resume_info, train_runtime = extract_checkpoint_times(log_file)
+    checkpoints, resume_info, enqueue_times, train_runtime = extract_checkpoint_times(log_file)
 
-    if not checkpoints and not resume_info and train_runtime is None:
+    if not checkpoints and not resume_info and not enqueue_times and train_runtime is None:
         print(f"No checkpoint, resume, or runtime entries found in {log_file}")
         return 0
 
@@ -183,6 +194,13 @@ def analyze_one_file(log_file: str, verbose: bool = False, by_type: bool = False
             print("-" * 50)
             for step, time_sec, checkpoint_type in checkpoints:
                 print(f"  Step {step:>6} [{checkpoint_type:>15}]: {time_sec:.4f}s")
+
+    # Print queued anchor enqueue information
+    if enqueue_times:
+        print(f"\nQueued Anchor Enqueue:")
+        print(f"  Total enqueues:     {len(enqueue_times)}")
+        print(f"  Total time:         {sum(enqueue_times):.4f}s")
+        print(f"  Average time:       {statistics.mean(enqueue_times):.4f}s")
 
     # Print resume information
     if resume_info:

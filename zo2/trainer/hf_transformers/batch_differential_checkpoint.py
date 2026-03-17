@@ -98,9 +98,10 @@ def _tie_state_dict_inplace(state: OrderedDict, tied_groups: list) -> None:
         if primary is None:
             continue
 
-        # Make all other keys in the group reference the primary tensor
+        # Make all other keys in the group reference the primary tensor.
+        # Also adds missing keys (e.g. lm_head.weight stripped during save).
         for name in group:
-            if name != primary and name in state:
+            if name != primary:
                 state[name] = state[primary]
 
 
@@ -187,6 +188,12 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         # Pending grad: the last computed projected_grad that hasn't been applied yet.
         # Saved in checkpoint so it can be restored on resume for the first step's zo_update.
         self._pending_grad = 0.0
+        # Pending seed: the zo_random_seed from the step that computed _pending_grad.
+        # Needed by ZO2 to reconstruct last_rstate (CUDA RNG state) on resume.
+        self._pending_seed = 0
+        # Base pending seed: the seed from the step that became the current base checkpoint.
+        # Needed by ZO2 replay: the first entry after a base uses this as prev_seed for z generation.
+        self._base_pending_seed = 0
 
         # Shadow model (real-time tracking)
         self.shadow_model: OrderedDict = None
@@ -309,20 +316,32 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         self.base_checkpoint_path = "__initial__"  # Special marker for initial state
 
         # Save initial model to output_dir for recovery (avoids HuggingFace re-download)
+        # Strip tied weight duplicates to match HuggingFace save_pretrained() convention.
         if self.output_dir:
             initial_model_dir = os.path.join(self.output_dir, "initial_model")
             os.makedirs(initial_model_dir, exist_ok=True)
+            # Compute excluded keys from tied groups (keep first, exclude rest)
+            excluded = set()
+            for group in self._tied_weight_groups:
+                for name in group[1:]:
+                    excluded.add(name)
+            if excluded:
+                save_state = OrderedDict(
+                    (k, v) for k, v in self.base_checkpoint_state.items() if k not in excluded
+                )
+            else:
+                save_state = self.base_checkpoint_state
             try:
                 from safetensors.torch import save_file
                 save_path = os.path.join(initial_model_dir, "model.safetensors")
-                save_file(self.base_checkpoint_state, save_path)
+                save_file(save_state, save_path)
                 _fsync_file(save_path)
-                logger.info(f"[BatchDiff] Initial model saved to {initial_model_dir} (safetensors)")
+                logger.info(f"[BatchDiff] Initial model saved to {initial_model_dir} (safetensors, excluded {len(excluded)} tied keys)")
             except ImportError:
                 save_path = os.path.join(initial_model_dir, "pytorch_model.bin")
-                torch.save(self.base_checkpoint_state, save_path)
+                torch.save(save_state, save_path)
                 _fsync_file(save_path)
-                logger.info(f"[BatchDiff] Initial model saved to {initial_model_dir} (pytorch_model.bin)")
+                logger.info(f"[BatchDiff] Initial model saved to {initial_model_dir} (pytorch_model.bin, excluded {len(excluded)} tied keys)")
 
         mem_mb = self._get_memory_size()
         t_elapsed = time.time() - t_start
@@ -366,6 +385,29 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             if pg is not None:
                 model.opt.projected_grad = float(pg)
                 logger.info(f"[BatchDiff Resume] Restored pending_grad={float(pg):.6e}")
+
+                # ZO2 only: reconstruct last_rstate so the first resumed step's
+                # zo_update can regenerate the correct perturbation vector z.
+                if pg != 0 and hasattr(model.opt, 'rstate_queue'):
+                    ps = opt_state.get('pending_seed', None)
+                    if ps is None:
+                        # Fallback: for checkpoints created before pending_seed was saved,
+                        # the last entry in zo_update_history has the seed we need (step >= 2).
+                        updates = opt_state.get('zo_update_history', [])
+                        if updates:
+                            ps = updates[-1]['seed']
+                            logger.info(f"[BatchDiff Resume] No pending_seed in checkpoint, "
+                                        f"using last update history seed={ps}")
+                        else:
+                            raise RuntimeError(
+                                f"Checkpoint has pending_grad={pg} but no pending_seed "
+                                "and empty zo_update_history. Cannot reconstruct RNG state "
+                                "for ZO2 delayed update. Re-run baseline with updated code."
+                            )
+                    torch.cuda.manual_seed(ps)
+                    model.opt.last_rstate = torch.cuda.get_rng_state()
+                    model.opt.rstate_queue.append(model.opt.last_rstate.clone())
+                    logger.info(f"[BatchDiff Resume] Reconstructed last_rstate from seed={ps}")
             else:
                 logger.warning("[BatchDiff Resume] No pending_grad found, "
                                "first step will skip zo_update (projected_grad=0)")
@@ -373,6 +415,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         # Load update history and base info
         if opt_state is not None:
             is_full_ckpt = opt_state.get('is_full_checkpoint', False)
+            self._base_pending_seed = opt_state.get('base_pending_seed', 0)
 
             if self.batch_size >= 1:
                 if is_full_ckpt:
@@ -520,27 +563,31 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 # Save the pending grad (newly computed, not yet applied) for checkpoint/resume.
                 # On resume, this will be restored to opt.projected_grad so the first step applies it.
                 self._pending_grad = float(new_grad) if not isinstance(new_grad, float) else new_grad
+                # Save the seed from this step — needed by ZO2 to reconstruct last_rstate on resume.
+                self._pending_seed = int(seed) if seed is not None else 0
 
-                # Only record if an actual update was applied in this step.
-                # Step 0 has applied_grad=0 (projected_grad initialized to 0), so it's skipped.
+                # Always record entries, including grad=0 (step 0 perturbation-only).
+                # This captures fp16 rounding from the perturbation-restore cycle AND
+                # provides the seed chain needed for ZO2 replay (entry[i-1]'s seed is
+                # used for entry[i]'s gradient update).
+                update = {
+                    'step': actual_step,
+                    'seed': int(seed) if seed is not None else 0,
+                    'grad': float(applied_grad) if not isinstance(applied_grad, float) else applied_grad,
+                    'lr': float(lr),
+                    'wd': float(wd),
+                    'zo_eps': float(zo_eps),
+                }
+                self.update_history.append(update)
                 if applied_grad != 0:
-                    update = {
-                        'step': actual_step,
-                        'seed': int(seed) if seed is not None else 0,
-                        'grad': float(applied_grad) if not isinstance(applied_grad, float) else applied_grad,
-                        'lr': float(lr),
-                        'wd': float(wd),
-                        'zo_eps': float(zo_eps),
-                    }
-                    self.update_history.append(update)
                     logger.info(f"[HOOK] step={actual_step}, UPDATE RECORDED: seed={update['seed']}, "
                                 f"applied_grad={update['grad']:.6e}, new_grad={new_grad:.6e}, lr={lr}, wd={wd}")
                     # Verification tag: grep "[VERIFY]" to cross-check train vs replay
                     logger.info(f"[VERIFY] step={actual_step} total_updates={len(self.update_history)} "
                                 f"pending_grad={self._pending_grad:.6e}")
                 else:
-                    logger.info(f"[HOOK] step={actual_step}, NO UPDATE (applied_grad=0), "
-                                f"new_grad={new_grad:.6e} (will be applied next step)")
+                    logger.info(f"[HOOK] step={actual_step}, PERTURBATION-ONLY (grad=0): "
+                                f"seed={update['seed']}, new_grad={new_grad:.6e} (will be applied next step)")
 
         return model, inputs, loss
 
@@ -756,6 +803,28 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         """Called at training end"""
         logger.info("[BatchDiff] Training ended, cleaning up...")
 
+        # Shutdown async anchor checkpointer (wait for last persist to finish)
+        async_anchor = getattr(self, '_async_anchor', None)
+        if async_anchor is not None:
+            logger.info("[AsyncAnchor] Waiting for last anchor persist to complete...")
+            async_anchor.shutdown()
+            # Final base update
+            completed_step = async_anchor.get_latest_completed_anchor_step()
+            if completed_step > self.base_checkpoint_step:
+                self.base_checkpoint_path = async_anchor.get_latest_completed_anchor_path()
+                self.base_checkpoint_step = completed_step
+                with self.update_lock:
+                    # Capture base_pending_seed before trimming
+                    for u in reversed(self.update_history):
+                        if u['step'] <= completed_step:
+                            self._base_pending_seed = u['seed']
+                            break
+                    self.update_history = [
+                        u for u in self.update_history
+                        if u['step'] > completed_step
+                    ]
+            logger.info(f"[AsyncAnchor] Final stats: {async_anchor.stats}")
+
         if self.enable_shadow:
             self.shadow_running = False
             if self.shadow_thread and self.shadow_thread.is_alive():
@@ -779,13 +848,17 @@ ZOReplayCheckpointCallback = BatchDiffCheckpointCallback
 IncrementalCheckpointCallback = BatchDiffCheckpointCallback
 
 
-def _generate_z_for_replay(param, rng_device="native"):
+def _generate_z_for_replay(param, rng_device="native", zo_gen=None):
     """Generate z noise for replay, respecting rng_device setting.
 
     Args:
         param: The parameter tensor (determines size, dtype, target device)
-        rng_device: "native" (use param's device) or "cpu" (always CPU, cross-GPU portable)
+        rng_device: "native" (use param's device), "cpu" (always CPU, cross-GPU portable),
+                    or "zo_rng" (cross-device deterministic via zo_rng library)
+        zo_gen: zo_rng.Generator instance (required when rng_device="zo_rng")
     """
+    if rng_device == "zo_rng":
+        return zo_gen.randn(param.shape, dtype=param.dtype, device=param.device)
     if rng_device == "cpu" and param.device.type != "cpu":
         z = torch.normal(mean=0, std=1, size=param.size(), dtype=torch.float32, device='cpu')
         return z.to(dtype=param.dtype, device=param.device)
@@ -794,7 +867,8 @@ def _generate_z_for_replay(param, rng_device="native"):
 
 
 def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
-                         simulate_perturbation=True, rng_device="native"):
+                         simulate_perturbation=True, rng_device="native",
+                         zo2_mode=False, prev_seed=None):
     """Apply one ZO update (perturbation + parameter update) to a state dict in-place.
 
     Simulates the full perturbation sequence [+1, -2, +1] * eps * z from zo_forward
@@ -805,8 +879,14 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
             loop to reproduce fp16 rounding residuals for bitwise-exact replay. If False,
             skip the perturbation loop (~4x faster) at the cost of ~1e-6 level parameter
             differences. Safe to disable for most use cases.
-        rng_device: "native" (use param's device) or "cpu" (always CPU, cross-GPU portable).
+        rng_device: "native" (use param's device), "cpu" (always CPU, cross-GPU portable),
+            or "zo_rng" (cross-device deterministic — CPU replay matches GPU training).
             Must match the rng_device used during training for bitwise-exact replay.
+        zo2_mode: If True, use ZO2 replay order: gradient FIRST (using prev step's seed),
+            then perturbation (using current seed). This matches ZO2 training where the
+            delayed update from step N is applied before step N+1's perturbation.
+        prev_seed: Seed from the previous update entry. In ZO2 mode, the gradient update
+            uses z generated from the previous step's seed (via last_rstate).
     """
     seed = update['seed']
     grad = update['grad']
@@ -814,22 +894,56 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
     wd = update.get('wd', 0.0)
     zo_eps = update.get('zo_eps', default_zo_eps)
 
-    if simulate_perturbation and zo_eps > 0:
-        for scaling_factor in [1, -2, 1]:
-            torch.manual_seed(seed)
+    def _reset_rng(rng_seed=None):
+        """Reset RNG; returns zo_gen for zo_rng mode, None otherwise."""
+        s = rng_seed if rng_seed is not None else seed
+        if rng_device == "zo_rng":
+            import zo_rng
+            return zo_rng.Generator(s)
+        torch.manual_seed(s)
+        return None
+
+    if zo2_mode and grad != 0:
+        # ZO2 order: gradient FIRST (using prev step's seed), then perturbation.
+        # In ZO2 training, module_dual_forward does:
+        #   1. zo_update(module) — applies delayed grad using last_rstate (prev seed's RNG)
+        #   2. zo_perturb [+1, -2, +1] — uses current seed's RNG
+        grad_seed = prev_seed if prev_seed is not None else seed
+        zo_gen = _reset_rng(grad_seed)
+        for name in param_names:
+            param = state[name]
+            z = _generate_z_for_replay(param, rng_device, zo_gen)
+            if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
+                param.sub_(lr * (grad * z + wd * param))
+            else:
+                param.sub_(lr * grad * z)
+
+        if simulate_perturbation and zo_eps > 0:
+            for scaling_factor in [1, -2, 1]:
+                zo_gen = _reset_rng(seed)
+                for name in param_names:
+                    param = state[name]
+                    z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    param.data.add_(scaling_factor * z * zo_eps)
+    else:
+        # Regular ZO order (or grad=0 perturbation-only): perturbation first, then gradient.
+        if simulate_perturbation and zo_eps > 0:
+            for scaling_factor in [1, -2, 1]:
+                zo_gen = _reset_rng()
+                for name in param_names:
+                    param = state[name]
+                    z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    param.data.add_(scaling_factor * z * zo_eps)
+
+        if grad != 0:
+            zo_gen = _reset_rng()
             for name in param_names:
                 param = state[name]
-                z = _generate_z_for_replay(param, rng_device)
-                param.data.add_(scaling_factor * z * zo_eps)
-
-    torch.manual_seed(seed)
-    for name in param_names:
-        param = state[name]
-        z = _generate_z_for_replay(param, rng_device)
-        if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
-            param.sub_(lr * (grad * z + wd * param))
-        else:
-            param.sub_(lr * grad * z)
+                z = _generate_z_for_replay(param, rng_device, zo_gen)
+                if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
+                    param.sub_(lr * (grad * z + wd * param))
+                else:
+                    param.sub_(lr * grad * z)
 
 
 def _replay_updates_on_state(
@@ -842,6 +956,8 @@ def _replay_updates_on_state(
     simulate_perturbation: bool = True,
     replay_in_fp32: bool = False,
     rng_device: str = "native",
+    zo2_mode: bool = False,
+    initial_prev_seed: int = None,
 ) -> OrderedDict:
     """
     Replay ZO updates on a state dict.
@@ -867,6 +983,9 @@ def _replay_updates_on_state(
         replay_in_fp32: If True, upcast fp16 state to fp32 before replay and downcast back
                         after. This avoids the ~7x penalty of torch.normal(dtype=fp16) on CPU.
                         Only affects CPU replay with fp16 models. Default False.
+        initial_prev_seed: Seed from the base checkpoint step. In ZO2 mode, the first
+                        replay entry (i=0) needs this as prev_seed for gradient z generation.
+                        Without it, the first entry would use its own seed (wrong).
 
     Returns:
         The modified state dict (stays on the device where computation was done)
@@ -895,19 +1014,23 @@ def _replay_updates_on_state(
             logger.info(f"[Replay] Upcast {original_dtype} → fp32 for CPU replay")
 
     logger.info(f"[Replay] Replaying {len(updates)} updates on device={actual_device}"
-                f" (simulate_perturbation={simulate_perturbation}, replay_in_fp32={replay_in_fp32})")
-    if actual_device == 'cpu' and torch.cuda.is_available():
+                f" (simulate_perturbation={simulate_perturbation}, replay_in_fp32={replay_in_fp32},"
+                f" rng_device={rng_device})")
+    if actual_device == 'cpu' and torch.cuda.is_available() and rng_device != "zo_rng":
         logger.warning("[Replay] WARNING: Replaying on CPU but CUDA is available. "
                        "CPU and CUDA RNG produce different z for the same seed. "
-                       "Use device='cuda' for exact reconstruction of CUDA-trained models.")
+                       "Use device='cuda' for exact reconstruction, or use ZO_RNG_DEVICE=zo_rng "
+                       "for cross-device deterministic replay.")
 
     # Use trainable_param_names if available to match training's iteration order;
     # otherwise fall back to all state dict keys (backward compatible with old checkpoints)
     param_names = trainable_param_names if trainable_param_names is not None else list(state.keys())
 
     for i, update in enumerate(updates):
+        prev_seed = (initial_prev_seed if i == 0 else updates[i - 1]['seed']) if zo2_mode else None
         _apply_single_update(state, update, param_names, default_zo_eps=default_zo_eps,
-                             simulate_perturbation=simulate_perturbation, rng_device=rng_device)
+                             simulate_perturbation=simulate_perturbation, rng_device=rng_device,
+                             zo2_mode=zo2_mode, prev_seed=prev_seed)
 
         if i < 3 or i == len(updates) - 1:
             logger.info(f"[Replay] update {i}: step={update.get('step','?')}, seed={update['seed']}, "
@@ -1041,6 +1164,7 @@ def resume_from_batch_diff(
     base_state_dict: OrderedDict = None,
     cached_optimizer_state: dict = None,
     rng_device: str = "native",
+    zo2_mode: bool = False,
 ) -> OrderedDict:
     """
     Resume from batch differential checkpoints.
@@ -1061,6 +1185,8 @@ def resume_from_batch_diff(
                 in memory). If provided, skips _load_base_state to avoid redundant disk I/O.
         cached_optimizer_state: Optional. Pre-loaded optimizer.pt content. If provided,
                 skips loading optimizer.pt again (avoids double loading).
+        zo2_mode: If True, use ZO2 replay order (gradient first with prev step's seed,
+                then perturbation). Auto-detected from checkpoint metadata if not specified.
 
     Returns:
         Reconstructed state_dict at the checkpoint (on CPU)
@@ -1114,6 +1240,7 @@ def resume_from_batch_diff(
     default_zo_eps = optimizer_state.get('zo_eps', 0.0)
     model_dtype_str = optimizer_state.get('model_dtype', None)
     pending_grad = optimizer_state.get('pending_grad', None)
+    base_pending_seed = optimizer_state.get('base_pending_seed', None)
     is_full_checkpoint = optimizer_state.get('is_full_checkpoint', False)
 
     # Auto-detect rng_device from checkpoint if caller didn't specify
@@ -1121,6 +1248,15 @@ def resume_from_batch_diff(
     if rng_device == "native" and ckpt_rng_device != "native":
         rng_device = ckpt_rng_device
         logger.info(f"[Resume] Auto-detected rng_device={rng_device} from checkpoint")
+
+    # Auto-detect zo2_mode from checkpoint if caller didn't specify
+    if not zo2_mode:
+        ckpt_zo2 = optimizer_state.get('zo2', False)
+        if ckpt_zo2:
+            zo2_mode = True
+            logger.info(f"[Resume] Auto-detected zo2_mode=True from checkpoint")
+    if zo2_mode:
+        logger.info(f"[Resume] ZO2 mode: will use prev-step seed for gradient, current seed for perturbation")
 
     model_dtype = _DTYPE_MAP.get(model_dtype_str, None)
 
@@ -1180,7 +1316,9 @@ def resume_from_batch_diff(
                              default_zo_eps=default_zo_eps,
                              simulate_perturbation=simulate_perturbation,
                              replay_in_fp32=replay_in_fp32,
-                             rng_device=rng_device)
+                             rng_device=rng_device,
+                             zo2_mode=zo2_mode,
+                             initial_prev_seed=base_pending_seed)
     if device == 'cuda' and torch.cuda.is_available():
         torch.cuda.synchronize()
     t_replay = time.time() - t_replay_start

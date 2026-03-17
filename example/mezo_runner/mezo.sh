@@ -18,6 +18,7 @@ DEV=${DEV:-500}
 EVAL=${EVAL:-1000}
 STEPS=${STEPS:-20000}
 EVAL_STEPS=${EVAL_STEPS:-4000}
+LOGGING_STEPS=${LOGGING_STEPS:-10}
 
 MODE=${MODE:-ft}
 SAVE_STEPS=${SAVE_STEPS:-20000}
@@ -36,13 +37,21 @@ BATCHDIFF_CKPT=${BATCHDIFF_CKPT:--1}
 ENABLE_SHADOW=${ENABLE_SHADOW:-0}
 INSTANT_RECOVER=${INSTANT_RECOVER:-0}
 GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
+# Async Anchor: 异步写入 full checkpoint (仅 BATCHDIFF_CKPT>=1 时有效)
+# GPU→CPU 异步拷贝 + 后台线程写盘，训练不阻塞
+ASYNC_ANCHOR=${ASYNC_ANCHOR:-0}
+OUTPUT_LOG=${OUTPUT_LOG:-""}
 BATCHDIFF_RESUME=${BATCHDIFF_RESUME:-""}
 BATCHDIFF_REPLAY_DEVICE=${BATCHDIFF_REPLAY_DEVICE:-cuda}
 BATCHDIFF_SIMULATE_PERTURBATION=${BATCHDIFF_SIMULATE_PERTURBATION:-1}
 # 确定性随机数: DETERMINISTIC=1 启用 torch.use_deterministic_algorithms (跨进程/跨GPU可复现)
 DETERMINISTIC=${DETERMINISTIC:-0}
-# ZO RNG 设备: "native" (用参数所在设备, 快) 或 "cpu" (跨GPU可移植, 慢~30%)
+# ZO RNG 设备: "native" (用参数所在设备, 快), "cpu" (跨GPU可移植, 慢两百来倍！),
+#              "zo_rng" (跨设备 bit-exact, 支持 BATCHDIFF_REPLAY_DEVICE=cpu 精确还原 GPU 训练)
 ZO_RNG_DEVICE=${ZO_RNG_DEVICE:-native}
+
+# 模型精度: "fp16" (默认), "bf16", "fp32"
+DTYPE=${DTYPE:-fp16}
 
 TRAIN_NAME=${TRAIN_NAME:-"Test_staging_8"}
 RESUME_CKPT=${RESUME_CKPT:-""}
@@ -62,6 +71,15 @@ if [ "$BATCHDIFF_CKPT" != "-1" ]; then
         # L3: 即时恢复 (必须在 L2+GPU故障 上)
         if [ "$INSTANT_RECOVER" == "1" ] && [ "$GPU_FAIL_STEP" != "-1" ]; then
             EXTRA_ARGS="$EXTRA_ARGS --instant_recover"
+        fi
+    fi
+
+    # Async Anchor (必须在 BATCHDIFF_CKPT>=1 上)
+    if [ "$ASYNC_ANCHOR" == "1" ] && [ "$BATCHDIFF_CKPT" -ge "1" ] 2>/dev/null; then
+        EXTRA_ARGS="$EXTRA_ARGS --async_anchor"
+        # OUTPUT_LOG: log checkpoints 写入独立目录 (full checkpoints 仍在 OUTPUT_ROOT)
+        if [ -n "$OUTPUT_LOG" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --log_output_dir ${OUTPUT_LOG}/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG"
         fi
     fi
 fi
@@ -127,12 +145,16 @@ esac
 echo "========== Configuration =========="
 echo "TAG: $TAG"
 echo "BS: $BS, LR: $LR, EPS: $EPS, SEED: $SEED"
-echo "STEPS: $STEPS, EVAL_STEPS: $EVAL_STEPS, SAVE_STEPS: $SAVE_STEPS"
-echo "MODE: $MODE, DO_EVAL: $DO_EVAL"
+echo "STEPS: $STEPS, EVAL_STEPS: $EVAL_STEPS, SAVE_STEPS: $SAVE_STEPS, LOGGING_STEPS: $LOGGING_STEPS"
+echo "MODE: $MODE, DTYPE: $DTYPE, DO_EVAL: $DO_EVAL"
 echo "--- Batch Differential Checkpoint ---"
 echo "BATCHDIFF_CKPT: $BATCHDIFF_CKPT (-1=disabled, 0=incremental, 1=pure diff, N>=2=batch diff)"
 echo "ENABLE_SHADOW: $ENABLE_SHADOW"
 echo "INSTANT_RECOVER: $INSTANT_RECOVER"
+echo "ASYNC_ANCHOR: $ASYNC_ANCHOR"
+if [ -n "$OUTPUT_LOG" ]; then
+    echo "OUTPUT_LOG: $OUTPUT_LOG"
+fi
 echo "GPU_FAIL_STEP: $GPU_FAIL_STEP"
 if [ -n "$BATCHDIFF_RESUME" ]; then
     echo "BATCHDIFF_RESUME: $BATCHDIFF_RESUME"
@@ -152,10 +174,10 @@ python /home/users/u0001609/NonStopZO2/example/mezo_runner/run.py \
     --num_train $TRAIN \
     --num_dev $DEV \
     --num_eval $EVAL \
-    --logging_steps 10 \
+    --logging_steps $LOGGING_STEPS \
     --max_steps $STEPS \
-    --trainer zo \
-    --load_float16 \
+    --trainer zo2 \
+    $([ "$DTYPE" == "fp16" ] && echo "--load_float16" || [ "$DTYPE" == "bf16" ] && echo "--load_bfloat16") \
     --learning_rate $LR \
     --zo_eps $EPS \
     --per_device_train_batch_size $BS \

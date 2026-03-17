@@ -57,3 +57,25 @@ void zo_rng_generate_cuda(int64_t seed, int64_t counter, int64_t n,
     zo_rng_kernel<<<blocks, threads, 0, cu_stream>>>(
         key_lo, key_hi, counter, n, output);
 }
+
+/*
+ * High-level entry point called from bindings.cpp.
+ * Handles device setup, tensor allocation, and stream management
+ * so that bindings.cpp doesn't need any CUDA headers.
+ */
+#include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
+#include <c10/cuda/CUDAGuard.h>
+
+extern "C"
+torch::Tensor zo_rng_generate_cuda_tensor(int64_t seed, int64_t counter,
+                                           int64_t n, int device_idx) {
+    c10::cuda::CUDAGuard guard(device_idx);
+    auto output = torch::empty({n}, torch::TensorOptions()
+                                        .dtype(torch::kFloat32)
+                                        .device(torch::kCUDA, device_idx));
+    auto stream = c10::cuda::getCurrentCUDAStream(device_idx).stream();
+    zo_rng_generate_cuda(seed, counter, n,
+                          output.data_ptr<float>(), (void *)stream);
+    return output;
+}

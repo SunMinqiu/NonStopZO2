@@ -17,7 +17,7 @@ ZO Checkpoint 成本模型：计算 + 画图
           "e2e_train": [
             {"checkpoint_type": "full"/"log", "checkpoint numbers": N, "e2e_time_seconds": T},
           ],
-          "full checkpoint resume time": 标量 (可选),
+          "full checkpoint resume time": Rf (标量),
           "log checkpoint resume time": dict 或 list[dict],
             每个 dict: {"type": "simulation"/"no-simulation", "data": [
               {"replay_steps": K, "replay_time": T, "total_resume_time": T}, ...
@@ -27,10 +27,14 @@ ZO Checkpoint 成本模型：计算 + 画图
     },
   }
 
-恢复公式:
-  U = polyfit(replay_steps, replay_time) 的斜率（包含 steps=0 数据点）
-  cold_start_i = total_resume_time_i - U * replay_steps_i
-  cold_start = mean(cold_start_i)
+核心公式:
+  overhead(K) = (Ca + K*tl)/(K*t + Ca) + [Rf + U*K*(K*t/2 + Ca)/(K*t + Ca)] / M
+  K* = (1/t) * (sqrt(Ca * (2*M*ts/U - Ca)) - Ca),  t = ts + tl
+
+恢复参数:
+  Rf = "full checkpoint resume time" (anchor 加载时间)
+  U  = polyfit(replay_steps, replay_time) 的斜率
+  δ  = Rf - (total_resume_time[steps=1] - U)  (首次恢复省下的时间)
 """
 
 import numpy as np
@@ -63,29 +67,41 @@ plt.rcParams.update({
 #  核心公式
 # ============================================================
 
-def K_star(C, U, M, ts, tl=0):
-    """最优 Full checkpoint 间隔。K* = (1/t) * ( sqrt( C*(2*M*ts/U - C) ) - C )"""
+def K_star(Ca, U, M, ts, tl=0, n_lag=0):
+    """最优 anchor 间隔。
+    同步模式 (n_lag=0): K* = (1/t) * ( sqrt( Ca*(2*M*ts/U - Ca) ) - Ca )
+    异步模式 (Ca=0, n_lag>0): overhead 对 K 单调递增, K* = n_lag (物理下限)
+    """
     t = ts + tl
-    inside = C * (2 * M * ts / U - C)
+    if Ca <= 0:
+        # 异步模式: Ca=0, overhead = [Rf + U*(K+n_lag)*...] / M
+        # 对K单调递增, 最优K尽可能小, 下限 = n_lag
+        return np.full_like(np.asarray(M, dtype=float), n_lag)
+    inside = Ca * (2 * M * ts / U - Ca)
     inside = np.maximum(inside, 0)
-    return np.maximum((np.sqrt(inside) - C) / t, 0)
+    return np.maximum((np.sqrt(inside) - Ca) / t, 0)
 
 
-def overhead(K, C, U, M, ts, tl=0, cold_start=0):
-    """per-unit-time overhead（无量纲比例）。"""
+def overhead(K, Ca, U, M, ts, tl=0, Rf=0, n_lag=0):
+    """per-unit-time overhead（无量纲比例）。
+    同步: (Ca + K*tl)/(K*t+Ca) + [Rf + U*K*(K*t/2+Ca)/(K*t+Ca)] / M
+    异步 (Ca=0): K*tl/(K*t) + [Rf + U*(K+n_lag)*(K*t/2)/(K*t)] / M
+    """
     t = ts + tl
-    T_cycle = K * t + C
-    ckpt_cost = (C + K * tl) / T_cycle
-    E_replay = U * K * (K * t / 2 + C) / T_cycle
-    return ckpt_cost + (cold_start + E_replay) / M
+    T_cycle = K * t + Ca
+    ckpt_cost = (Ca + K * tl) / T_cycle
+    K_eff = K + n_lag  # 异步模式下 replay 距离多了 n_lag
+    E_replay = U * K_eff * (K * t / 2 + Ca) / T_cycle
+    return ckpt_cost + (Rf + E_replay) / M
 
 
-def recovery_time(K, C, U, ts, tl=0, cold_start=0):
-    """平均恢复时间 = cold_start + E[回放时间]"""
+def recovery_time(K, Ca, U, ts, tl=0, Rf=0, n_lag=0):
+    """平均恢复时间 = Rf + E[回放时间]"""
     t = ts + tl
-    T_cycle = K * t + C
-    E_replay = U * K * (K * t / 2 + C) / T_cycle
-    return cold_start + E_replay
+    T_cycle = K * t + Ca
+    K_eff = K + n_lag
+    E_replay = U * K_eff * (K * t / 2 + Ca) / T_cycle
+    return Rf + E_replay
 
 
 # ============================================================
@@ -119,6 +135,7 @@ def flatten_experiments(experiments):
                 "total_steps": total_steps,
                 "avg_full_ckpt_time": info.get("avg_full_ckpt_time"),
                 "avg_log_ckpt_time": info.get("avg_log_ckpt_time"),
+                "n_lag": info.get("n_lag", 0),
                 "e2e_train": info.get("e2e_train", []),
                 "full_resume_time": info.get("full checkpoint resume time"),
                 "log_resume_time_raw": info.get("log checkpoint resume time"),
@@ -127,18 +144,16 @@ def flatten_experiments(experiments):
     return records
 
 
-def compute_log_resume_params(log_resume_raw):
+def compute_log_resume_params(log_resume_raw, full_resume_time=None):
     """
     从 "log checkpoint resume time" 原始数据计算回放参数。
 
-    用 ALL 数据点（含 replay_steps=0）做 polyfit 拟合 U：
-      2+ 个点: U = polyfit slope
-      1 个点 (steps>0): U = replay_time / steps
-      1 个点 (steps=0): U = 0
+    U = polyfit(replay_steps, replay_time) 的斜率
+    Rf = full_resume_time (anchor 加载时间，从外部传入)
+    δ  = Rf - (total_resume_time[steps=min] - U*min_steps)
+         即首次恢复比稳态恢复省下的时间
 
-    cold_start = mean(total_resume_time_i - U * replay_steps_i)
-
-    Returns: [{"type", "U", "cold_start", "data"}, ...]
+    Returns: [{"type", "U", "Rf", "delta", "data"}, ...]
     """
     if log_resume_raw is None:
         return []
@@ -148,6 +163,8 @@ def compute_log_resume_params(log_resume_raw):
         entries = [log_resume_raw]
     else:
         entries = list(log_resume_raw)
+
+    Rf = full_resume_time if full_resume_time is not None else 0.0
 
     results = []
     for entry in entries:
@@ -168,18 +185,25 @@ def compute_log_resume_params(log_resume_raw):
 
         U = max(0.0, float(U))
 
-        # cold_start from total_resume_time
-        cs_list = []
-        for d in data:
-            trt = d.get("total_resume_time")
+        # delta: 首次恢复省下的时间
+        # 找 replay_steps 最小的数据点
+        delta = 0.0
+        if Rf > 0:
+            min_idx = int(np.argmin(steps))
+            d_min = data[min_idx]
+            trt = d_min.get("total_resume_time")
             if trt is not None:
-                cs_list.append(trt - U * d["replay_steps"])
-        cold_start = max(0.0, float(np.mean(cs_list))) if cs_list else 0.0
+                # 稳态恢复时间 = Rf + U * steps
+                # 实测恢复时间 = trt
+                # delta = 稳态 - 实测
+                steady_state = Rf + U * d_min["replay_steps"]
+                delta = max(0.0, steady_state - trt)
 
         results.append({
             "type": sim_type,
             "U": U,
-            "cold_start": cold_start,
+            "Rf": Rf,
+            "delta": delta,
             "data": data,
         })
 
@@ -200,12 +224,101 @@ def _apply_filters(records, config, filter_keys):
 #  Plot 1: Cost Model
 # ============================================================
 
-def plot_cost_model(experiments, config, mtbf_config):
-    """
-    成本模型图（3 子图）。
+def _prepare_cost_model_scenarios(experiments, config):
+    """准备 cost model 的 scenarios 数据（共用逻辑）。"""
+    records = flatten_experiments(experiments)
+    records = _apply_filters(records, config, ["model", "dataset", "FS"])
 
-    config 维度: model, dataset, FS, simulation
-      设为具体值 → 固定（过滤）; None → 每个值画一条线
+    scenarios = []
+    for rec in records:
+        params_list = compute_log_resume_params(
+            rec["log_resume_time_raw"],
+            full_resume_time=rec.get("full_resume_time"))
+        for params in params_list:
+            scenarios.append({
+                "model": rec["model"],
+                "dataset": rec["dataset"],
+                "FS": rec["FS"],
+                "simulation": params["type"],
+                "Ca": rec["avg_full_ckpt_time"],
+                "n_lag": rec.get("n_lag", 0),
+                "ts": rec["ts"],
+                "tl": rec["avg_log_ckpt_time"] or 0,
+                "U": params["U"],
+                "Rf": params["Rf"],
+                "delta": params["delta"],
+            })
+
+    sim_val = config.get("simulation")
+    if sim_val is not None:
+        scenarios = [s for s in scenarios if s["simulation"] == sim_val]
+
+    unfixed = [d for d in ["model", "dataset", "FS", "simulation"]
+               if config.get(d) is None]
+
+    return scenarios, unfixed
+
+
+def plot_cost_model_K_star(experiments, config, mtbf_config):
+    """
+    图 A: K* vs MTBF（单独一张图）。
+
+    Parameters
+    ----------
+    experiments : dict  — EXPERIMENTS 数据
+    config : dict       — {"model", "dataset", "FS", "simulation"}
+    mtbf_config : dict  — {"range_hours", "table_values"}
+    """
+    scenarios, unfixed = _prepare_cost_model_scenarios(experiments, config)
+    if not scenarios:
+        print("plot_cost_model_K_star: No matching scenarios found.")
+        return None
+
+    mtbf_h = np.linspace(mtbf_config["range_hours"][0],
+                         mtbf_config["range_hours"][1], 500)
+    mtbf_s = mtbf_h * 3600
+
+    fig, ax = plt.subplots(figsize=(10, 7))
+
+    for i, s in enumerate(scenarios):
+        label = " / ".join(str(s[d]) for d in unfixed) if unfixed else \
+                f"{s['model']} / {s['dataset']}"
+        color = _DEFAULT_COLORS[i % len(_DEFAULT_COLORS)]
+        ls = _DEFAULT_LS[i % len(_DEFAULT_LS)]
+        Ca, U, ts, tl = s["Ca"], s["U"], s["ts"], s["tl"]
+        Rf = s["Rf"]
+        n_lag = s.get("n_lag", 0)
+
+        # 打印各 MTBF 下的 K* 和 overhead
+        print(f"\n  [{label}]  Ca={Ca:.3f}  U={U:.4f}  ts={ts:.3f}  tl={tl:.4f}  Rf={Rf:.1f}")
+        for mh in mtbf_config.get("table_values", []):
+            ms = mh * 3600
+            k = K_star(Ca, U, ms, ts, tl, n_lag)
+            oh = overhead(k, Ca, U, ms, ts, tl, Rf, n_lag) * 100
+            print(f"    MTBF={mh:>2d}h  →  K*={float(k):>8.1f}  overhead={oh:.3f}%")
+
+        K_opt = K_star(Ca, U, mtbf_s, ts, tl, n_lag)
+        ax.plot(mtbf_h, K_opt, color=color, ls=ls, lw=2.5, label=label)
+
+    fixed_parts = [f"{d}={config[d]}" for d in ["model", "dataset", "FS", "simulation"]
+                   if config.get(d) is not None]
+    title_suffix = "  |  " + ", ".join(fixed_parts) if fixed_parts else ""
+
+    ax.set_xlabel('MTBF (hours)')
+    ax.set_ylabel('Optimal K* (steps)')
+    ax.set_title('(a) K* vs MTBF' + title_suffix, fontweight='bold')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout(pad=2.0)
+    return fig
+
+
+def plot_cost_model_overhead(experiments, config, mtbf_config):
+    """
+    图 B+C: Overhead 两张子图（一张 fig）。
+      (b) Overhead at Optimal K* vs MTBF
+      (c) Overhead vs K at fixed MTBF
 
     Parameters
     ----------
@@ -213,107 +326,77 @@ def plot_cost_model(experiments, config, mtbf_config):
     config : dict       — {"model", "dataset", "FS", "simulation"}
     mtbf_config : dict  — {"range_hours", "demo_hours", "table_values"}
     """
-    records = flatten_experiments(experiments)
-    records = _apply_filters(records, config, ["model", "dataset", "FS"])
-
-    # 展开 simulation 维度
-    scenarios = []
-    for rec in records:
-        params_list = compute_log_resume_params(rec["log_resume_time_raw"])
-        for params in params_list:
-            scenarios.append({
-                "model": rec["model"],
-                "dataset": rec["dataset"],
-                "FS": rec["FS"],
-                "simulation": params["type"],
-                "C": rec["avg_full_ckpt_time"],
-                "ts": rec["ts"],
-                "tl": rec["avg_log_ckpt_time"] or 0,
-                "U": params["U"],
-                "cold_start": params["cold_start"],
-            })
-
-    # 过滤 simulation
-    sim_val = config.get("simulation")
-    if sim_val is not None:
-        scenarios = [s for s in scenarios if s["simulation"] == sim_val]
-
+    scenarios, unfixed = _prepare_cost_model_scenarios(experiments, config)
     if not scenarios:
-        print("plot_cost_model: No matching scenarios found.")
+        print("plot_cost_model_overhead: No matching scenarios found.")
         return None
-
-    # 生成 label：用未固定的维度
-    unfixed = [d for d in ["model", "dataset", "FS", "simulation"]
-               if config.get(d) is None]
 
     mtbf_h = np.linspace(mtbf_config["range_hours"][0],
                          mtbf_config["range_hours"][1], 500)
     mtbf_s = mtbf_h * 3600
 
-    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(18, 7))
 
     for i, s in enumerate(scenarios):
         label = " / ".join(str(s[d]) for d in unfixed) if unfixed else \
                 f"{s['model']} / {s['dataset']}"
         color = _DEFAULT_COLORS[i % len(_DEFAULT_COLORS)]
         ls = _DEFAULT_LS[i % len(_DEFAULT_LS)]
-        C, U, ts, tl, cs = s["C"], s["U"], s["ts"], s["tl"], s["cold_start"]
+        Ca, U, ts, tl, Rf = s["Ca"], s["U"], s["ts"], s["tl"], s["Rf"]
+        n_lag = s.get("n_lag", 0)
 
-        K_opt = K_star(C, U, mtbf_s, ts, tl)
-
-        # (a) K* vs MTBF
-        axes[0].plot(mtbf_h, K_opt, color=color, ls=ls, lw=2.5, label=label)
+        K_opt = K_star(Ca, U, mtbf_s, ts, tl, n_lag)
 
         # (b) Overhead %
-        oh = np.array([overhead(k, C, U, m, ts, tl, cs)
+        oh = np.array([overhead(k, Ca, U, m, ts, tl, Rf, n_lag)
                        for k, m in zip(K_opt, mtbf_s)]) * 100
-        axes[1].plot(mtbf_h, oh, color=color, ls=ls, lw=2.5, label=label)
+        axes[0].plot(mtbf_h, oh, color=color, ls=ls, lw=2.5, label=label)
 
         # (c) overhead(K) at fixed MTBF
         M_demo = mtbf_config["demo_hours"] * 3600
         K_range = np.linspace(50, 16000, 1000)
-        ovh = np.array([overhead(K, C, U, M_demo, ts, tl, cs) for K in K_range])
-        Kopt = K_star(C, U, M_demo, ts, tl)
-        axes[2].plot(K_range, ovh, color=color, ls=ls, lw=2, label=label)
-        axes[2].axvline(x=Kopt, color=color, ls=':', alpha=0.4)
-        axes[2].plot(Kopt, overhead(Kopt, C, U, M_demo, ts, tl, cs), 'o',
+        ovh = np.array([overhead(K, Ca, U, M_demo, ts, tl, Rf, n_lag) for K in K_range])
+        Kopt = K_star(Ca, U, M_demo, ts, tl, n_lag)
+        axes[1].plot(K_range, ovh, color=color, ls=ls, lw=2, label=label)
+        axes[1].axvline(x=Kopt, color=color, ls=':', alpha=0.4)
+        axes[1].plot(Kopt, overhead(Kopt, Ca, U, M_demo, ts, tl, Rf, n_lag), 'o',
                      color=color, ms=7)
-        axes[2].annotate(
+        axes[1].annotate(
             f'K*={Kopt:.0f}',
-            xy=(Kopt, overhead(Kopt, C, U, M_demo, ts, tl, cs)),
+            xy=(Kopt, overhead(Kopt, Ca, U, M_demo, ts, tl, Rf, n_lag)),
             fontsize=12, color=color, ha='left', va='bottom',
             xytext=(Kopt + 100,
-                    overhead(Kopt, C, U, M_demo, ts, tl, cs) + 0.002))
+                    overhead(Kopt, Ca, U, M_demo, ts, tl, Rf) + 0.002))
 
-    # 标题
     fixed_parts = [f"{d}={config[d]}" for d in ["model", "dataset", "FS", "simulation"]
                    if config.get(d) is not None]
     title_suffix = "  |  " + ", ".join(fixed_parts) if fixed_parts else ""
 
     axes[0].set_xlabel('MTBF (hours)')
-    axes[0].set_ylabel('Optimal K* (steps)')
-    axes[0].set_title('(a) K* vs MTBF' + title_suffix, fontweight='bold')
+    axes[0].set_ylabel('Overhead (%)')
+    axes[0].set_title('(b) Overhead at Optimal K*' + title_suffix, fontweight='bold')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
+    axes[0].set_ylim(bottom=0)
 
-    axes[1].set_xlabel('MTBF (hours)')
-    axes[1].set_ylabel('Overhead (%)')
-    axes[1].set_title('(b) Overhead at Optimal K*', fontweight='bold')
+    axes[1].set_xlabel('K (steps)')
+    axes[1].set_ylabel('Per-unit-time Overhead')
+    axes[1].set_title(
+        f'(c) Overhead vs K  (MTBF={mtbf_config["demo_hours"]}h)',
+        fontweight='bold')
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     axes[1].set_ylim(bottom=0)
 
-    axes[2].set_xlabel('K (steps)')
-    axes[2].set_ylabel('Per-unit-time Overhead')
-    axes[2].set_title(
-        f'(c) Overhead vs K  (MTBF={mtbf_config["demo_hours"]}h)',
-        fontweight='bold')
-    axes[2].legend()
-    axes[2].grid(True, alpha=0.3)
-    axes[2].set_ylim(bottom=0)
-
     plt.tight_layout(pad=2.0)
     return fig
+
+
+def plot_cost_model(experiments, config, mtbf_config):
+    """兼容旧接口：依次调用两个子图函数，返回 (fig_a, fig_bc)。"""
+    fig_a = plot_cost_model_K_star(experiments, config, mtbf_config)
+    fig_bc = plot_cost_model_overhead(experiments, config, mtbf_config)
+    return fig_a, fig_bc
 
 
 # ============================================================
@@ -505,15 +588,18 @@ def plot_resume_comparison(experiments, config):
             })
 
         # Log resume bars
-        params_list = compute_log_resume_params(rec["log_resume_time_raw"])
+        params_list = compute_log_resume_params(
+            rec["log_resume_time_raw"],
+            full_resume_time=rec.get("full_resume_time"))
         for params in params_list:
             if sim_filter is not None and params["type"] != sim_filter:
                 continue
             U = params["U"]
+            Rf = params["Rf"]
             sim_label = f" ({params['type']})" if len(params_list) > 1 and sim_filter is None else ""
             for d in params["data"]:
                 replay_portion = U * d["replay_steps"]
-                total = d.get("total_resume_time", replay_portion + params["cold_start"])
+                total = d.get("total_resume_time", Rf + replay_portion)
                 cold_portion = max(0.0, total - replay_portion)
                 bars.append({
                     "label": f"Log (replay={d['replay_steps']}){sim_label}",

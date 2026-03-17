@@ -264,3 +264,74 @@ resume_from_batch_diff()
     └─ _apply_single_update() × N
         └─ _generate_z_for_replay()
 ```
+
+---
+
+# `mezo.sh` 参数速查表
+
+> 所有参数均通过**环境变量**传入，格式: `KEY=VALUE bash mezo.sh`
+
+## 训练基础参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `MODEL` | `facebook/opt-1.3b` | HuggingFace 模型名 |
+| `TASK` | (必填) | 任务名: SST2, SQuAD, CB, Copa, ReCoRD, DROP 等 |
+| `MODE` | `ft` | 训练模式: `ft`(全参数), `prefix`(prefix tuning), `lora` |
+| `DTYPE` | `fp16` | 模型精度: `fp16`(float16), `bf16`(bfloat16), `fp32`(float32) |
+| `LR` | `1e-5` | 学习率 |
+| `EPS` | `1e-3` | ZO perturbation epsilon |
+| `BS` | `16` | per_device_train_batch_size |
+| `SEED` | `0` | 全局随机种子 (控制数据顺序 + ZO perturbation seed 生成) |
+| `STEPS` | `20000` | max_steps |
+| `EVAL_STEPS` | `4000` | 每隔多少步做一次 evaluation |
+| `LOGGING_STEPS` | `10` | 每隔多少步记录一次 training loss |
+| `SAVE_STEPS` | `20000` | 每隔多少步保存一次 checkpoint |
+| `TRAIN` | `1000` | 训练样本数 |
+| `DEV` | `500` | 验证集样本数 (CB/Copa 自动改为 100) |
+| `EVAL` | `1000` | 测试集样本数 |
+
+## 输出与控制
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `OUTPUT_ROOT` | `/lvs0/rccs-hpbdrt/minqiu/ZO_ckpt` | checkpoint 输出根目录. 可改为 `/tmp/ZO_ckpt`(本地NVMe) 或 `/dev/shm/ZO_ckpt`(DRAM) 测性能 |
+| `OUTPUT_LOG` | `""` | **仅 `ASYNC_ANCHOR=1` 时有效**. log checkpoint 输出目录. 设置后 log checkpoints (optimizer.pt) 写入此目录, full checkpoints (model.safetensors) + cache checkpoint (initial_model/) 仍在 `OUTPUT_ROOT`. 可设为 `/dev/shm/ZO_ckpt`(DRAM) 加速频繁的 log 写入 |
+|`FORCE_FSYNC` | `0`| FORCE_FSYNC=1时会强制将ckpt同步写入Local SSD, 但是其他模式下不会触发|
+| `TRAIN_NAME` | `Test_staging_8` | 实验名前缀，拼入 output_dir |
+| `DO_EVAL` | `1` | 设为 `0` 跳过训练后的 evaluation 阶段 (`--no_eval`) |
+| `GPU_ID` | `0` | 使用哪块 GPU (设置 CUDA_VISIBLE_DEVICES) |
+| `WANDB_PROJECT` | `NonStopZO2` | Weights & Biases 项目名 |
+
+## L0-L3 Checkpoint 层级
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `BATCHDIFF_CKPT` | `-1` | **核心开关**. `-1`=L0 Full Checkpoint; `0`=Log-based(累积所有updates); `N>=1`=Full+Log(每N步做一次full，中间存log) |
+| `ASYNC_ANCHOR` | `0` | **异步 anchor**. 设为 `1` 启用异步写入 full checkpoint. **仅 `BATCHDIFF_CKPT>=1` 时有效**. GPU→CPU 异步拷贝 + 后台线程写盘，训练不阻塞. 若前一次写盘未完成则跳过本次 anchor (redo log 保证可恢复) |
+| `ENABLE_SHADOW` | `0` | L2: 设为 `1` 启用 CPU Shadow Model. **仅对 `BATCHDIFF_CKPT>=1` 有效**，`<=0` 时强制关闭（`=0` 无 bounded replay、shadow 无意义；`=-1` 禁用模式）(**代码发布前最好删除**)|
+| `INSTANT_RECOVER` | `0` | L3: 设为 `1` 启用即时恢复 (需要 ENABLE_SHADOW + GPU_FAIL_STEP) (**代码发布前最好删除**)|
+| `GPU_FAIL_STEP` | `-1` | 在第 N 步模拟 GPU 故障. `-1`=不注入. 可独立使用或叠加任意层级 (**代码发布前最好删除**)|
+
+## Resume / Replay 参数
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `RESUME_CKPT` | `""` | L0 标准恢复: HuggingFace `resume_from_checkpoint` 路径 |
+| `BATCHDIFF_RESUME` | `""` | L1+ 差分恢复: 指定 full checkpoint 路径，自动扫描并重放后续 differential checkpoints. **优先于 RESUME_CKPT** |
+| `BATCHDIFF_REPLAY_DEVICE` | `cuda` | Replay 设备: `cpu` 或 `cuda`. **使用 `ZO_RNG_DEVICE=zo_rng` 时可安全设为 `cpu`**; 否则 replay 设备必须与训练设备一致 |
+| `BATCHDIFF_SIMULATE_PERTURBATION` | `1` | `1`=replay 时模拟 [+1,-2,+1] perturbation 序列以精确还原 fp16 舍入; `0`=跳过, ~4x 更快但非 bitwise exact |
+| `BATCHDIFF_REPLAY_FP32` | `0` | 设为 `1` 使用 fp32 精度做 replay |
+
+## 确定性与随机数控制
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `DETERMINISTIC` | `0` | 设为 `1` 启用 `torch.use_deterministic_algorithms(True)` + `CUBLAS_WORKSPACE_CONFIG=:4096:8`. 强制 cuBLAS matmul 等所有 PyTorch 算子使用确定性实现，保证同一硬件上两次独立训练产生 bitwise 相同的 loss 轨迹. **注意: 不影响 replay 正确性**（replay 不涉及 cuBLAS），仅影响训练 forward pass. 代价: ~5-15% 性能下降 |
+| `ZO_RNG_DEVICE` | `native` | ZO 扰动噪声 z 的生成设备. `native`=在参数所在设备上生成(快); `cpu`=始终在 CPU 生成再传到 GPU(跨设备可移植，但非常慢！); **`zo_rng`=使用 zo_rng 库生成跨设备 bit-exact 的噪声，使 `BATCHDIFF_REPLAY_DEVICE=cpu` 可以精确还原 GPU 训练** |
+
+> **关于确定性的说明**:
+> - 无论 `DETERMINISTIC` 设为何值，`cudnn.deterministic=True` 和 `cudnn.benchmark=False` **始终开启**
+> - `DETERMINISTIC=1` 额外强制 cuBLAS 使用确定性 GEMM kernel，但**不保证跨 GPU 架构一致**（如 A100 vs H200），只保证同一硬件多次运行一致
+> - **Replay (seed log 回放) 的正确性不依赖 `DETERMINISTIC` 设置**，因为 replay 全程只做 RNG + 逐元素运算，不涉及 cuBLAS matmul
+> - **`ZO_RNG_DEVICE=zo_rng` 是唯一能保证 CPU replay = GPU 训练的选项**。原理: 使用 Philox4x32 PRNG + 多项式近似的 Box-Muller 变换，整个流程只用 IEEE 754 浮点加减乘除，在 CPU 和 GPU 上产生完全相同的结果

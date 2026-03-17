@@ -29,7 +29,16 @@ def get_extensions():
         (CUDA_HOME is not None and os.path.isdir(CUDA_HOME))
     )
 
+    # Disable Random123 SSE to avoid conflicts with NVIDIA HPC SDK headers
+    r123_no_sse = ['-DR123_USE_SSE4_2=0', '-DR123_USE_SSE4_1=0', '-DR123_USE_SSE=0']
+
     if has_cuda:
+        # Find cudart library path (HPC SDK puts it in a non-standard location)
+        import glob
+        cuda_link_dirs = []
+        for p in glob.glob('/opt/nvidia/hpc_sdk/Linux_x86_64/*/cuda/*/targets/x86_64-linux/lib'):
+            cuda_link_dirs.append(f'-L{p}')
+
         sources_cuda = sources_cpu + [os.path.join(CSRC, 'generate_cuda.cu')]
         ext = CUDAExtension(
             name='zo_rng._ext_impl',
@@ -37,10 +46,10 @@ def get_extensions():
             include_dirs=include_dirs,
             define_macros=[('ZO_RNG_WITH_CUDA', None)],
             extra_compile_args={
-                'cxx': ['-O3', '-fopenmp', '-DZO_RNG_WITH_CUDA'],
-                'nvcc': ['-O3', '--use_fast_math=false'],
+                'cxx': ['-O3', '-fopenmp', '-DZO_RNG_WITH_CUDA', '-ffp-contract=off'] + r123_no_sse,
+                'nvcc': ['-O3', '--fmad=false'] + r123_no_sse,
             },
-            extra_link_args=['-fopenmp'],
+            extra_link_args=['-fopenmp'] + cuda_link_dirs,
         )
     else:
         ext = CppExtension(
@@ -48,7 +57,7 @@ def get_extensions():
             sources=sources_cpu,
             include_dirs=include_dirs,
             extra_compile_args={
-                'cxx': ['-O3', '-fopenmp'],
+                'cxx': ['-O3', '-fopenmp', '-ffp-contract=off'],
             },
             extra_link_args=['-fopenmp'],
         )

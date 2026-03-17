@@ -152,13 +152,20 @@ class OurArguments(TrainingArguments):
     batchdiff_simulate_perturbation: bool = True  # simulate fp16 perturbation loop during replay (disable for ~4x speedup)
     batchdiff_replay_fp32: bool = False  # upcast fp16→fp32 during CPU replay to avoid slow torch.normal(fp16) on CPU (~7x speedup)
 
+    # Async Anchor Checkpoint (requires batchdiff_ckpt >= 1)
+    # Replaces synchronous full checkpoint with two-phase async pipeline:
+    #   Phase 1: GPU→CPU async copy via dedicated CUDA stream
+    #   Phase 2: CPU→disk persist in background thread
+    async_anchor: bool = False  # enable async anchor checkpoint
+    log_output_dir: str = ""  # separate directory for log checkpoints (only with async_anchor)
+
     # Deterministic reproducibility
     deterministic: bool = False  # enable torch.use_deterministic_algorithms for cross-process reproducibility
-    zo_rng_device: str = "native"  # "native": use param's device (fast), "cpu": always generate z on CPU (cross-GPU portable, ~30% slower)
+    zo_rng_device: str = "native"  # "native": param's device (fast), "cpu": always CPU (~30% slower), "zo_rng": cross-device bit-exact (enables CPU replay of GPU training)
 
     # ZO2 added -> ZO2 configs
     zo_method: str = "mezo-sgd"
-    zo_mode: str = "zo2"
+    zo_mode: str = os.environ.get("ZO_MODE", "zo")  # 可通过环境变量 ZO_MODE=zo 或 ZO_MODE=zo2 切换
     offloading_device: str = "cpu"
     working_device: str = "cuda:0"
 
@@ -243,8 +250,8 @@ class Framework:
             # Set up ZO configuration
             self.zo_config = ZOConfig(
                 method="mezo-sgd",
-                # zo2=(self.args.zo_mode == "zo2"),
-                zo2=False,
+                zo2=(self.args.zo_mode == "zo2"),
+                # zo2=False,
                 lr=self.args.learning_rate,
                 weight_decay=self.args.weight_decay,
                 eps=self.args.zo_eps,
@@ -572,6 +579,28 @@ class Framework:
                 batchdiff_callback.trainer = trainer
                 batchdiff_callback._hook_registered = True
 
+            # Async anchor checkpoint (requires batchdiff_ckpt >= 1)
+            if self.args.async_anchor and self.args.batchdiff_ckpt >= 1:
+                if self.args.enable_shadow:
+                    logger.warning("[AsyncAnchor] Shadow model is not supported with async anchor. Disabling shadow.")
+                    batchdiff_callback.enable_shadow = False
+                    batchdiff_callback.instant_recover = False
+                from zo2.trainer.hf_transformers.async_anchor_checkpoint import AsyncAnchorCheckpointer
+                from zo2.trainer.hf_transformers.batch_differential_checkpoint import _detect_tied_weights
+                async_ckpt = AsyncAnchorCheckpointer(
+                    model=self.model,
+                    checkpoint_dir=self.args.output_dir,
+                    tied_groups=_detect_tied_weights(self.model),
+                )
+                trainer._async_anchor = async_ckpt
+                batchdiff_callback._async_anchor = async_ckpt
+                if self.args.log_output_dir:
+                    trainer._log_output_dir = self.args.log_output_dir
+                    logger.info(f"[AsyncAnchor] Log checkpoints → {self.args.log_output_dir}")
+                logger.info(f"[AsyncAnchor] Enabled (anchor every {self.args.batchdiff_ckpt} steps)")
+            elif self.args.async_anchor and self.args.batchdiff_ckpt < 1:
+                logger.warning("[AsyncAnchor] async_anchor requires batchdiff_ckpt >= 1, ignoring")
+
             # 设置 GPU 故障注入
             if gpu_fail_step > 0:
                 batchdiff_callback.failure_simulator.set_fail_step(gpu_fail_step)
@@ -603,6 +632,7 @@ class Framework:
                 simulate_perturbation=self.args.batchdiff_simulate_perturbation,
                 replay_in_fp32=self.args.batchdiff_replay_fp32,
                 rng_device=self.args.zo_rng_device,
+                zo2_mode=(self.args.zo_mode == "zo2"),
             )
             self.model.load_state_dict(recovered_state)
 
@@ -611,7 +641,10 @@ class Framework:
             match = re.search(r'checkpoint-(\d+)', last_checkpoint)
             resumed_step = int(match.group(1)) if match else 0
             logger.info(f"[BatchDiff Resume] Will continue training from step {resumed_step}")
-        elif os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
+        elif self.args.batchdiff_ckpt < 0 and os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
+            # HuggingFace auto-resume: only when batchdiff is NOT active.
+            # Batchdiff checkpoint dirs only contain log files (no model weights),
+            # so HF's auto-resume can't load them. Use --batchdiff_resume instead.
             last_checkpoint = get_last_checkpoint(self.args.output_dir)
 
         if last_checkpoint is not None and self.args.resume_from_checkpoint is None:

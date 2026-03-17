@@ -110,6 +110,13 @@ class MeZO2SGD(MeZOSGD):
             module (nn.Module): The module whose parameters are to be updated.
             weight_decay (float, optional): Optional weight decay for regularization.
         """
+        if self.last_rstate is None:
+            raise RuntimeError(
+                "zo_update called but last_rstate is None. "
+                "This means projected_grad was set to a non-zero value without "
+                "reconstructing the corresponding CUDA RNG state. "
+                "Ensure pending_seed is saved/restored alongside pending_grad on resume."
+            )
         torch.cuda.set_rng_state(self.last_rstate)
         super().zo_update(module, weight_decay=weight_decay)
         self.last_rstate = torch.cuda.get_rng_state()

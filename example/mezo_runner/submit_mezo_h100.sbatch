@@ -29,6 +29,7 @@ export EVAL_STEPS=${EVAL_STEPS:-100}
 export SAVE_STEPS=${SAVE_STEPS:-1}
 export DO_EVAL=${DO_EVAL:-0}
 export BATCHDIFF_CKPT=${BATCHDIFF_CKPT:-0}
+export DTYPE=${DTYPE:-fp16}
 
 # 其他默认参数
 export WANDB_PROJECT=${WANDB_PROJECT:-NonStopZO2}
@@ -128,7 +129,7 @@ python ${PROJECT_ROOT}/example/mezo_runner/run.py \
     --logging_steps 10 \
     --max_steps $STEPS \
     --trainer zo \
-    --load_float16 \
+    $([ "$DTYPE" == "fp16" ] && echo "--load_float16" || [ "$DTYPE" == "bf16" ] && echo "--load_bfloat16") \
     --learning_rate $LR \
     --zo_eps $EPS \
     --per_device_train_batch_size $BS \

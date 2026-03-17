@@ -23,7 +23,7 @@ from zo2.utils.utils import seed_everything
 
 # Hyper
 args = argparse.ArgumentParser()
-args.add_argument("--zo_method", type=str, default="zo2")
+args.add_argument("--zo_method", type=str, default=os.environ.get("ZO_MODE", "zo"))  # 可通过环境变量 ZO_MODE=zo 或 ZO_MODE=zo2 切换
 args.add_argument("--eval", action="store_true")
 args.add_argument("--model_name", type=str, default="facebook/opt-2.7b")
 args.add_argument("--verbose", action="store_true")
