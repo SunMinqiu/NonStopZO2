@@ -91,6 +91,11 @@ class OurArguments(TrainingArguments):
     # MeZO
     zo_eps: float = 1e-3 # eps in MeZO
 
+    # MeZO-Adam specific
+    adam_beta1: float = 0.9  # Adam beta1
+    adam_beta2: float = 0.999  # Adam beta2
+    adam_eps: float = 1e-8  # Adam epsilon (distinct from zo_eps)
+
     # Prefix tuning
     prefix_tuning: bool = False # whether to use prefix tuning
     num_prefix: int = 5 # number of prefixes to use
@@ -248,10 +253,9 @@ class Framework:
             elif self.args.load_bfloat16:
                 torch_dtype = torch.bfloat16
             # Set up ZO configuration
-            self.zo_config = ZOConfig(
-                method="mezo-sgd",
+            zo_kwargs = dict(
+                method=self.args.zo_method,
                 zo2=(self.args.zo_mode == "zo2"),
-                # zo2=False,
                 lr=self.args.learning_rate,
                 weight_decay=self.args.weight_decay,
                 eps=self.args.zo_eps,
@@ -259,6 +263,10 @@ class Framework:
                 working_device=self.args.working_device,
                 rng_device=self.args.zo_rng_device,
             )
+            if self.args.zo_method == "mezo-adam":
+                zo_kwargs["betas"] = (self.args.adam_beta1, self.args.adam_beta2)
+                zo_kwargs["adam_eps"] = self.args.adam_eps
+            self.zo_config = ZOConfig(**zo_kwargs)
             # Always load from model_name. from_pretrained happens before the timer
             # and benefits equally from page cache for both resume paths.
             model_load_path = self.args.model_name

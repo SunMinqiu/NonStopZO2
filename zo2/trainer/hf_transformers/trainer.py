@@ -564,6 +564,14 @@ class ZOTrainer(Trainer):
             rng_device = getattr(model.opt, 'rng_device', 'native') if hasattr(model, 'opt') else 'native'
             optimizer_state['rng_device'] = rng_device
 
+            # Save zo_method for Adam detection during replay
+            zo_method = 'mezo-sgd'
+            if hasattr(model, 'opt') and hasattr(model.opt, 'betas'):
+                zo_method = 'mezo-adam'
+                optimizer_state['adam_betas'] = model.opt.betas
+                optimizer_state['adam_eps_value'] = model.opt.adam_eps
+            optimizer_state['zo_method'] = zo_method
+
             opt_path = os.path.join(output_dir, OPTIMIZER_NAME)
             torch.save(optimizer_state, opt_path)
             from .batch_differential_checkpoint import _fsync_file
@@ -1171,7 +1179,11 @@ class ZOTrainer(Trainer):
                         zo_metadata_keys = ['zo_update_history', 'base_checkpoint', 'current_step',
                                            'batch_size', 'num_updates', 'tied_weights', 'model_dtype',
                                            'pending_grad', 'pending_seed', 'trainable_param_names',
-                                           'zo_eps', 'rng_device', 'is_full_checkpoint', 'zo2']
+                                           'zo_eps', 'rng_device', 'is_full_checkpoint', 'zo2',
+                                           'zo_method', 'adam_betas', 'adam_eps_value',
+                                           'base_pending_seed']
+                        # Note: 'adam_state' is NOT stripped — it flows through to
+                        # MeZOAdam.load_state_dict() which extracts it
                         for key in zo_metadata_keys:
                             opt_state.pop(key, None)
 

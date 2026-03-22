@@ -13,6 +13,8 @@ BS=${BS:-16}
 LR=${LR:-1e-5}
 EPS=${EPS:-1e-3}
 SEED=${SEED:-0}
+# ZO 优化器选择: "mezo-sgd" (默认) 或 "mezo-adam"
+ZO_METHOD=${ZO_METHOD:-mezo-sgd}
 TRAIN=${TRAIN:-1000}
 DEV=${DEV:-500}
 EVAL=${EVAL:-1000}
@@ -37,6 +39,10 @@ BATCHDIFF_CKPT=${BATCHDIFF_CKPT:--1}
 ENABLE_SHADOW=${ENABLE_SHADOW:-0}
 INSTANT_RECOVER=${INSTANT_RECOVER:-0}
 GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
+# Shadow Pipeline: CPU 端 pipelined z 预生成 + ring buffer, 需要 ENABLE_SHADOW=1
+# P 个 producer 线程并行生成 z (释放GIL)，1 个 consumer 串行更新 shadow
+SHADOW_PIPELINE=${SHADOW_PIPELINE:-0}
+SHADOW_PIPELINE_WORKERS=${SHADOW_PIPELINE_WORKERS:-2}
 # Async Anchor: 异步写入 full checkpoint (仅 BATCHDIFF_CKPT>=1 时有效)
 # GPU→CPU 异步拷贝 + 后台线程写盘，训练不阻塞
 ASYNC_ANCHOR=${ASYNC_ANCHOR:-0}
@@ -49,6 +55,11 @@ DETERMINISTIC=${DETERMINISTIC:-0}
 # ZO RNG 设备: "native" (用参数所在设备, 快), "cpu" (跨GPU可移植, 慢两百来倍！),
 #              "zo_rng" (跨设备 bit-exact, 支持 BATCHDIFF_REPLAY_DEVICE=cpu 精确还原 GPU 训练)
 ZO_RNG_DEVICE=${ZO_RNG_DEVICE:-native}
+
+# Adam 参数 (仅 ZO_METHOD=mezo-adam 时生效)
+ADAM_BETA1=${ADAM_BETA1:-0.9}
+ADAM_BETA2=${ADAM_BETA2:-0.999}
+ADAM_EPS=${ADAM_EPS:-1e-8}
 
 # 模型精度: "fp16" (默认), "bf16", "fp32"
 DTYPE=${DTYPE:-fp16}
@@ -100,6 +111,9 @@ if [ -n "$BATCHDIFF_RESUME" ]; then
     fi
 elif [ -n "$RESUME_CKPT" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --resume_from_checkpoint $RESUME_CKPT"
+else
+    # 非 resume 模式：覆盖已有输出目录，避免 HF Trainer 意外 auto-resume
+    EXTRA_ARGS="$EXTRA_ARGS --overwrite_output_dir"
 fi
 
 # 确定性随机数控制
@@ -118,6 +132,10 @@ if [ "$MODE" == "prefix" ]; then
     EXTRA_ARGS="--prefix_tuning --num_prefix 5 --no_reparam --prefix_init_by_real_act"
 elif [ "$MODE" == "lora" ]; then
     EXTRA_ARGS="--lora"
+fi
+# Adam 参数传递 (仅 mezo-adam 时需要)
+if [ "$ZO_METHOD" == "mezo-adam" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --zo_method mezo-adam --adam_beta1 $ADAM_BETA1 --adam_beta2 $ADAM_BETA2 --adam_eps $ADAM_EPS"
 fi
 TAG=mezo-$MODE-$LR-$EPS-$SEED
 
@@ -146,7 +164,7 @@ echo "========== Configuration =========="
 echo "TAG: $TAG"
 echo "BS: $BS, LR: $LR, EPS: $EPS, SEED: $SEED"
 echo "STEPS: $STEPS, EVAL_STEPS: $EVAL_STEPS, SAVE_STEPS: $SAVE_STEPS, LOGGING_STEPS: $LOGGING_STEPS"
-echo "MODE: $MODE, DTYPE: $DTYPE, DO_EVAL: $DO_EVAL"
+echo "MODE: $MODE, DTYPE: $DTYPE, DO_EVAL: $DO_EVAL, ZO_METHOD: $ZO_METHOD"
 echo "--- Batch Differential Checkpoint ---"
 echo "BATCHDIFF_CKPT: $BATCHDIFF_CKPT (-1=disabled, 0=incremental, 1=pure diff, N>=2=batch diff)"
 echo "ENABLE_SHADOW: $ENABLE_SHADOW"

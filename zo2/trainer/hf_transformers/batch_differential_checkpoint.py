@@ -6,12 +6,41 @@ Batch Differential Checkpoint for ZO Training:
   - batch_size >= 1: Full + Log (full checkpoint every N steps, log checkpoints in between)
     - Optional: enable_shadow for real-time shadow model on CPU (instant recovery)
 - Controllable failure injection for testing
+
+Environment variables:
+  - FORCE_FSYNC=1: Force fsync after checkpoint writes
+  - PARALLEL_RECOVERY=1: Enable pipelined producer-consumer replay recovery.
+      P producer threads/streams generate z concurrently while 1 consumer
+      applies updates serially via a ring buffer. Bitwise-exact with
+      sequential replay.
+  - PARALLEL_RECOVERY_WORKERS=P: Number of producers / ring buffer slots
+      (default: 1). P>=2 needed for overlap. Use calibrate_parallel_recovery()
+      to determine optimal P.
+  - CLOSEDFORM_RECOVERY=1: Enable closed-form parallel replay recovery.
+      Unrolls the ZO-SGD recurrence into a sum of independent terms, enabling
+      true data-parallel computation across W workers. Near-exact with serial
+      replay (no perturbation simulation).
+  - CLOSEDFORM_WORKERS=W: Number of parallel workers (default: 1).
+  - CLOSEDFORM_PRECISION=mode: Precision mode for closed-form replay.
+      "fp32" (all fp32), "fp16" (keep original dtype), "mixed" (default,
+      accumulate in fp32, keep params in original dtype).
+  - SHADOW_PIPELINE=1: Enable pipelined producer-consumer for the CPU shadow
+      model during training. P producer threads pre-generate z tensors from
+      logged seeds while 1 consumer thread applies updates using buffered z.
+      Requires ENABLE_SHADOW=1. Falls back to serial shadow if not set.
+      GIL is not a bottleneck: PyTorch ops and zo_rng release the GIL.
+  - SHADOW_PIPELINE_WORKERS=P: Number of producer threads / ring buffer slots
+      for the shadow pipeline (default: 2). Use calibrate_shadow_pipeline()
+      to determine optimal P. Memory: P × model_size per z-buffer slot.
 """
 
 import os
 import re
 import threading
+import multiprocessing as mp
+import queue as queue_module   # for queue.Empty in shadow process
 import time
+import math
 import torch
 from transformers import TrainerCallback
 from collections import OrderedDict
@@ -163,13 +192,13 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 -1: Disabled
                 0: Log-based (accumulate all updates)
                 >=1: Full + Log (full checkpoint every N steps, log in between)
-            enable_shadow: Enable real-time shadow model on CPU (only effective for batch_size>=1)
+            enable_shadow: Enable real-time shadow model on CPU (effective for batch_size>=0, forced off for -1)
             instant_recover: Instantly recover from shadow on GPU failure (requires enable_shadow)
         """
         self.batch_size = batch_size
-        # Shadow only makes sense for batch_size>=1 (bounded replay cost).
-        # For batch_size<=0: -1 is disabled, 0 replays from initial (no base to shadow).
-        self.enable_shadow = enable_shadow if batch_size >= 1 else False
+        # Shadow is allowed for batch_size>=0 (=0: log-based, >=1: full+log).
+        # Only batch_size=-1 (disabled mode) forces shadow off.
+        self.enable_shadow = enable_shadow if batch_size >= 0 else False
         self.instant_recover = instant_recover if self.enable_shadow else False
 
         # Base checkpoint state (CPU)
@@ -201,6 +230,17 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         self.shadow_lock = threading.Lock()
         self.shadow_thread = None
         self.shadow_running = False
+        self.shadow_adam_state = None  # Adam m/v/t on CPU (None = SGD mode)
+
+        # Multiprocessing shadow (zero contention with training)
+        self.shadow_process = None       # mp.Process
+        self.update_queue = None         # mp.Queue: training → shadow
+        self.shadow_step_val = None      # mp.Value('i', lock=False): shared step counter
+        self.shadow_shared = None        # OrderedDict of shared-memory tensors
+        self.recovery_req = None         # mp.Event: training requests recovery pause
+        self.recovery_ready = None       # mp.Event: shadow signals "paused, safe to read"
+        self.recovery_done = None        # mp.Event: training signals "done reading, resume"
+        self.shadow_stop_event = None    # mp.Event: immediate stop signal for shadow process
 
         # Output directory
         self.output_dir = None
@@ -262,9 +302,13 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         # Sync current_step with trainer state so the hook reports correct step numbers
         self.current_step = state.global_step
 
-        # Start shadow model thread
+        # Initialize shadow Adam state if optimizer is MeZO-Adam
+        if self.enable_shadow and model is not None:
+            self._init_shadow_adam_state(model)
+
+        # Start shadow model as separate process (zero contention with training)
         if self.enable_shadow:
-            self._start_shadow_thread()
+            self._start_shadow_process()
             if self.instant_recover:
                 logger.info("[BatchDiff] Mode: L3 (Instant Recovery) - shadow tracking + instant recovery")
             else:
@@ -305,7 +349,10 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 
         self.base_checkpoint_state = OrderedDict()
         for key, value in state_dict.items():
-            self.base_checkpoint_state[key] = value.detach().cpu().clone()
+            t = value.detach().cpu().clone()
+            if self.enable_shadow:
+                t.share_memory_()  # POSIX shm: shadow process reads via DMA
+            self.base_checkpoint_state[key] = t
 
         # Initialize shadow model
         if self.enable_shadow:
@@ -412,6 +459,18 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 logger.warning("[BatchDiff Resume] No pending_grad found, "
                                "first step will skip zo_update (projected_grad=0)")
 
+        # Restore Adam state (only when optimizer is MeZOAdam)
+        if hasattr(model, 'opt') and hasattr(model.opt, 'm'):
+            # Priority: replayed adam state (log checkpoint) > checkpoint adam state (full checkpoint)
+            replay_adam = _get_and_clear_replay_adam_state()
+            if replay_adam:
+                model.opt.restore_adam_state(replay_adam)
+                logger.info(f"[BatchDiff Resume] Restored replayed Adam state: t={replay_adam.get('t', 0)}")
+            elif opt_state and 'adam_state' in opt_state:
+                model.opt.restore_adam_state(opt_state['adam_state'])
+                logger.info(f"[BatchDiff Resume] Restored Adam state from checkpoint: "
+                            f"t={opt_state['adam_state'].get('t', 0)}")
+
         # Load update history and base info
         if opt_state is not None:
             is_full_ckpt = opt_state.get('is_full_checkpoint', False)
@@ -457,25 +516,129 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         t_elapsed = time.time() - t_start
         logger.info(f"[BatchDiff Resume] Initialized ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
 
-    def _refresh_shadow_from_base(self):
-        """Refresh shadow model from base_checkpoint_state."""
-        with self.shadow_lock:
-            self.shadow_model = OrderedDict()
-            for key, value in self.base_checkpoint_state.items():
-                self.shadow_model[key] = value.clone()
-            if hasattr(self, '_tied_weight_groups') and self._tied_weight_groups:
-                _tie_state_dict_inplace(self.shadow_model, self._tied_weight_groups)
-            self.shadow_step = len(self.update_history)
+    def _init_shadow_adam_state(self, model):
+        """Initialize shadow_adam_state if the optimizer is MeZO-Adam.
 
-    def _start_shadow_thread(self):
-        """Start shadow model tracking thread"""
-        if self.shadow_thread is not None and self.shadow_thread.is_alive():
+        Detects whether the model's optimizer is Adam-based and creates a fresh
+        Adam state (m={}, v={}, t=0) on CPU. For resume, the Adam state is loaded
+        from the base checkpoint via _load_adam_state_from_base().
+        """
+        opt = getattr(model, 'opt', None)
+        if opt is None:
+            self.shadow_adam_state = None
             return
 
+        # Check if optimizer is Adam variant (has adam_betas attribute)
+        betas = getattr(opt, 'adam_betas', None)
+        if betas is None:
+            self.shadow_adam_state = None
+            logger.info("[Shadow] Optimizer is SGD, no Adam state needed")
+            return
+
+        adam_eps = getattr(opt, 'adam_eps', 1e-8)
+        self.shadow_adam_state = {
+            'm': {},
+            'v': {},
+            't': 0,
+            'betas': betas,
+            'adam_eps': adam_eps,
+        }
+        logger.info(f"[Shadow] Initialized Adam state: betas={betas}, eps={adam_eps}")
+
+    def _refresh_shadow_from_base(self):
+        """Refresh shadow model from base_checkpoint_state.
+        Creates shared-memory tensors for multiprocessing shadow."""
+        self.shadow_shared = OrderedDict()
+        for key, value in self.base_checkpoint_state.items():
+            t = value.clone()
+            t.share_memory_()  # POSIX shm: shadow process writes in-place
+            self.shadow_shared[key] = t
+        if hasattr(self, '_tied_weight_groups') and self._tied_weight_groups:
+            _tie_state_dict_inplace(self.shadow_shared, self._tied_weight_groups)
+        # Keep shadow_model as alias for compatibility (status/logging/recovery)
+        self.shadow_model = self.shadow_shared
+        self.shadow_step = len(self.update_history)
+
+    def _start_shadow_process(self):
+        """Start shadow model as a separate process (zero GIL/lock contention).
+
+        The shadow process runs independently with its own GIL. Communication:
+        - update_queue (mp.Queue): training → shadow, update dicts
+        - shadow_step_val (mp.Value): shared atomic counter, lock-free
+        - shadow_shared (POSIX shm tensors): shadow process writes in-place
+        - recovery Events: pause/resume protocol for safe cloning
+        """
+        if self.shadow_process is not None and self.shadow_process.is_alive():
+            return
+
+        use_pipeline = os.environ.get('SHADOW_PIPELINE', '0') == '1'
+        P = int(os.environ.get('SHADOW_PIPELINE_WORKERS', '2'))
+        simulate_perturbation = os.environ.get('BATCHDIFF_SIMULATE_PERTURBATION', '1') == '1'
+
+        # Detect rng_device
+        rng_device = 'native'
+        if self.trainer is not None and hasattr(self.trainer, 'model'):
+            _opt = getattr(self.trainer.model, 'opt', None)
+            if _opt is not None:
+                rng_device = getattr(_opt, 'rng_device', 'native')
+
+        # Detect default zo_eps
+        default_zo_eps = 0.0
+        if self.trainer and hasattr(self.trainer, 'model') and hasattr(self.trainer.model, 'opt'):
+            default_zo_eps = getattr(self.trainer.model.opt, 'zo_eps', 0.0)
+
+        # Adam config (picklable dict, not the full state)
+        adam_config = None
+        if self.shadow_adam_state is not None:
+            adam_config = {
+                'betas': self.shadow_adam_state['betas'],
+                'adam_eps': self.shadow_adam_state['adam_eps'],
+            }
+
+        param_names = self._trainable_param_names or list(self.shadow_shared.keys())
+
+        # Use spawn context: creates a *fresh* Python process (no inherited
+        # corrupted ATen/OpenMP thread pool from fork).  One-time import cost
+        # (~15-30s) but full multi-threaded tensor ops throughout training.
+        ctx = mp.get_context('spawn')
+        self.update_queue = ctx.Queue()
+        self.shadow_step_val = ctx.Value('i', 0, lock=False)  # lock-free atomic
+        self.recovery_req = ctx.Event()
+        self.recovery_ready = ctx.Event()
+        self.recovery_done = ctx.Event()
+        self.shadow_stop_event = ctx.Event()
+
+        self.shadow_process = ctx.Process(
+            target=_shadow_process_main,
+            args=(self.update_queue, self.base_checkpoint_state, self.shadow_shared,
+                  self.shadow_step_val,
+                  self.recovery_req, self.recovery_ready, self.recovery_done,
+                  self.shadow_stop_event,
+                  param_names, rng_device, simulate_perturbation,
+                  default_zo_eps, adam_config, use_pipeline, P),
+            daemon=True,
+        )
+
+        self.shadow_process.start()
+        logger.info(f"[BatchDiff] Started shadow process (PID={self.shadow_process.pid}, "
+                    f"pipeline={use_pipeline}, P={P}, rng={rng_device})")
+
+    # Keep legacy thread methods for reference / fallback
+    def _start_shadow_thread(self):
+        """Legacy: start shadow as in-process thread. Use _start_shadow_process() instead."""
+        if self.shadow_thread is not None and self.shadow_thread.is_alive():
+            return
         self.shadow_running = True
-        self.shadow_thread = threading.Thread(target=self._shadow_worker, daemon=True)
+        use_pipeline = os.environ.get('SHADOW_PIPELINE', '0') == '1'
+        if use_pipeline:
+            target = self._shadow_worker_pipelined
+            P = int(os.environ.get('SHADOW_PIPELINE_WORKERS', '2'))
+            logger.info(f"[BatchDiff] Starting pipelined shadow thread (P={P})")
+        else:
+            target = self._shadow_worker
+            logger.info("[BatchDiff] Starting serial shadow thread")
+        self.shadow_thread = threading.Thread(target=target, daemon=True)
         self.shadow_thread.start()
-        logger.info("[BatchDiff] Started shadow model thread")
 
     def _shadow_worker(self):
         """Background thread: continuously track GPU updates"""
@@ -509,6 +672,177 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 
         logger.info("[Shadow] Worker stopped")
 
+    def _shadow_worker_pipelined(self):
+        """Pipelined shadow: P producer threads pre-generate z, 1 consumer applies updates.
+
+        Adapts the ring buffer pattern from _pipelined_replay_cpu to run continuously
+        during training. GIL is not a bottleneck because PyTorch tensor ops and zo_rng
+        C extensions release the GIL — producer (z generation) and consumer (param update)
+        truly run in parallel.
+
+        Env vars:
+            SHADOW_PIPELINE_WORKERS=P: number of producer threads / ring buffer slots (default 2)
+        """
+        P = max(1, int(os.environ.get('SHADOW_PIPELINE_WORKERS', '2')))
+        logger.info(f"[Shadow Pipeline] Worker started with P={P} ring buffer slots")
+
+        # ---- Detect config once at startup ----
+        _rng_device = 'native'
+        if self.trainer is not None and hasattr(self.trainer, 'model'):
+            _opt = getattr(self.trainer.model, 'opt', None)
+            if _opt is not None:
+                _rng_device = getattr(_opt, 'rng_device', 'native')
+
+        simulate_perturbation = os.environ.get('BATCHDIFF_SIMULATE_PERTURBATION', '1') == '1'
+
+        default_zo_eps = 0.0
+        if self.trainer and hasattr(self.trainer, 'model') and hasattr(self.trainer.model, 'opt'):
+            default_zo_eps = getattr(self.trainer.model.opt, 'zo_eps', 0.0)
+
+        # ---- Ring buffer infrastructure (same pattern as _pipelined_replay_cpu) ----
+        buffer = [None] * P          # each slot: z_dict (pre-generated z tensors)
+        ready = [threading.Event() for _ in range(P)]
+        free = [threading.Event() for _ in range(P)]
+        for e in free:
+            e.set()  # all slots start free
+
+        producer_error = [None]
+        producer_stop = threading.Event()
+
+        # Each producer owns one slot and generates z for steps assigned to it
+        # Assignment: slot i handles steps {i, i+P, i+2P, ...} within each batch
+        # We use a shared counter to coordinate step assignment
+        next_step_to_assign = [0]  # mutable container for thread-safe coordination
+        assign_lock = threading.Lock()
+
+        def producer(slot_id):
+            """Producer thread: wait for assignment, generate z, signal ready."""
+            try:
+                while not producer_stop.is_set():
+                    # Wait for our slot to be freed by consumer
+                    free[slot_id].wait(timeout=0.05)
+                    if producer_stop.is_set():
+                        break
+                    if not free[slot_id].is_set():
+                        continue
+                    free[slot_id].clear()
+
+                    # Get assigned step
+                    with assign_lock:
+                        step_idx = next_step_to_assign[0]
+                        next_step_to_assign[0] += 1
+
+                    # Wait for update to become available
+                    while not producer_stop.is_set():
+                        with self.update_lock:
+                            if step_idx < len(self.update_history):
+                                update = self.update_history[step_idx].copy()
+                                break
+                        time.sleep(0.001)
+
+                    if producer_stop.is_set():
+                        free[slot_id].set()
+                        break
+
+                    # Read param_names from shadow model (stable reference)
+                    with self.shadow_lock:
+                        param_names = self._trainable_param_names or list(self.shadow_model.keys())
+
+                    # Pre-generate z tensors (thread-safe, releases GIL)
+                    z = _generate_z_for_one_step(update['seed'], param_names,
+                                                 self.shadow_model, _rng_device)
+
+                    buffer[slot_id] = (step_idx, z)
+                    ready[slot_id].set()
+
+            except Exception as e:
+                producer_error[0] = e
+                ready[slot_id].set()  # unblock consumer
+
+        # Launch P producer threads
+        threads = []
+        for i in range(P):
+            t = threading.Thread(target=producer, args=(i,), daemon=True)
+            t.start()
+            threads.append(t)
+
+        # ---- Consumer loop (this thread) ----
+        consumer_step = self.shadow_step  # next step index to consume
+        next_step_to_assign[0] = consumer_step  # align producer assignment
+        # Pre-assign first P slots
+        for i in range(P):
+            with assign_lock:
+                pass  # producers will self-assign via next_step_to_assign
+
+        # We need an ordered consumption queue since producers may finish out of order
+        # Use a dict to buffer out-of-order completions
+        pending_results = {}
+        next_slot_to_check = 0
+
+        while self.shadow_running:
+            try:
+                if producer_error[0] is not None:
+                    logger.error(f"[Shadow Pipeline] Producer error: {producer_error[0]}")
+                    break
+
+                # Check the next slot in round-robin
+                slot = next_slot_to_check % P
+                if ready[slot].wait(timeout=0.05):
+                    ready[slot].clear()
+
+                    if producer_error[0] is not None:
+                        raise producer_error[0]
+
+                    step_idx, z = buffer[slot]
+                    buffer[slot] = None
+
+                    # Buffer if out of order, or process immediately
+                    pending_results[step_idx] = z
+
+                    # Process all consecutive ready steps
+                    while consumer_step in pending_results:
+                        z_dict = pending_results.pop(consumer_step)
+
+                        with self.update_lock:
+                            if consumer_step >= len(self.update_history):
+                                break
+                            update = self.update_history[consumer_step].copy()
+
+                        with self.shadow_lock:
+                            param_names = self._trainable_param_names or list(self.shadow_model.keys())
+                            _apply_single_update_with_pregenerated_z(
+                                self.shadow_model, update, param_names, z_dict,
+                                default_zo_eps=default_zo_eps,
+                                simulate_perturbation=simulate_perturbation,
+                                zo2_mode=False,
+                                adam_state=self.shadow_adam_state,
+                            )
+
+                        del z_dict
+
+                        with self.shadow_lock:
+                            self.shadow_step += 1
+                        consumer_step += 1
+
+                        if consumer_step % 10 == 0:
+                            logger.info(f"[Shadow Pipeline] Caught up to step {consumer_step}")
+
+                    # Release slot for producer to reuse
+                    free[slot].set()
+                    next_slot_to_check += 1
+
+            except Exception as e:
+                logger.error(f"[Shadow Pipeline] Consumer error: {e}")
+                time.sleep(0.1)
+
+        # ---- Shutdown ----
+        producer_stop.set()
+        for e in free:
+            e.set()  # unblock waiting producers
+        for t in threads:
+            t.join(timeout=2.0)
+        logger.info("[Shadow Pipeline] Worker stopped")
+
     def _apply_update_to_shadow(self, update):
         """Apply one update to shadow model (always on CPU).
         Note: When rng_device="native" and training runs on CUDA, the shadow model will use
@@ -524,7 +858,9 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                 if _opt is not None:
                     _rng_device = getattr(_opt, 'rng_device', 'native')
             # Shadow stays on CPU — never move to CUDA to avoid RNG race with main thread
-            _apply_single_update(self.shadow_model, update, param_names, rng_device=_rng_device)
+            _apply_single_update(self.shadow_model, update, param_names,
+                                 rng_device=_rng_device,
+                                 adam_state=self.shadow_adam_state)
 
     def _zo_update_hook(self, model, inputs, loss):
         """Hook called after ZO training step"""
@@ -579,6 +915,14 @@ class BatchDiffCheckpointCallback(TrainerCallback):
                     'zo_eps': float(zo_eps),
                 }
                 self.update_history.append(update)
+                # Non-blocking send to shadow process (no lock, no GIL contention)
+                if self.update_queue is not None:
+                    try:
+                        self.update_queue.put_nowait(update)
+                    except Exception as e:
+                        if not getattr(self, '_queue_error_logged', False):
+                            logger.warning(f"[BatchDiff] Failed to send update to shadow: {e}")
+                            self._queue_error_logged = True
                 if applied_grad != 0:
                     logger.info(f"[HOOK] step={actual_step}, UPDATE RECORDED: seed={update['seed']}, "
                                 f"applied_grad={update['grad']:.6e}, new_grad={new_grad:.6e}, lr={lr}, wd={wd}")
@@ -596,11 +940,14 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         self.current_step = state.global_step
 
         if self.current_step % 10 == 0:
-            with self.update_lock:
-                num_updates = len(self.update_history)
+            num_updates = len(self.update_history)
             if self.enable_shadow:
-                with self.shadow_lock:
-                    shadow_step = self.shadow_step
+                shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
+                # Health check: detect dead shadow process (log once)
+                if self.shadow_process is not None and not self.shadow_process.is_alive():
+                    if not getattr(self, '_shadow_death_logged', False):
+                        logger.error(f"[BatchDiff] Shadow process DEAD (exitcode={self.shadow_process.exitcode})")
+                        self._shadow_death_logged = True
                 logger.info(f"[BatchDiff] GPU step {self.current_step}, Shadow step {shadow_step}, "
                            f"Updates: {num_updates}")
             else:
@@ -608,22 +955,32 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 
     def recover_from_shadow(self) -> OrderedDict:
         """
-        Recover from shadow model or update_history.
+        Recover from shadow model (shared memory) or update_history.
+        Uses Event protocol to pause shadow process for safe cloning.
         Returns state_dict that can be directly load_state_dict.
         """
         t_start = time.time()
 
-        if self.enable_shadow:
-            with self.shadow_lock:
-                if self.shadow_model is None:
-                    logger.error("[Recovery] No shadow model available!")
-                    return None
+        if self.enable_shadow and self.shadow_shared is not None:
+            # Request shadow process to pause
+            if self.shadow_process is not None and self.shadow_process.is_alive():
+                self.recovery_req.set()
+                if not self.recovery_ready.wait(timeout=10.0):
+                    logger.warning("[Recovery] Shadow process did not respond to pause request")
+            elif self.shadow_model is None:
+                logger.error("[Recovery] No shadow model available!")
+                return None
 
-                shadow_step = self.shadow_step
+            shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
 
-                recovered = OrderedDict()
-                for key, value in self.shadow_model.items():
-                    recovered[key] = value.clone()
+            # Clone shared memory tensors (shadow process is paused, safe to read)
+            recovered = OrderedDict()
+            for key, value in self.shadow_shared.items():
+                recovered[key] = value.clone()
+
+            # Resume shadow process
+            if self.shadow_process is not None and self.shadow_process.is_alive():
+                self.recovery_done.set()
 
             t_elapsed = time.time() - t_start
             logger.info(f"[Recovery] Recovered from shadow model at step {shadow_step} in {t_elapsed:.3f}s")
@@ -706,8 +1063,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         model.to('cuda')
         torch.cuda.synchronize()
 
-        with self.shadow_lock:
-            recovered_step = self.shadow_step
+        recovered_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
 
         logger.info(f"[Recovery] Successfully recovered to step {recovered_step}")
         return recovered_step
@@ -715,15 +1071,13 @@ class BatchDiffCheckpointCallback(TrainerCallback):
     def get_recovery_status(self) -> dict:
         """Get current recovery status"""
         if self.enable_shadow:
-            with self.shadow_lock:
-                shadow_step = self.shadow_step
-                shadow_available = self.shadow_model is not None
+            shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
+            shadow_available = self.shadow_shared is not None or self.shadow_model is not None
         else:
             shadow_step = -1
             shadow_available = False
 
-        with self.update_lock:
-            total_updates = len(self.update_history)
+        total_updates = len(self.update_history)
 
         can_recover = (self.enable_shadow and shadow_available and shadow_step > 0) or \
                       (not self.enable_shadow and self.base_checkpoint_state is not None)
@@ -767,15 +1121,24 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 
     def _update_base_and_shadow(self, model, step):
         """Update base_checkpoint_state from current model (full step only for batch_size>=1).
-        Also refreshes shadow model if enabled."""
+        GPU → CPU shared memory DMA, then notify shadow process to refresh."""
         state_dict = model.state_dict()
 
-        self.base_checkpoint_state = OrderedDict()
-        for key, value in state_dict.items():
-            self.base_checkpoint_state[key] = value.detach().cpu().clone()
-
-        if self.enable_shadow:
-            self._refresh_shadow_from_base()
+        if self.enable_shadow and self.shadow_shared is not None:
+            # GPU → POSIX shared memory DMA (in-place copy to existing shm tensors)
+            for key, value in state_dict.items():
+                self.base_checkpoint_state[key].copy_(value)
+            # Notify shadow process: base updated, please refresh
+            if self.update_queue is not None:
+                self.update_queue.put_nowait({
+                    'cmd': 'refresh',
+                    'new_step': len(self.update_history),
+                })
+        else:
+            # Non-shadow path: allocate new tensors (original behavior)
+            self.base_checkpoint_state = OrderedDict()
+            for key, value in state_dict.items():
+                self.base_checkpoint_state[key] = value.detach().cpu().clone()
 
     def _get_memory_size(self):
         if self.base_checkpoint_state is None:
@@ -790,8 +1153,7 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         total_gb = mem.total / (1024 ** 3)
 
         if self.enable_shadow:
-            with self.shadow_lock:
-                shadow_step = self.shadow_step if self.shadow_model else -1
+            shadow_step = self.shadow_step_val.value if self.shadow_step_val else (self.shadow_step if self.shadow_model else -1)
             logger.info(f"[BatchDiff] Memory: cache={cache_mb:.1f}MB, "
                        f"system={used_gb:.1f}/{total_gb:.1f}GB, "
                        f"shadow_step={shadow_step}")
@@ -826,6 +1188,25 @@ class BatchDiffCheckpointCallback(TrainerCallback):
             logger.info(f"[AsyncAnchor] Final stats: {async_anchor.stats}")
 
         if self.enable_shadow:
+            # 1. Immediate stop signal (shadow checks this every iteration, ~50ns)
+            if self.shadow_stop_event is not None:
+                self.shadow_stop_event.set()
+            # 2. Unblock any recovery_done.wait() deadlock
+            if self.recovery_done is not None:
+                self.recovery_done.set()
+            # 3. Queue stop command as fallback
+            if self.update_queue is not None:
+                try:
+                    self.update_queue.put_nowait({'cmd': 'stop'})
+                except Exception:
+                    pass
+            # 4. Wait for shadow to exit (should be near-instant)
+            if self.shadow_process is not None and self.shadow_process.is_alive():
+                self.shadow_process.join(timeout=5.0)
+                if self.shadow_process.is_alive():
+                    self.shadow_process.terminate()
+                    logger.warning("[BatchDiff] Shadow process force-terminated")
+            # Legacy thread cleanup
             self.shadow_running = False
             if self.shadow_thread and self.shadow_thread.is_alive():
                 self.shadow_thread.join(timeout=5.0)
@@ -836,6 +1217,9 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         if self.base_checkpoint_state:
             del self.base_checkpoint_state
             self.base_checkpoint_state = None
+        if self.shadow_shared:
+            del self.shadow_shared
+            self.shadow_shared = None
         if self.shadow_model:
             del self.shadow_model
             self.shadow_model = None
@@ -846,6 +1230,413 @@ class BatchDiffCheckpointCallback(TrainerCallback):
 # Backward compatibility aliases
 ZOReplayCheckpointCallback = BatchDiffCheckpointCallback
 IncrementalCheckpointCallback = BatchDiffCheckpointCallback
+
+
+# ============================================================================
+# Shadow Process (multiprocessing, zero contention with training)
+# ============================================================================
+
+def _shadow_process_main(update_queue, base_shared, shadow_shared, shadow_step_val,
+                          recovery_req, recovery_ready, recovery_done,
+                          stop_event,
+                          param_names, rng_device, simulate_perturbation,
+                          default_zo_eps, adam_config, use_pipeline, P):
+    """Shadow process entry point. Runs in a separate process with independent GIL.
+
+    All heavy computation (z generation, tensor updates) happens here without
+    any lock/GIL contention with the training process.
+
+    Args:
+        update_queue: mp.Queue — receives update dicts and commands from training
+        base_shared: OrderedDict of shared-memory tensors (training writes new anchors)
+        shadow_shared: OrderedDict of shared-memory tensors (this process writes updates)
+        shadow_step_val: mp.Value('i', lock=False) — shared atomic step counter
+        recovery_req/ready/done: mp.Event — pause/resume protocol for safe recovery
+        stop_event: mp.Event — immediate stop signal from on_train_end
+        param_names: list of trainable parameter names
+        rng_device: 'native', 'cpu', or 'zo_rng'
+        simulate_perturbation: whether to simulate [+1,-2,+1] perturbation
+        default_zo_eps: default perturbation epsilon
+        adam_config: dict with 'betas' and 'adam_eps' (or None for SGD)
+        use_pipeline: whether to use pipelined P-producer ring buffer
+        P: number of producer threads (if pipeline)
+    """
+    # Spawn process starts with a fresh Python — set up logging (no inherited handlers)
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s')
+    _logger = logging.getLogger(__name__ + '.shadow_process')
+
+    # Thread allocation: in pipeline mode, producer (zo_rng or torch.normal)
+    # and consumer (ATen ops) both use the same OpenMP thread pool.  Split
+    # cores evenly: n_cores // (P+1) per operation, so total = n_cores.
+    # (zo_rng also uses #pragma omp parallel, sharing the OpenMP runtime.)
+    n_cores = os.cpu_count() or 64
+    if use_pipeline:
+        threads_per_op = max(1, n_cores // (P + 1))
+        torch.set_num_threads(threads_per_op)
+    else:
+        torch.set_num_threads(n_cores)
+
+    _logger.info(f"[Shadow Process] Started (PID={os.getpid()}, pipeline={use_pipeline}, P={P}, "
+                 f"num_threads={torch.get_num_threads()}, cores={n_cores})")
+    _logger.info(f"[Shadow Process] OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS','unset')}, "
+                 f"OMP_WAIT_POLICY={os.environ.get('OMP_WAIT_POLICY','unset')}")
+
+    try:
+        # Initialize Adam state locally (not shared — only this process uses it)
+        adam_state = None
+        if adam_config is not None:
+            adam_state = {
+                'm': {}, 'v': {}, 't': 0,
+                'betas': adam_config['betas'],
+                'adam_eps': adam_config['adam_eps'],
+            }
+            _logger.info(f"[Shadow Process] Adam state initialized: betas={adam_config['betas']}")
+
+        if use_pipeline:
+            _shadow_process_pipelined(
+                update_queue, base_shared, shadow_shared, shadow_step_val,
+                recovery_req, recovery_ready, recovery_done, stop_event,
+                param_names, rng_device, simulate_perturbation,
+                default_zo_eps, adam_state, P, _logger)
+        else:
+            _shadow_process_serial(
+                update_queue, base_shared, shadow_shared, shadow_step_val,
+                recovery_req, recovery_ready, recovery_done, stop_event,
+                param_names, rng_device, simulate_perturbation,
+                default_zo_eps, adam_state, _logger)
+    except Exception:
+        import traceback
+        _logger.error(f"[Shadow Process] CRASHED:\n{traceback.format_exc()}")
+
+
+def _shadow_process_serial(update_queue, base_shared, shadow_shared, shadow_step_val,
+                            recovery_req, recovery_ready, recovery_done, stop_event,
+                            param_names, rng_device, simulate_perturbation,
+                            default_zo_eps, adam_state, _logger):
+    """Serial shadow: get update from queue, generate z + apply, repeat."""
+    _logger.info(f"[Shadow Process] Running in serial mode (params={len(param_names)}, rng={rng_device})")
+
+    while True:
+        if stop_event.is_set():
+            break
+
+        # Check recovery request (pause for safe cloning by training process)
+        if recovery_req.is_set():
+            recovery_ready.set()
+            while not recovery_done.is_set():
+                if stop_event.is_set():
+                    break
+                recovery_done.wait(timeout=0.1)
+            recovery_done.clear()
+            recovery_req.clear()
+            recovery_ready.clear()
+            if stop_event.is_set():
+                break
+            continue
+
+        try:
+            cmd = update_queue.get(timeout=0.05)
+        except queue_module.Empty:
+            continue
+
+        if isinstance(cmd, dict) and cmd.get('cmd') == 'stop':
+            break
+        elif isinstance(cmd, dict) and cmd.get('cmd') == 'refresh':
+            # Base was updated via DMA — copy base_shared → shadow_shared
+            for key in param_names:
+                if key in shadow_shared and key in base_shared:
+                    shadow_shared[key].copy_(base_shared[key])
+            shadow_step_val.value = cmd['new_step']
+            if adam_state is not None:
+                adam_state['m'].clear()
+                adam_state['v'].clear()
+                adam_state['t'] = 0
+            _logger.info(f"[Shadow Process] Refreshed from base at step {cmd['new_step']}")
+            continue
+
+        # Normal update
+        update = cmd
+        t_apply = time.time()
+        _apply_single_update(shadow_shared, update, param_names,
+                             default_zo_eps=default_zo_eps,
+                             rng_device=rng_device,
+                             simulate_perturbation=simulate_perturbation,
+                             adam_state=adam_state)
+        t_elapsed = time.time() - t_apply
+        shadow_step_val.value += 1
+
+        step = shadow_step_val.value
+        if step == 1:
+            _logger.info(f"[Shadow Process] First update applied in {t_elapsed:.3f}s, "
+                         f"shadow_step_val={step}")
+        if step % 10 == 0:
+            _logger.info(f"[Shadow Process] Caught up to step {step}")
+
+    _logger.info("[Shadow Process] Stopped (serial)")
+
+
+def _shadow_process_pipelined(update_queue, base_shared, shadow_shared, shadow_step_val,
+                               recovery_req, recovery_ready, recovery_done, stop_event,
+                               param_names, rng_device, simulate_perturbation,
+                               default_zo_eps, adam_state, P, _logger):
+    """Pipelined shadow: P producer threads pre-generate z, consumer applies updates.
+
+    Ring buffer pattern runs entirely within this process — threads share this
+    process's GIL (not the training process's GIL), so zero training contention.
+    """
+    # Buffer size: decoupled from P.  B = ceil(t_c / max(t_p, t_t)).
+    # Set via SHADOW_BUFFER_SIZE env var (from calibrate_shadow_pipeline output).
+    buffer_size = max(P + 1, int(os.environ.get('SHADOW_BUFFER_SIZE', str(P + 1))))
+    # Memory estimation: each z buffer slot ≈ Ψ (same shape as params)
+    per_slot_bytes = sum(shadow_shared[nm].numel() * shadow_shared[nm].element_size()
+                         for nm in param_names)
+    total_buf_bytes = buffer_size * per_slot_bytes
+    shadow_bytes = sum(shadow_shared[nm].numel() * shadow_shared[nm].element_size()
+                       for nm in param_names)
+    _logger.info(f"[Shadow Pipeline] P={P} producers, buffer_size={buffer_size}, "
+                 f"per_slot={per_slot_bytes/1e9:.2f}GB, "
+                 f"z_buf_total={total_buf_bytes/1e9:.2f}GB, "
+                 f"shadow_copy={shadow_bytes/1e9:.2f}GB, "
+                 f"est_total={( shadow_bytes + total_buf_bytes)/1e9:.2f}GB")
+
+    # Ring buffer (buffer_size slots, independent of P)
+    buffer = [None] * buffer_size
+    ready = [threading.Event() for _ in range(buffer_size)]
+    free = [threading.Event() for _ in range(buffer_size)]
+    for e in free:
+        e.set()
+
+    producer_stop = threading.Event()
+    producer_error = [None]
+
+    # Internal queue: main loop puts updates, producers consume
+    internal_updates = {}  # step_idx → update dict
+    internal_lock = threading.Lock()
+    update_available_event = threading.Event()
+
+    # Step assignment
+    next_step_to_assign = [shadow_step_val.value]
+    next_enqueue_step = [shadow_step_val.value]  # monotonic counter for incoming updates
+    assign_lock = threading.Lock()
+
+    # Shared timing for diagnostics (producer writes, consumer reads)
+    producer_timing = {'t0': 0.0, 't1': 0.0, 'duration_ms': 0.0}
+
+    def producer(slot_id):
+        """Producer: wait for slot, get update, generate z, signal ready.
+
+        Each producer cycles through buffer slots: slot_id, slot_id+P, slot_id+2P, ...
+        This ensures P producers cover all buffer_size slots without conflict.
+        """
+        current_slot = slot_id
+        try:
+            while not producer_stop.is_set():
+                free[current_slot].wait(timeout=0.05)
+                if producer_stop.is_set():
+                    break
+                if not free[current_slot].is_set():
+                    continue
+                free[current_slot].clear()
+
+                with assign_lock:
+                    step_idx = next_step_to_assign[0]
+                    next_step_to_assign[0] += 1
+
+                # Wait for update data
+                update = None
+                while not producer_stop.is_set():
+                    with internal_lock:
+                        if step_idx in internal_updates:
+                            update = internal_updates.pop(step_idx)
+                            break
+                    update_available_event.wait(timeout=0.05)
+                    update_available_event.clear()
+
+                if producer_stop.is_set():
+                    free[current_slot].set()
+                    break
+
+                # Pre-generate z (releases GIL via zo_rng/PyTorch C++)
+                t0_zgen = time.monotonic()
+                z = _generate_z_for_one_step(update['seed'], param_names,
+                                              shadow_shared, rng_device)
+                t1_zgen = time.monotonic()
+                producer_timing['t0'] = t0_zgen
+                producer_timing['t1'] = t1_zgen
+                producer_timing['duration_ms'] = (t1_zgen - t0_zgen) * 1000
+
+                buffer[current_slot] = (step_idx, z, update)
+                ready[current_slot].set()
+
+                # Cycle to next slot for this producer
+                current_slot = (current_slot + P) % buffer_size
+
+        except Exception as e:
+            _logger.error(f"[Shadow Pipeline] Producer-{slot_id} CRASHED: {e}")
+            producer_error[0] = e
+            ready[current_slot].set()
+
+    # Launch producer threads
+    threads = []
+    for i in range(P):
+        t = threading.Thread(target=producer, args=(i,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Consumer loop (this thread)
+    # Note: next_step_to_assign and next_enqueue_step already initialized above;
+    # do NOT re-assign here — producers may have already incremented them.
+    consumer_step = shadow_step_val.value
+    pending_results = {}
+    next_slot_to_check = 0
+
+    while True:
+        # Immediate exit check (~50ns, no lock)
+        if stop_event.is_set():
+            break
+
+        # Check recovery
+        if recovery_req.is_set():
+            recovery_ready.set()
+            while not recovery_done.is_set():
+                if stop_event.is_set():
+                    break
+                recovery_done.wait(timeout=0.1)
+            recovery_done.clear()
+            recovery_req.clear()
+            recovery_ready.clear()
+            if stop_event.is_set():
+                break
+            continue
+
+        # Read from external queue (non-blocking)
+        try:
+            while True:
+                cmd = update_queue.get_nowait()
+                if isinstance(cmd, dict) and cmd.get('cmd') == 'stop':
+                    producer_stop.set()
+                    for e in free:
+                        e.set()
+                    for t in threads:
+                        t.join(timeout=2.0)
+                    _logger.info("[Shadow Pipeline] Stopped")
+                    return
+                elif isinstance(cmd, dict) and cmd.get('cmd') == 'refresh':
+                    # --- Stop producers cleanly ---
+                    producer_stop.set()
+                    update_available_event.set()
+                    for e in free:
+                        e.set()
+                    for t in threads:
+                        t.join(timeout=2.0)
+
+                    # --- Reset shadow from new base ---
+                    for key in param_names:
+                        if key in shadow_shared and key in base_shared:
+                            shadow_shared[key].copy_(base_shared[key])
+                    new_step = cmd['new_step']
+                    shadow_step_val.value = new_step
+                    consumer_step = new_step
+
+                    # --- Reset all pipeline state ---
+                    next_step_to_assign[0] = new_step
+                    next_enqueue_step[0] = new_step
+                    internal_updates.clear()
+                    pending_results.clear()
+                    for buf_idx in range(P):
+                        buffer[buf_idx] = None
+                        ready[buf_idx].clear()
+                        free[buf_idx].set()
+                    update_available_event.clear()
+                    next_slot_to_check = 0
+                    if adam_state is not None:
+                        adam_state['m'].clear()
+                        adam_state['v'].clear()
+                        adam_state['t'] = 0
+
+                    # --- Restart producers ---
+                    producer_stop.clear()
+                    producer_error[0] = None
+                    threads.clear()
+                    for i in range(P):
+                        t = threading.Thread(target=producer, args=(i,), daemon=True)
+                        t.start()
+                        threads.append(t)
+                    _logger.info(f"[Shadow Pipeline] Refreshed at step {new_step}")
+                else:
+                    # Normal update — store for producers with monotonic index
+                    with internal_lock:
+                        internal_updates[next_enqueue_step[0]] = cmd
+                        next_enqueue_step[0] += 1
+                    update_available_event.set()
+        except queue_module.Empty:
+            pass
+
+        if producer_error[0] is not None:
+            _logger.error(f"[Shadow Pipeline] Producer error: {producer_error[0]}")
+            break
+
+        # Check next slot in round-robin (buffer_size may be > P)
+        slot = next_slot_to_check % buffer_size
+        if ready[slot].wait(timeout=0.05):
+            ready[slot].clear()
+
+            if producer_error[0] is not None:
+                break
+
+            step_idx, z_dict, update = buffer[slot]
+            buffer[slot] = None
+            # Release slot immediately so producer can start generating
+            # next z in parallel with consumer's apply.  Consumer holds
+            # references to z_dict/update; Python refcount keeps them alive.
+            free[slot].set()
+            next_slot_to_check += 1
+
+            pending_results[step_idx] = (z_dict, update)
+
+            # Process consecutive ready steps
+            while consumer_step in pending_results:
+                z_dict, update = pending_results.pop(consumer_step)
+
+                t0_apply = time.monotonic()
+                _apply_single_update_with_pregenerated_z(
+                    shadow_shared, update, param_names, z_dict,
+                    default_zo_eps=default_zo_eps,
+                    simulate_perturbation=simulate_perturbation,
+                    zo2_mode=False,
+                    adam_state=adam_state,
+                )
+                t1_apply = time.monotonic()
+                apply_ms = (t1_apply - t0_apply) * 1000
+
+                # Check overlap with most recent producer z-gen
+                p_t0, p_t1 = producer_timing['t0'], producer_timing['t1']
+                overlap = (p_t0 < t1_apply and p_t1 > t0_apply)
+
+                del z_dict
+                shadow_step_val.value += 1
+                consumer_step += 1
+
+                if consumer_step <= 50 or consumer_step % 10 == 0:
+                    slots_occupied = sum(1 for r in ready if r.is_set())
+                    slots_free = sum(1 for f in free if f.is_set())
+                    _logger.info(
+                        f"[Diag] step={consumer_step} "
+                        f"apply={apply_ms:.0f}ms "
+                        f"zgen={producer_timing['duration_ms']:.0f}ms "
+                        f"overlap={'YES' if overlap else 'no'} "
+                        f"threads={torch.get_num_threads()} "
+                        f"buf: ready={slots_occupied} free={slots_free}"
+                    )
+
+    # Cleanup
+    producer_stop.set()
+    for e in free:
+        e.set()
+    for t in threads:
+        t.join(timeout=2.0)
+    _logger.info("[Shadow Pipeline] Stopped (pipelined)")
 
 
 def _generate_z_for_replay(param, rng_device="native", zo_gen=None):
@@ -866,9 +1657,1138 @@ def _generate_z_for_replay(param, rng_device="native", zo_gen=None):
         return torch.normal(mean=0, std=1, size=param.size(), dtype=param.dtype, device=param.device)
 
 
+def _is_wd_param(name):
+    """Return True if this parameter receives weight decay (not bias/layernorm)."""
+    return ('bias' not in name and 'layer_norm' not in name
+            and 'layernorm' not in name and 'ln' not in name)
+
+
+def _generate_z_for_one_step(seed, param_names, state, rng_device, replay_dtype=None):
+    """Generate z for all params for a single step (thread-safe).
+
+    Uses a per-call torch.Generator to avoid global RNG state contamination.
+
+    Args:
+        seed: RNG seed for this step
+        param_names: ordered list of param names (must match training order)
+        state: state dict (read-only, used for shape/dtype/device info)
+        rng_device: "native", "cpu", or "zo_rng"
+        replay_dtype: if set, generate z in this dtype (e.g. fp32 for replay_in_fp32)
+
+    Returns:
+        dict of {param_name: z_tensor}
+    """
+    z_dict = {}
+
+    if rng_device == "zo_rng":
+        import zo_rng
+        zo_gen = zo_rng.Generator(seed)
+        for name in param_names:
+            param = state[name]
+            dtype = replay_dtype if replay_dtype is not None else param.dtype
+            z_dict[name] = zo_gen.randn(param.shape, dtype=dtype, device=param.device)
+    else:
+        # Determine generator device
+        sample_param = state[param_names[0]]
+        if rng_device == "cpu" or sample_param.device.type == "cpu":
+            gen = torch.Generator(device='cpu')
+        else:
+            gen = torch.Generator(device=sample_param.device)
+        gen.manual_seed(seed)
+
+        for name in param_names:
+            param = state[name]
+            dtype = replay_dtype if replay_dtype is not None else param.dtype
+
+            if rng_device == "cpu" and param.device.type != "cpu":
+                z = torch.normal(mean=0, std=1, size=param.size(),
+                                 dtype=torch.float32, device='cpu', generator=gen)
+                z_dict[name] = z.to(dtype=dtype, device=param.device)
+            else:
+                z_dict[name] = torch.normal(mean=0, std=1, size=param.size(),
+                                            dtype=dtype, device=param.device, generator=gen)
+
+    return z_dict
+
+
+def _pipelined_replay_cpu(state, updates, param_names, rng_device,
+                          num_producers, default_zo_eps, simulate_perturbation,
+                          zo2_mode, seeds_info, replay_dtype):
+    """Pipelined replay: P CPU producer threads + ring buffer + main-thread consumer.
+
+    Each producer i owns slot i in a ring buffer of size P, generating z for
+    steps {i, i+P, i+2P, ...}. The consumer (main thread) reads slots in order
+    0, 1, ..., P-1, 0, 1, ... applying updates sequentially.
+
+    Args:
+        state: state dict to modify in-place
+        updates: list of update dicts
+        param_names: ordered param names
+        rng_device: "native", "cpu", or "zo_rng"
+        num_producers: P = number of producer threads = ring buffer size
+        default_zo_eps: fallback zo_eps
+        simulate_perturbation: whether to simulate [+1, -2, +1] perturbation
+        zo2_mode: ZO2 replay order
+        seeds_info: list of (grad_seed, perturb_seed) per step
+        replay_dtype: override dtype for z generation (e.g. fp32)
+    """
+    P = num_producers
+    n = len(updates)
+
+    # Ring buffer: P slots, each holds (z_dict, z_perturb_dict)
+    buffer = [None] * P
+    ready = [threading.Event() for _ in range(P)]
+    free = [threading.Event() for _ in range(P)]
+    for e in free:
+        e.set()  # all slots start free
+
+    error_holder = [None]
+
+    def producer(slot_id):
+        try:
+            step = slot_id
+            while step < n:
+                free[slot_id].wait()
+                free[slot_id].clear()
+                grad_seed, perturb_seed = seeds_info[step]
+                z = _generate_z_for_one_step(grad_seed, param_names, state,
+                                             rng_device, replay_dtype)
+                z_perturb = None
+                if zo2_mode and perturb_seed != grad_seed:
+                    z_perturb = _generate_z_for_one_step(perturb_seed, param_names,
+                                                         state, rng_device, replay_dtype)
+                buffer[slot_id] = (z, z_perturb)
+                ready[slot_id].set()
+                step += P
+        except Exception as e:
+            error_holder[0] = e
+            ready[slot_id].set()  # unblock consumer
+
+    # Launch P producer threads
+    threads = []
+    for i in range(min(P, n)):
+        t = threading.Thread(target=producer, args=(i,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Consumer (main thread): read slots in order
+    for step in range(n):
+        slot = step % P
+        ready[slot].wait()
+        ready[slot].clear()
+        if error_holder[0] is not None:
+            raise error_holder[0]
+
+        z, z_perturb = buffer[slot]
+        _apply_single_update_with_pregenerated_z(
+            state, updates[step], param_names, z,
+            z_perturb_dict=z_perturb,
+            default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            zo2_mode=zo2_mode,
+        )
+        buffer[slot] = None  # release z memory
+        free[slot].set()
+
+        # Logging
+        if step < 3 or step == n - 1:
+            logger.info(f"[PipelinedReplay] update {step}: step={updates[step].get('step','?')}, "
+                        f"seed={updates[step]['seed']}, grad={updates[step]['grad']:.6e}, "
+                        f"lr={updates[step]['lr']}, wd={updates[step].get('wd', 0.0)}")
+        elif step == 3:
+            logger.info(f"[PipelinedReplay] ... ({n - 4} more updates) ...")
+
+    # Wait for all producers to finish
+    for t in threads:
+        t.join()
+    if error_holder[0] is not None:
+        raise error_holder[0]
+
+
+def _pipelined_replay_gpu(state, updates, param_names, rng_device,
+                          num_producers, default_zo_eps, simulate_perturbation,
+                          zo2_mode, seeds_info, replay_dtype):
+    """Pipelined replay: P CUDA streams + events, single Python thread.
+
+    Each slot i uses a dedicated CUDA stream for z generation. The consumer
+    runs on the default stream. CUDA events synchronize between producer
+    streams and the default stream — no Python threads needed.
+
+    Args: same as _pipelined_replay_cpu
+    """
+    P = num_producers
+    n = len(updates)
+
+    streams = [torch.cuda.Stream() for _ in range(P)]
+    ready_events = [torch.cuda.Event() for _ in range(P)]
+    free_events = [torch.cuda.Event() for _ in range(P)]
+    buffer = [None] * P
+
+    # Pre-fill: schedule first P z-generations on separate streams
+    for i in range(min(P, n)):
+        grad_seed, perturb_seed = seeds_info[i]
+        with torch.cuda.stream(streams[i]):
+            z = _generate_z_for_one_step(grad_seed, param_names, state,
+                                         rng_device, replay_dtype)
+            z_perturb = None
+            if zo2_mode and perturb_seed != grad_seed:
+                z_perturb = _generate_z_for_one_step(perturb_seed, param_names,
+                                                     state, rng_device, replay_dtype)
+            buffer[i] = (z, z_perturb)
+        ready_events[i].record(streams[i])
+
+    # Main loop: consumer on default stream
+    default_stream = torch.cuda.current_stream()
+    for step in range(n):
+        slot = step % P
+
+        # Wait for producer stream to finish this slot's z
+        default_stream.wait_event(ready_events[slot])
+
+        z, z_perturb = buffer[slot]
+        _apply_single_update_with_pregenerated_z(
+            state, updates[step], param_names, z,
+            z_perturb_dict=z_perturb,
+            default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            zo2_mode=zo2_mode,
+        )
+
+        # Schedule next z generation for this slot
+        next_step = step + P
+        if next_step < n:
+            free_events[slot].record(default_stream)
+            grad_seed, perturb_seed = seeds_info[next_step]
+            with torch.cuda.stream(streams[slot]):
+                streams[slot].wait_event(free_events[slot])
+                z = _generate_z_for_one_step(grad_seed, param_names, state,
+                                             rng_device, replay_dtype)
+                z_perturb = None
+                if zo2_mode and perturb_seed != grad_seed:
+                    z_perturb = _generate_z_for_one_step(perturb_seed, param_names,
+                                                         state, rng_device, replay_dtype)
+                buffer[slot] = (z, z_perturb)
+            ready_events[slot].record(streams[slot])
+        else:
+            buffer[slot] = None  # release z memory
+
+        # Logging
+        if step < 3 or step == n - 1:
+            logger.info(f"[PipelinedReplay] update {step}: step={updates[step].get('step','?')}, "
+                        f"seed={updates[step]['seed']}, grad={updates[step]['grad']:.6e}, "
+                        f"lr={updates[step]['lr']}, wd={updates[step].get('wd', 0.0)}")
+        elif step == 3:
+            logger.info(f"[PipelinedReplay] ... ({n - 4} more updates) ...")
+
+    torch.cuda.synchronize()
+
+
+def _apply_single_update_with_pregenerated_z(state, update, param_names, z_dict,
+                                              z_perturb_dict=None,
+                                              default_zo_eps=0.0,
+                                              simulate_perturbation=True,
+                                              zo2_mode=False,
+                                              adam_state=None):
+    """Apply one ZO update using pre-generated z tensors.
+
+    Logic matches _apply_single_update exactly, but uses pre-generated z
+    instead of calling torch.manual_seed + torch.normal.
+
+    Args:
+        state: state dict to modify in-place
+        update: update dict with seed, grad, lr, wd, zo_eps
+        param_names: ordered param names
+        z_dict: pre-generated z for gradient update (keyed by param name)
+        z_perturb_dict: pre-generated z for perturbation (ZO2 mode, different seed).
+                        If None and zo2_mode, falls back to z_dict for perturbation.
+        default_zo_eps: fallback zo_eps
+        simulate_perturbation: whether to simulate [+1, -2, +1] perturbation
+        zo2_mode: ZO2 replay order
+        adam_state: If not None, use Adam update rule instead of SGD. Dict with keys:
+            m (dict), v (dict), t (int), betas (tuple), adam_eps (float).
+            Modified in-place (m/v/t updated). None = SGD (original path, unchanged).
+    """
+    grad = update['grad']
+    lr = update['lr']
+    wd = update.get('wd', 0.0)
+    zo_eps = update.get('zo_eps', default_zo_eps)
+
+    # Determine which z to use for perturbation
+    z_for_perturb = z_perturb_dict if z_perturb_dict is not None else z_dict
+
+    if adam_state is not None:
+        # ====== Adam path (regular ZO order only, no ZO2) ======
+        # 1) Perturbation simulation [+1, -2, +1]
+        if simulate_perturbation and zo_eps > 0:
+            for scaling_factor in [1, -2, 1]:
+                for name in param_names:
+                    param = state[name]
+                    z = z_dict[name]
+                    param.data.add_(scaling_factor * z * zo_eps)
+
+        # 2) Adam update (always runs — even for grad=0, m/v decay and t increments,
+        #    matching training where zo_update is called unconditionally)
+        beta1, beta2 = adam_state['betas']
+        a_eps = adam_state['adam_eps']
+        adam_state['t'] += 1
+        t = adam_state['t']
+        bc1, bc2 = 1 - beta1 ** t, 1 - beta2 ** t
+        step_size = lr / bc1
+
+        for name in param_names:
+            param = state[name]
+            z = z_dict[name]
+            g = (grad * z).float()  # fp32 to prevent underflow
+
+            m, v = adam_state['m'], adam_state['v']
+            if name not in m:
+                m[name] = torch.zeros_like(param, dtype=torch.float32)
+                v[name] = torch.zeros_like(param, dtype=torch.float32)
+
+            m[name].mul_(beta1).add_(g, alpha=1 - beta1)
+            v[name].mul_(beta2).addcmul_(g, g, value=1 - beta2)
+
+            denom = (v[name] / bc2).sqrt_().add_(a_eps)
+            upd = m[name].div(denom).mul_(step_size)
+
+            # AdamW weight decay (skip bias/layernorm)
+            if all(x not in name for x in ['bias', 'layer_norm', 'layernorm', 'ln']):
+                upd.add_(param.float(), alpha=lr * wd)
+            param.sub_(upd.to(param.dtype))
+        return
+
+    if zo2_mode and grad != 0:
+        # ZO2 order: gradient FIRST (using prev step's z), then perturbation (current z)
+        for name in param_names:
+            param = state[name]
+            z = z_dict[name]
+            if _is_wd_param(name):
+                param.sub_(lr * (grad * z + wd * param))
+            else:
+                param.sub_(lr * grad * z)
+
+        if simulate_perturbation and zo_eps > 0:
+            for scaling_factor in [1, -2, 1]:
+                for name in param_names:
+                    param = state[name]
+                    z = z_for_perturb[name]
+                    param.data.add_(scaling_factor * z * zo_eps)
+    else:
+        # Regular ZO order: perturbation first, then gradient
+        if simulate_perturbation and zo_eps > 0:
+            for scaling_factor in [1, -2, 1]:
+                for name in param_names:
+                    param = state[name]
+                    z = z_dict[name]
+                    param.data.add_(scaling_factor * z * zo_eps)
+
+        if grad != 0:
+            for name in param_names:
+                param = state[name]
+                z = z_dict[name]
+                if _is_wd_param(name):
+                    param.sub_(lr * (grad * z + wd * param))
+                else:
+                    param.sub_(lr * grad * z)
+
+
+def _parallel_replay_updates_on_state(
+    state: OrderedDict,
+    updates: list,
+    device: str = 'cpu',
+    move_to_device: bool = True,
+    trainable_param_names: list = None,
+    default_zo_eps: float = 0.0,
+    simulate_perturbation: bool = True,
+    replay_in_fp32: bool = False,
+    rng_device: str = "native",
+    zo2_mode: bool = False,
+    initial_prev_seed: int = None,
+) -> OrderedDict:
+    """Replay ZO updates with pipelined producer-consumer architecture.
+
+    P producer threads/streams generate z concurrently while 1 consumer
+    applies updates serially via a ring buffer of size P.
+    Result is bitwise-exact with sequential replay.
+
+    CPU mode (threads): when device='cpu' or rng_device in {'cpu', 'zo_rng'}.
+    GPU mode (CUDA streams): when device='cuda' and rng_device='native'.
+
+    Args: same as _replay_updates_on_state
+    """
+    if not updates:
+        return state
+
+    P = 1  # default: 1 producer (no overlap, same as sequential)
+    env_workers = os.environ.get('PARALLEL_RECOVERY_WORKERS', None)
+    if env_workers is not None:
+        P = max(1, int(env_workers))
+
+    logger.info(f"[PipelinedReplay] {len(updates)} updates, P={P}, "
+                f"rng_device={rng_device}, zo2_mode={zo2_mode}, "
+                f"simulate_perturbation={simulate_perturbation}")
+
+    # ---- Device handling (same as sequential) ----
+    actual_device = 'cpu'
+    if move_to_device and device == 'cuda' and torch.cuda.is_available():
+        for key in state:
+            if state[key].device.type != 'cuda':
+                state[key] = state[key].cuda()
+        actual_device = 'cuda'
+    elif len(state) > 0:
+        # Use .type to normalize 'cuda:0' -> 'cuda'
+        actual_device = next(iter(state.values())).device.type
+
+    # ---- fp32 upcast (same as sequential) ----
+    original_dtype = None
+    replay_dtype = None
+    if replay_in_fp32 and actual_device == 'cpu':
+        sample = next(iter(state.values()))
+        if sample.dtype in (torch.float16, torch.bfloat16):
+            original_dtype = sample.dtype
+            replay_dtype = torch.float32
+            for key in state:
+                state[key] = state[key].float()
+            logger.info(f"[PipelinedReplay] Upcast {original_dtype} -> fp32 for CPU replay")
+
+    # ---- CPU/CUDA RNG warning ----
+    if actual_device == 'cpu' and torch.cuda.is_available() and rng_device != "zo_rng":
+        logger.warning("[PipelinedReplay] WARNING: Replaying on CPU but CUDA is available. "
+                       "Use device='cuda' or ZO_RNG_DEVICE=zo_rng for exact reconstruction.")
+
+    param_names = trainable_param_names if trainable_param_names is not None else list(state.keys())
+
+    # ---- Memory warning ----
+    n = len(updates)
+    model_bytes = sum(state[nm].numel() * state[nm].element_size() for nm in param_names)
+    z_sets_per_step = 2 if zo2_mode else 1
+    buffer_bytes = model_bytes * P * z_sets_per_step
+    available_bytes = psutil.virtual_memory().available
+    if buffer_bytes > available_bytes * 0.5:
+        logger.warning(f"[PipelinedReplay] Ring buffer ~{buffer_bytes / 1e9:.1f} GB "
+                       f"but only {available_bytes / 1e9:.1f} GB available. "
+                       f"Consider reducing PARALLEL_RECOVERY_WORKERS.")
+
+    # ---- Pre-compute seeds_info ----
+    seeds_info = []
+    for i, update in enumerate(updates):
+        if zo2_mode:
+            if i == 0:
+                prev_seed = initial_prev_seed if initial_prev_seed is not None else update['seed']
+            else:
+                prev_seed = updates[i - 1]['seed']
+            seeds_info.append((prev_seed, update['seed']))
+        else:
+            seeds_info.append((update['seed'], update['seed']))
+
+    # ---- Dispatch to CPU or GPU pipeline ----
+    t_start = time.time()
+    _pip_proc = psutil.Process(os.getpid())
+    _pip_cpu0, _pip_gpu0 = _log_memory("pipelined start", _pip_proc, actual_device)
+
+    use_gpu_pipeline = (actual_device == 'cuda' and rng_device == 'native')
+    if use_gpu_pipeline:
+        logger.info(f"[PipelinedReplay] Using GPU mode (CUDA streams)")
+        _pipelined_replay_gpu(
+            state, updates, param_names, rng_device,
+            num_producers=P, default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            zo2_mode=zo2_mode, seeds_info=seeds_info,
+            replay_dtype=replay_dtype,
+        )
+    else:
+        logger.info(f"[PipelinedReplay] Using CPU mode (threads)")
+        _pipelined_replay_cpu(
+            state, updates, param_names, rng_device,
+            num_producers=P, default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            zo2_mode=zo2_mode, seeds_info=seeds_info,
+            replay_dtype=replay_dtype,
+        )
+
+    _log_memory("pipelined done", _pip_proc, actual_device, _pip_cpu0, _pip_gpu0)
+
+    # ---- fp32 downcast ----
+    if original_dtype is not None:
+        for key in state:
+            state[key] = state[key].to(original_dtype)
+        logger.info(f"[PipelinedReplay] Downcast fp32 -> {original_dtype}")
+
+    t_elapsed = time.time() - t_start
+    mode_str = "GPU/CUDA-streams" if use_gpu_pipeline else "CPU/threads"
+    logger.info(f"[PipelinedReplay] Completed: {n} updates in {t_elapsed:.3f}s "
+                f"(P={P}, mode={mode_str}, device={actual_device})")
+
+    return state
+
+
+# ============================================================================
+# Memory logging helper
+# ============================================================================
+
+def _log_memory(tag, proc, device_type, baseline_cpu=None, baseline_gpu=None):
+    """Log CPU RSS and GPU memory at a labeled checkpoint.
+
+    Returns (cpu_rss, gpu_alloc_or_None) for use as baseline in later calls.
+    """
+    cpu_rss = proc.memory_info().rss
+    parts = [f"CPU RSS={cpu_rss / 1e9:.2f} GB"]
+    if baseline_cpu is not None:
+        parts.append(f"(delta={(cpu_rss - baseline_cpu) / 1e9:+.2f} GB)")
+    gpu_alloc = None
+    if device_type == 'cuda' and torch.cuda.is_available():
+        gpu_alloc = torch.cuda.memory_allocated()
+        gpu_peak = torch.cuda.max_memory_allocated()
+        parts.append(f"GPU alloc={gpu_alloc / 1e9:.2f} GB")
+        parts.append(f"GPU peak={gpu_peak / 1e9:.2f} GB")
+        if baseline_gpu is not None:
+            parts.append(f"(delta={(gpu_alloc - baseline_gpu) / 1e9:+.2f} GB)")
+    logger.info(f"[Memory] {tag}: {', '.join(parts)}")
+    return cpu_rss, gpu_alloc
+
+
+# ============================================================================
+# Closed-form parallel replay
+# ============================================================================
+
+def _closedform_cpu(state, param_names, terms, rng_device, num_workers,
+                    accum_dtype, replay_dtype):
+    """CPU backend for closed-form replay using threads.
+
+    Workers generate z in parallel, scale in-place, then lock-accumulate
+    into a single shared buffer.  No per-worker partial-sum buffers.
+    Worker k processes terms[k], terms[k+W], terms[k+2W], ...
+
+    Args:
+        state: state dict (read-only for shape/dtype/device info)
+        param_names: ordered param names
+        terms: list of (step_idx, coeff_wd, coeff_nowd, grad_seed)
+        rng_device: RNG mode
+        num_workers: W
+        accum_dtype: dtype for partial sum accumulation
+        replay_dtype: dtype override for z generation (or None)
+
+    Returns:
+        dict mapping param_name -> total sum tensor
+    """
+    W = min(num_workers, len(terms))
+    if W == 0:
+        return {}
+
+    # Single shared accumulation buffer (instead of W separate partials)
+    total_sum = {}
+    for name in param_names:
+        param = state[name]
+        total_sum[name] = torch.zeros(param.shape, dtype=accum_dtype,
+                                      device=param.device)
+
+    lock = threading.Lock()
+    error_holder = [None]
+
+    def worker_fn(worker_id):
+        try:
+            idx = worker_id
+            while idx < len(terms):
+                _step_idx, coeff_wd, coeff_nowd, grad_seed = terms[idx]
+                z_dict = _generate_z_for_one_step(
+                    grad_seed, param_names, state, rng_device, replay_dtype)
+                # Scale z in-place (reuse z buffer as result buffer)
+                for name in param_names:
+                    z = z_dict[name]
+                    c = coeff_wd if _is_wd_param(name) else coeff_nowd
+                    if accum_dtype != z.dtype:
+                        z = z.to(accum_dtype)
+                        z_dict[name] = z
+                    z.mul_(c)
+                # Lock and accumulate into shared buffer
+                with lock:
+                    for name in param_names:
+                        total_sum[name].add_(z_dict[name])
+                del z_dict
+                idx += W
+        except Exception as e:
+            error_holder[0] = e
+
+    threads = []
+    for i in range(W):
+        t = threading.Thread(target=worker_fn, args=(i,), daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join()
+
+    if error_holder[0] is not None:
+        raise error_holder[0]
+
+    return total_sum
+
+
+def _closedform_gpu(state, param_names, terms, rng_device, num_workers,
+                    accum_dtype, replay_dtype):
+    """GPU backend for closed-form replay using CUDA streams.
+
+    Processes terms in batches of W: generate z in W parallel streams,
+    synchronize, then accumulate into a single shared buffer on the
+    default stream.  No per-worker partial-sum buffers.
+
+    Args: same as _closedform_cpu
+    Returns: dict mapping param_name -> total sum tensor
+    """
+    W = min(num_workers, len(terms))
+    if W == 0:
+        return {}
+
+    streams = [torch.cuda.Stream() for _ in range(W)]
+
+    # Single shared accumulation buffer
+    total_sum = {}
+    for name in param_names:
+        param = state[name]
+        total_sum[name] = torch.zeros(param.shape, dtype=accum_dtype,
+                                      device=param.device)
+
+    # Process terms in batches of W
+    for batch_start in range(0, len(terms), W):
+        batch_end = min(batch_start + W, len(terms))
+        batch_size = batch_end - batch_start
+        z_dicts = [None] * batch_size
+
+        # Phase 1: generate z and scale in-place across W parallel streams
+        for i in range(batch_size):
+            _step_idx, coeff_wd, coeff_nowd, grad_seed = terms[batch_start + i]
+            with torch.cuda.stream(streams[i]):
+                z_dicts[i] = _generate_z_for_one_step(
+                    grad_seed, param_names, state, rng_device, replay_dtype)
+                for name in param_names:
+                    z = z_dicts[i][name]
+                    c = coeff_wd if _is_wd_param(name) else coeff_nowd
+                    if accum_dtype != z.dtype:
+                        z = z.to(accum_dtype)
+                        z_dicts[i][name] = z
+                    z.mul_(c)
+
+        # Phase 2: sync, then accumulate on default stream
+        torch.cuda.synchronize()
+        for i in range(batch_size):
+            for name in param_names:
+                total_sum[name].add_(z_dicts[i][name])
+        del z_dicts
+
+    return total_sum
+
+
+def _closedform_replay_on_state(
+    state: OrderedDict,
+    updates: list,
+    device: str = 'cpu',
+    move_to_device: bool = True,
+    trainable_param_names: list = None,
+    rng_device: str = "native",
+    zo2_mode: bool = False,
+    initial_prev_seed: int = None,
+    num_workers: int = 1,
+    precision: str = "mixed",
+) -> OrderedDict:
+    """Closed-form parallel replay of ZO-SGD updates.
+
+    Unrolls the recurrence p_t = (1 - lr_t*wd_t)*p_{t-1} - lr_t*grad_t*z_t
+    into a closed-form sum of independent terms:
+        p_n = sp[0]*p_0 - Σ_{t=0}^{n-1} sp[t+1] * lr_t * grad_t * z_t
+    where sp[i] = Π_{j=i}^{n-1} (1 - lr_j*wd_j) is the suffix product.
+
+    Each term in the sum is independent, so the sum is split across W workers.
+    No perturbation simulation — this implements the pure mathematical model.
+
+    Args:
+        state: state dict to modify (initial parameters p_0)
+        updates: list of update dicts with keys: seed, grad, lr, wd
+        device: 'cpu' or 'cuda'
+        move_to_device: if True and device='cuda', move state to GPU first
+        trainable_param_names: ordered param names (must match training order)
+        rng_device: "native", "cpu", or "zo_rng"
+        zo2_mode: if True, gradient uses prev step's seed
+        initial_prev_seed: seed from base checkpoint for ZO2 mode
+        num_workers: W, number of parallel workers (default 1 = serial closed-form)
+        precision: "fp32" (all fp32), "fp16" (keep original dtype),
+                   "mixed" (accumulate in fp32, keep params in original dtype)
+
+    Returns:
+        Modified state dict with recovered parameters
+    """
+    if not updates:
+        return state
+
+    n = len(updates)
+    W = num_workers
+
+    logger.info(f"[ClosedForm] {n} updates, W={W}, precision={precision}, "
+                f"rng_device={rng_device}, zo2_mode={zo2_mode}")
+
+    # ---- Device handling ----
+    actual_device = 'cpu'
+    if move_to_device and device == 'cuda' and torch.cuda.is_available():
+        for key in state:
+            if state[key].device.type != 'cuda':
+                state[key] = state[key].cuda()
+        actual_device = 'cuda'
+    elif len(state) > 0:
+        actual_device = next(iter(state.values())).device.type
+
+    # ---- Precision setup ----
+    sample = next(iter(state.values()))
+    original_dtype = sample.dtype
+
+    if precision == "fp32":
+        accum_dtype = torch.float32
+        target_dtype = torch.float32
+        replay_dtype = torch.float32
+        # Upcast state to fp32
+        if original_dtype != torch.float32:
+            for key in state:
+                state[key] = state[key].float()
+            logger.info(f"[ClosedForm] Upcast {original_dtype} -> fp32")
+    elif precision == "fp16":
+        accum_dtype = original_dtype
+        target_dtype = original_dtype
+        # On CPU, torch.normal(dtype=fp16) is ~22x slower than fp32.
+        # Generate z in fp32 and cast during accumulation for speed.
+        replay_dtype = torch.float32 if (actual_device == 'cpu' and original_dtype != torch.float32) else None
+    elif precision == "mixed":
+        accum_dtype = torch.float32
+        target_dtype = original_dtype
+        # On CPU, generate z in fp32 directly (avoids slow fp16 torch.normal + later cast)
+        replay_dtype = torch.float32 if (actual_device == 'cpu' and original_dtype != torch.float32) else None
+    else:
+        raise ValueError(f"Unknown precision mode: {precision}")
+
+    # ---- CPU/CUDA RNG warning ----
+    if actual_device == 'cpu' and torch.cuda.is_available() and rng_device != "zo_rng":
+        logger.warning("[ClosedForm] WARNING: Replaying on CPU but CUDA is available. "
+                       "Use device='cuda' or ZO_RNG_DEVICE=zo_rng for exact reconstruction.")
+
+    param_names = trainable_param_names if trainable_param_names is not None else list(state.keys())
+
+    # ---- Memory warning ----
+    total_numel = sum(state[nm].numel() for nm in param_names)
+    accum_elem_size = torch.tensor([], dtype=accum_dtype).element_size()
+    replay_es = torch.tensor([], dtype=replay_dtype if replay_dtype is not None else original_dtype).element_size()
+    accum_bytes = total_numel * accum_elem_size          # 1 shared buffer
+    z_bytes = total_numel * replay_es * W                # W concurrent z buffers
+    total_buffer = accum_bytes + z_bytes
+    available_bytes = psutil.virtual_memory().available
+    if total_buffer > available_bytes * 0.5:
+        logger.warning(f"[ClosedForm] Worker buffers ~{total_buffer / 1e9:.1f} GB "
+                       f"but only {available_bytes / 1e9:.1f} GB available.")
+
+    # ---- Precompute suffix product sp[i] = Π_{j=i}^{n-1} (1 - lr_j * wd_j) ----
+    has_any_wd = any(u.get('wd', 0.0) != 0 for u in updates)
+    sp = [1.0] * (n + 1)
+    if has_any_wd:
+        for i in range(n - 1, -1, -1):
+            sp[i] = sp[i + 1] * (1.0 - updates[i]['lr'] * updates[i].get('wd', 0.0))
+
+    sp_0 = sp[0]
+
+    # ---- Precompute seeds_info (same as pipelined) ----
+    seeds_info = []
+    for i, update in enumerate(updates):
+        if zo2_mode:
+            if i == 0:
+                prev_seed = initial_prev_seed if initial_prev_seed is not None else update['seed']
+            else:
+                prev_seed = updates[i - 1]['seed']
+            seeds_info.append((prev_seed, update['seed']))
+        else:
+            seeds_info.append((update['seed'], update['seed']))
+
+    # ---- Build term list, filter grad=0 ----
+    terms = []
+    for t in range(n):
+        grad = updates[t]['grad']
+        if grad == 0:
+            continue
+        lr = updates[t]['lr']
+        coeff_wd = sp[t + 1] * lr * grad
+        coeff_nowd = lr * grad
+        terms.append((t, coeff_wd, coeff_nowd, seeds_info[t][0]))
+
+    logger.info(f"[ClosedForm] {len(terms)} non-zero terms out of {n} updates"
+                f" (sp[0]={sp_0:.10f})")
+
+    # ---- Dispatch to backend ----
+    t_start = time.time()
+    _cf_proc = psutil.Process(os.getpid())
+    _cf_cpu0, _cf_gpu0 = _log_memory("closedform start", _cf_proc, actual_device)
+
+    use_gpu = (actual_device == 'cuda' and rng_device == 'native')
+    if len(terms) == 0:
+        total_sum = {}
+    elif use_gpu:
+        logger.info(f"[ClosedForm] Using GPU mode (CUDA streams)")
+        total_sum = _closedform_gpu(
+            state, param_names, terms, rng_device, W, accum_dtype, replay_dtype)
+    else:
+        logger.info(f"[ClosedForm] Using CPU mode (threads)")
+        total_sum = _closedform_cpu(
+            state, param_names, terms, rng_device, W, accum_dtype, replay_dtype)
+
+    _log_memory("closedform after accumulation", _cf_proc, actual_device, _cf_cpu0, _cf_gpu0)
+
+    # If no terms, fill zeros
+    if not total_sum:
+        total_sum = {name: torch.zeros(state[name].shape, dtype=accum_dtype,
+                                       device=state[name].device)
+                     for name in param_names}
+
+    # ---- Finalize: p_n = sp[0] * p_0 - total_sum ----
+    for name in param_names:
+        p0 = state[name]
+        ts = total_sum[name]
+        if _is_wd_param(name) and has_any_wd:
+            result = sp_0 * p0.to(accum_dtype) - ts
+        else:
+            result = p0.to(accum_dtype) - ts
+        state[name] = result.to(target_dtype)
+
+    t_elapsed = time.time() - t_start
+    mode_str = "GPU/CUDA-streams" if use_gpu else "CPU/threads"
+    logger.info(f"[ClosedForm] Completed: {n} updates in {t_elapsed:.3f}s "
+                f"(W={W}, precision={precision}, mode={mode_str}, device={actual_device})")
+    _log_memory("closedform done", _cf_proc, actual_device, _cf_cpu0, _cf_gpu0)
+
+    return state
+
+
+def validate_closedform_replay(
+    state: OrderedDict,
+    updates: list,
+    trainable_param_names: list = None,
+    rng_device: str = "native",
+    zo2_mode: bool = False,
+    initial_prev_seed: int = None,
+    num_workers: int = 1,
+    device: str = 'cpu',
+) -> dict:
+    """Validate closed-form replay against serial replay.
+
+    Runs serial replay (simulate_perturbation=False) as ground truth, then
+    runs closed-form replay in all 3 precision modes (fp32, mixed, fp16).
+    Reports max absolute error and relative error per parameter per mode.
+
+    Args:
+        state: initial state dict (will be cloned, not modified)
+        updates: list of update dicts
+        trainable_param_names: ordered param names
+        rng_device: RNG mode
+        zo2_mode: ZO2 mode flag
+        initial_prev_seed: for ZO2 mode
+        num_workers: W for closed-form
+        device: computation device
+
+    Returns:
+        dict with structure:
+        {
+            "fp32": {"param_name": {"max_abs": float, "rel": float}, ...},
+            "mixed": {...},
+            "fp16": {...},
+        }
+    """
+    def _clone(s):
+        return OrderedDict((k, v.clone()) for k, v in s.items())
+
+    param_names = trainable_param_names if trainable_param_names is not None else list(state.keys())
+
+    # Ground truth: serial replay without perturbation
+    state_serial = _clone(state)
+    _replay_updates_on_state(
+        state_serial, updates, device=device, move_to_device=True,
+        trainable_param_names=param_names,
+        simulate_perturbation=False,
+        rng_device=rng_device, zo2_mode=zo2_mode,
+        initial_prev_seed=initial_prev_seed,
+    )
+
+    results = {}
+    for prec in ["fp32", "mixed", "fp16"]:
+        state_cf = _clone(state)
+        _closedform_replay_on_state(
+            state_cf, updates, device=device, move_to_device=True,
+            trainable_param_names=param_names,
+            rng_device=rng_device, zo2_mode=zo2_mode,
+            initial_prev_seed=initial_prev_seed,
+            num_workers=num_workers,
+            precision=prec,
+        )
+
+        prec_results = {}
+        for name in param_names:
+            serial_p = state_serial[name].float()
+            cf_p = state_cf[name].float()
+            diff = (serial_p - cf_p).abs()
+            max_abs = diff.max().item()
+            denom = serial_p.abs().max().item()
+            rel = max_abs / max(denom, 1e-10)
+            prec_results[name] = {"max_abs": max_abs, "rel": rel}
+
+        results[prec] = prec_results
+
+    # Log summary
+    logger.info(f"[ClosedForm Validation] {len(updates)} updates, W={num_workers}")
+    for prec in ["fp32", "mixed", "fp16"]:
+        max_abs_all = max(v["max_abs"] for v in results[prec].values())
+        max_rel_all = max(v["rel"] for v in results[prec].values())
+        logger.info(f"  {prec:6s}: max_abs={max_abs_all:.2e}, max_rel={max_rel_all:.2e}")
+
+    return results
+
+
+def calibrate_parallel_recovery(state, param_names, rng_device="native",
+                                n_warmup=3, n_measure=5, zo_eps=1e-3,
+                                zo2_mode=False):
+    """Measure t_generate and t_update, recommend optimal P for pipelined replay.
+
+    Runs a few warmup + measurement iterations of z generation and parameter
+    update to determine the optimal number of producers P.
+
+    Args:
+        state: state dict (will be modified in-place during measurement, clone first!)
+        param_names: ordered list of trainable param names
+        rng_device: "native", "cpu", or "zo_rng"
+        n_warmup: warmup iterations (discarded)
+        n_measure: measurement iterations
+        zo_eps: perturbation epsilon for update measurement
+        zo2_mode: if True, measure with 2 z-sets per step
+
+    Returns:
+        dict with keys: t_gen, t_update, recommended_P
+    """
+    is_cuda = next(iter(state.values())).device.type == 'cuda'
+
+    # --- Measure t_gen (z generation) ---
+    times_gen = []
+    for i in range(n_warmup + n_measure):
+        seed = 1000000 + i
+        if is_cuda:
+            torch.cuda.synchronize()
+        t0 = time.time()
+        z = _generate_z_for_one_step(seed, param_names, state, rng_device)
+        if zo2_mode:
+            _generate_z_for_one_step(seed + 1, param_names, state, rng_device)
+        if is_cuda:
+            torch.cuda.synchronize()
+        t1 = time.time()
+        if i >= n_warmup:
+            times_gen.append(t1 - t0)
+        del z
+
+    # --- Measure t_update (parameter update with pre-generated z) ---
+    dummy_update = {'seed': 42, 'grad': 1e-4, 'lr': 1e-5, 'wd': 0.01, 'zo_eps': zo_eps}
+    times_update = []
+    for i in range(n_warmup + n_measure):
+        z = _generate_z_for_one_step(42, param_names, state, rng_device)
+        z_perturb = None
+        if zo2_mode:
+            z_perturb = _generate_z_for_one_step(43, param_names, state, rng_device)
+        if is_cuda:
+            torch.cuda.synchronize()
+        t0 = time.time()
+        _apply_single_update_with_pregenerated_z(
+            state, dummy_update, param_names, z,
+            z_perturb_dict=z_perturb,
+            default_zo_eps=zo_eps,
+            simulate_perturbation=True,
+            zo2_mode=zo2_mode,
+        )
+        if is_cuda:
+            torch.cuda.synchronize()
+        t1 = time.time()
+        if i >= n_warmup:
+            times_update.append(t1 - t0)
+        del z
+
+    t_gen = sum(times_gen) / len(times_gen)
+    t_update = sum(times_update) / len(times_update)
+    recommended_P = max(1, math.ceil(t_gen / t_update))
+
+    logger.info(f"[Calibrate] t_gen={t_gen*1000:.1f}ms, t_update={t_update*1000:.1f}ms, "
+                f"recommended P={recommended_P}")
+
+    return {'t_gen': t_gen, 't_update': t_update, 'recommended_P': recommended_P}
+
+
+def calibrate_shadow_pipeline(state, param_names, rng_device="zo_rng",
+                              n_warmup=3, n_measure=5, zo_eps=1e-3,
+                              adam_state=None, t_train=None):
+    """Measure t_gen and t_update for shadow pipeline, recommend optimal P and buffer_size.
+
+    Measurements are taken at reduced thread count (n_cores // (P+1)) to reflect
+    actual pipeline conditions where producer and consumer share CPU cores.
+
+    Args:
+        state: state dict on CPU (will be modified in-place, clone first!)
+        param_names: ordered list of trainable param names
+        rng_device: "native", "cpu", or "zo_rng" (default "zo_rng" for shadow)
+        n_warmup: warmup iterations (discarded)
+        n_measure: measurement iterations
+        zo_eps: perturbation epsilon for update measurement
+        adam_state: If not None, measure Adam update path instead of SGD.
+            Dict with keys: m (dict), v (dict), t (int), betas (tuple), adam_eps (float).
+        t_train: GPU training step time in seconds. Used to compute buffer_size
+            via B = ceil(t_update / max(t_gen, t_train)). If None, defaults to P+1.
+
+    Returns:
+        dict with keys: t_gen, t_update, recommended_P, buffer_size,
+                        threads_per_op, t_pipeline_step,
+                        per_slot_bytes, total_bytes_at_P
+    """
+    # Ensure state is on CPU
+    for k in state:
+        if state[k].device.type != 'cpu':
+            state[k] = state[k].cpu()
+
+    n_cores = os.cpu_count() or 64
+    original_threads = torch.get_num_threads()
+
+    def _measure(n_threads):
+        """Measure t_gen and t_update at given thread count."""
+        torch.set_num_threads(n_threads)
+
+        times_gen = []
+        for i in range(n_warmup + n_measure):
+            seed = 1000000 + i
+            t0 = time.time()
+            z = _generate_z_for_one_step(seed, param_names, state, rng_device)
+            t1 = time.time()
+            if i >= n_warmup:
+                times_gen.append(t1 - t0)
+            del z
+
+        dummy_update = {'seed': 42, 'grad': 1e-4, 'lr': 1e-5, 'wd': 0.01, 'zo_eps': zo_eps}
+        times_update = []
+        for i in range(n_warmup + n_measure):
+            z = _generate_z_for_one_step(42, param_names, state, rng_device)
+            t0 = time.time()
+            _apply_single_update_with_pregenerated_z(
+                state, dummy_update, param_names, z,
+                default_zo_eps=zo_eps,
+                simulate_perturbation=True,
+                zo2_mode=False,
+                adam_state=adam_state,
+            )
+            t1 = time.time()
+            if i >= n_warmup:
+                times_update.append(t1 - t0)
+            del z
+
+        tg = sum(times_gen) / len(times_gen)
+        tu = sum(times_update) / len(times_update)
+        return tg, tu
+
+    # Phase 1: measure at n_cores//2 (assumes P=1)
+    threads_p1 = max(1, n_cores // 2)
+    t_gen, t_update = _measure(threads_p1)
+    recommended_P = max(1, math.ceil(t_gen / t_update))
+    logger.info(f"[CalibrateShadow] Phase 1 @ {threads_p1} threads: "
+                f"t_gen={t_gen*1000:.1f}ms, t_update={t_update*1000:.1f}ms → P={recommended_P}")
+
+    # Phase 2: if P>1, re-measure at correct thread count
+    if recommended_P > 1:
+        threads_p2 = max(1, n_cores // (recommended_P + 1))
+        t_gen, t_update = _measure(threads_p2)
+        recommended_P = max(1, math.ceil(t_gen / t_update))
+        logger.info(f"[CalibrateShadow] Phase 2 @ {threads_p2} threads: "
+                    f"t_gen={t_gen*1000:.1f}ms, t_update={t_update*1000:.1f}ms → P={recommended_P}")
+
+    # Restore threads
+    torch.set_num_threads(original_threads)
+
+    threads_per_op = max(1, n_cores // (recommended_P + 1))
+
+    # Buffer size: B = ceil(t_update / max(t_gen, t_train))
+    if t_train is not None:
+        effective_producer_cycle = max(t_gen, t_train)
+        buffer_size = max(recommended_P + 1, math.ceil(t_update / effective_producer_cycle))
+    else:
+        buffer_size = recommended_P + 1
+
+    t_pipeline_step = max(t_gen, t_update)
+
+    # Memory analysis
+    per_slot_bytes = sum(state[nm].numel() * state[nm].element_size()
+                         for nm in param_names)
+    shadow_base_bytes = per_slot_bytes
+    adam_extra_bytes = sum(state[nm].numel() * 4 * 2 for nm in param_names) if adam_state is not None else 0
+    total_at_P = shadow_base_bytes + buffer_size * per_slot_bytes + adam_extra_bytes
+
+    logger.info(f"[CalibrateShadow] threads_per_op={threads_per_op}, "
+                f"t_gen={t_gen*1000:.1f}ms, t_update={t_update*1000:.1f}ms")
+    logger.info(f"[CalibrateShadow] P={recommended_P}, buffer_size={buffer_size}"
+                f"{f', t_train={t_train*1000:.1f}ms' if t_train else ''}")
+    logger.info(f"[CalibrateShadow] pipeline: {t_pipeline_step*1000:.1f}ms/step")
+    logger.info(f"[CalibrateShadow] memory: shadow={shadow_base_bytes/1e9:.2f}GB + "
+                f"z_buf={buffer_size}×{per_slot_bytes/1e9:.2f}GB = "
+                f"{(shadow_base_bytes + buffer_size * per_slot_bytes)/1e9:.2f}GB"
+                f"{f' + adam_mv={adam_extra_bytes/1e9:.2f}GB' if adam_extra_bytes else ''}"
+                f" → total={total_at_P/1e9:.2f}GB")
+
+    return {
+        't_gen': t_gen,
+        't_update': t_update,
+        'recommended_P': recommended_P,
+        'buffer_size': buffer_size,
+        'threads_per_op': threads_per_op,
+        't_pipeline_step': t_pipeline_step,
+        'per_slot_bytes': per_slot_bytes,
+        'adam_extra_bytes': adam_extra_bytes,
+        'total_bytes_at_P': total_at_P,
+    }
+
+
+# ============================================================
+# Adam replay helpers: module-level cache for passing adam state
+# between resume_from_batch_diff() and _init_for_resume()
+# ============================================================
+_replay_adam_state_cache = {}
+
+
+def _set_replay_adam_state(adam_state):
+    global _replay_adam_state_cache
+    _replay_adam_state_cache = adam_state or {}
+
+
+def _get_and_clear_replay_adam_state():
+    global _replay_adam_state_cache
+    result = _replay_adam_state_cache
+    _replay_adam_state_cache = {}
+    return result if result else None
+
+
+def _load_adam_state_from_base(base_checkpoint_ref, fallback_optimizer_state=None):
+    """Load Adam state from base checkpoint. Returns fresh m/v/t=0 for __initial__."""
+    if base_checkpoint_ref == '__initial__':
+        betas = fallback_optimizer_state.get('adam_betas', (0.9, 0.999)) if fallback_optimizer_state else (0.9, 0.999)
+        adam_eps = fallback_optimizer_state.get('adam_eps_value', 1e-8) if fallback_optimizer_state else 1e-8
+        return {'m': {}, 'v': {}, 't': 0, 'betas': betas, 'adam_eps': adam_eps}
+
+    opt_path = os.path.join(base_checkpoint_ref, "optimizer.pt")
+    if os.path.exists(opt_path):
+        opt = torch.load(opt_path, map_location='cpu', weights_only=False)
+        adam_state = opt.get('adam_state', None)
+        if adam_state:
+            return adam_state
+
+    # Fallback: no adam_state in base checkpoint (shouldn't happen in practice)
+    betas = fallback_optimizer_state.get('adam_betas', (0.9, 0.999)) if fallback_optimizer_state else (0.9, 0.999)
+    adam_eps = fallback_optimizer_state.get('adam_eps_value', 1e-8) if fallback_optimizer_state else 1e-8
+    logger.warning(f"[Adam Replay] No adam_state found in base {base_checkpoint_ref}, starting from t=0")
+    return {'m': {}, 'v': {}, 't': 0, 'betas': betas, 'adam_eps': adam_eps}
+
+
 def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                          simulate_perturbation=True, rng_device="native",
-                         zo2_mode=False, prev_seed=None):
+                         zo2_mode=False, prev_seed=None,
+                         adam_state=None):
     """Apply one ZO update (perturbation + parameter update) to a state dict in-place.
 
     Simulates the full perturbation sequence [+1, -2, +1] * eps * z from zo_forward
@@ -887,6 +2807,9 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
             delayed update from step N is applied before step N+1's perturbation.
         prev_seed: Seed from the previous update entry. In ZO2 mode, the gradient update
             uses z generated from the previous step's seed (via last_rstate).
+        adam_state: If not None, use Adam update rule instead of SGD. Dict with keys:
+            m (dict), v (dict), t (int), betas (tuple), adam_eps (float).
+            Modified in-place (m/v/t updated). None = SGD (original path, unchanged).
     """
     seed = update['seed']
     grad = update['grad']
@@ -903,6 +2826,62 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
         torch.manual_seed(s)
         return None
 
+    t_start = time.time()
+    t_z = 0.0
+    t_update = 0.0
+
+    if adam_state is not None:
+        # ====== Adam path (regular ZO order only, no ZO2) ======
+        # 1) Perturbation simulation [+1, -2, +1]
+        if simulate_perturbation and zo_eps > 0:
+            for scaling_factor in [1, -2, 1]:
+                zo_gen = _reset_rng()
+                for name in param_names:
+                    param = state[name]
+                    _t0 = time.time()
+                    z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    t_z += time.time() - _t0
+                    _t0 = time.time()
+                    param.data.add_(scaling_factor * z * zo_eps)
+                    t_update += time.time() - _t0
+
+        # 2) Adam update (always runs — even for grad=0, m/v decay and t increments,
+        #    matching training where zo_update is called unconditionally)
+        beta1, beta2 = adam_state['betas']
+        a_eps = adam_state['adam_eps']
+        adam_state['t'] += 1
+        t = adam_state['t']
+        bc1, bc2 = 1 - beta1 ** t, 1 - beta2 ** t
+        step_size = lr / bc1
+
+        zo_gen = _reset_rng()
+        for name in param_names:
+            param = state[name]
+            _t0 = time.time()
+            z = _generate_z_for_replay(param, rng_device, zo_gen)
+            t_z += time.time() - _t0
+            _t0 = time.time()
+            g = (grad * z).float()  # fp32 to prevent underflow
+
+            m, v = adam_state['m'], adam_state['v']
+            if name not in m:
+                m[name] = torch.zeros_like(param, dtype=torch.float32)
+                v[name] = torch.zeros_like(param, dtype=torch.float32)
+
+            m[name].mul_(beta1).add_(g, alpha=1 - beta1)
+            v[name].mul_(beta2).addcmul_(g, g, value=1 - beta2)
+
+            denom = (v[name] / bc2).sqrt_().add_(a_eps)
+            upd = m[name].div(denom).mul_(step_size)
+
+            # AdamW weight decay (skip bias/layernorm)
+            if all(x not in name for x in ['bias', 'layer_norm', 'layernorm', 'ln']):
+                upd.add_(param.float(), alpha=lr * wd)
+            param.sub_(upd.to(param.dtype))
+            t_update += time.time() - _t0
+
+        return {'total': time.time() - t_start, 'z_gen': t_z, 'update': t_update}
+
     if zo2_mode and grad != 0:
         # ZO2 order: gradient FIRST (using prev step's seed), then perturbation.
         # In ZO2 training, module_dual_forward does:
@@ -912,19 +2891,27 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
         zo_gen = _reset_rng(grad_seed)
         for name in param_names:
             param = state[name]
+            _t0 = time.time()
             z = _generate_z_for_replay(param, rng_device, zo_gen)
+            t_z += time.time() - _t0
+            _t0 = time.time()
             if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
                 param.sub_(lr * (grad * z + wd * param))
             else:
                 param.sub_(lr * grad * z)
+            t_update += time.time() - _t0
 
         if simulate_perturbation and zo_eps > 0:
             for scaling_factor in [1, -2, 1]:
                 zo_gen = _reset_rng(seed)
                 for name in param_names:
                     param = state[name]
+                    _t0 = time.time()
                     z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    t_z += time.time() - _t0
+                    _t0 = time.time()
                     param.data.add_(scaling_factor * z * zo_eps)
+                    t_update += time.time() - _t0
     else:
         # Regular ZO order (or grad=0 perturbation-only): perturbation first, then gradient.
         if simulate_perturbation and zo_eps > 0:
@@ -932,18 +2919,28 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                 zo_gen = _reset_rng()
                 for name in param_names:
                     param = state[name]
+                    _t0 = time.time()
                     z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    t_z += time.time() - _t0
+                    _t0 = time.time()
                     param.data.add_(scaling_factor * z * zo_eps)
+                    t_update += time.time() - _t0
 
         if grad != 0:
             zo_gen = _reset_rng()
             for name in param_names:
                 param = state[name]
+                _t0 = time.time()
                 z = _generate_z_for_replay(param, rng_device, zo_gen)
+                t_z += time.time() - _t0
+                _t0 = time.time()
                 if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
                     param.sub_(lr * (grad * z + wd * param))
                 else:
                     param.sub_(lr * grad * z)
+                t_update += time.time() - _t0
+
+    return {'total': time.time() - t_start, 'z_gen': t_z, 'update': t_update}
 
 
 def _replay_updates_on_state(
@@ -958,6 +2955,7 @@ def _replay_updates_on_state(
     rng_device: str = "native",
     zo2_mode: bool = False,
     initial_prev_seed: int = None,
+    adam_state: dict = None,
 ) -> OrderedDict:
     """
     Replay ZO updates on a state dict.
@@ -990,6 +2988,34 @@ def _replay_updates_on_state(
     Returns:
         The modified state dict (stays on the device where computation was done)
     """
+    # ---- Parallel / Closed-form dispatch (SGD only, not Adam) ----
+    if adam_state is not None:
+        if os.environ.get('PARALLEL_RECOVERY') == '1' or os.environ.get('CLOSEDFORM_RECOVERY') == '1':
+            logger.warning("[Replay] Adam mode only supports serial replay, ignoring PARALLEL/CLOSEDFORM")
+    else:
+        if os.environ.get('PARALLEL_RECOVERY', '0') == '1':
+            return _parallel_replay_updates_on_state(
+                state, updates, device=device, move_to_device=move_to_device,
+                trainable_param_names=trainable_param_names,
+                default_zo_eps=default_zo_eps,
+                simulate_perturbation=simulate_perturbation,
+                replay_in_fp32=replay_in_fp32,
+                rng_device=rng_device,
+                zo2_mode=zo2_mode,
+                initial_prev_seed=initial_prev_seed,
+            )
+
+        if os.environ.get('CLOSEDFORM_RECOVERY', '0') == '1':
+            return _closedform_replay_on_state(
+                state, updates, device=device, move_to_device=move_to_device,
+                trainable_param_names=trainable_param_names,
+                rng_device=rng_device,
+                zo2_mode=zo2_mode,
+                initial_prev_seed=initial_prev_seed,
+                num_workers=int(os.environ.get('CLOSEDFORM_WORKERS', '1')),
+                precision=os.environ.get('CLOSEDFORM_PRECISION', 'mixed'),
+            )
+
     if not updates:
         return state
 
@@ -1001,7 +3027,16 @@ def _replay_updates_on_state(
                 state[key] = state[key].cuda()
         actual_device = 'cuda'
     elif len(state) > 0:
-        actual_device = str(next(iter(state.values())).device)
+        # Use .type to normalize 'cuda:0' -> 'cuda'
+        actual_device = next(iter(state.values())).device.type
+
+    # Move Adam m/v to replay device (loaded from CPU via _load_adam_state_from_base)
+    if adam_state is not None:
+        for mv_key in ('m', 'v'):
+            for name in adam_state.get(mv_key, {}):
+                t_mv = adam_state[mv_key][name]
+                if t_mv.device.type != actual_device:
+                    adam_state[mv_key][name] = t_mv.to(actual_device)
 
     # Upcast fp16 → fp32 on CPU to avoid slow torch.normal(dtype=fp16) on CPU
     original_dtype = None
@@ -1026,18 +3061,38 @@ def _replay_updates_on_state(
     # otherwise fall back to all state dict keys (backward compatible with old checkpoints)
     param_names = trainable_param_names if trainable_param_names is not None else list(state.keys())
 
+    _seq_proc = psutil.Process(os.getpid())
+    _seq_cpu0, _seq_gpu0 = _log_memory("sequential start", _seq_proc, actual_device)
+    _seq_quarter = max(1, len(updates) // 4)
+
+    timings = []
     for i, update in enumerate(updates):
         prev_seed = (initial_prev_seed if i == 0 else updates[i - 1]['seed']) if zo2_mode else None
-        _apply_single_update(state, update, param_names, default_zo_eps=default_zo_eps,
+        timing = _apply_single_update(state, update, param_names, default_zo_eps=default_zo_eps,
                              simulate_perturbation=simulate_perturbation, rng_device=rng_device,
-                             zo2_mode=zo2_mode, prev_seed=prev_seed)
+                             zo2_mode=zo2_mode, prev_seed=prev_seed,
+                             adam_state=adam_state)
+        timings.append(timing)
+
+        if i > 0 and i % _seq_quarter == 0:
+            _log_memory(f"sequential step {i}/{len(updates)}", _seq_proc, actual_device, _seq_cpu0, _seq_gpu0)
 
         if i < 3 or i == len(updates) - 1:
             logger.info(f"[Replay] update {i}: step={update.get('step','?')}, seed={update['seed']}, "
                         f"grad={update['grad']:.6e}, lr={update['lr']}, wd={update.get('wd', 0.0)}, "
-                        f"zo_eps={update.get('zo_eps', default_zo_eps)}")
+                        f"zo_eps={update.get('zo_eps', default_zo_eps)}, "
+                        f"time={timing['total']:.4f}s (z_gen={timing['z_gen']:.4f}s, update={timing['update']:.4f}s)")
         elif i == 3:
             logger.info(f"[Replay] ... ({len(updates) - 4} more updates) ...")
+
+    if timings:
+        avg_total = sum(t['total'] for t in timings) / len(timings)
+        avg_z = sum(t['z_gen'] for t in timings) / len(timings)
+        avg_upd = sum(t['update'] for t in timings) / len(timings)
+        total_z = sum(t['z_gen'] for t in timings)
+        total_upd = sum(t['update'] for t in timings)
+        logger.info(f"[Replay Timing] avg per step: total={avg_total:.4f}s, z_gen={avg_z:.4f}s, update={avg_upd:.4f}s")
+        logger.info(f"[Replay Timing] total: z_gen={total_z:.3f}s, update={total_upd:.3f}s")
 
     # Downcast fp32 → original dtype
     if original_dtype is not None:
@@ -1274,10 +3329,24 @@ def resume_from_batch_diff(
         )
         base_checkpoint_ref = "__initial__"
 
+    # Detect Adam optimizer
+    zo_method = optimizer_state.get('zo_method', 'mezo-sgd')
+    is_adam = (zo_method == 'mezo-adam')
+    adam_state = None
+
     # For full checkpoints (batch_size >= 1), load model directly — no replay needed
     if is_full_checkpoint:
         logger.info(f"[Resume] Target is a full checkpoint, loading directly")
+        if is_adam:
+            # Full checkpoint: adam state in optimizer.pt, _init_for_resume will restore it
+            _set_replay_adam_state(None)
         return load_batch_diff_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
+
+    # For log checkpoints with Adam: load adam state from base, replay will update it
+    if is_adam:
+        adam_state = _load_adam_state_from_base(base_checkpoint_ref, optimizer_state)
+        logger.info(f"[Resume] Adam mode: loaded base adam state (t={adam_state.get('t', 0)}, "
+                    f"betas={adam_state.get('betas')}, {len(adam_state.get('m', {}))} m/v entries)")
 
     # Load base model (common to all modes)
     if base_state_dict is not None and base_checkpoint_ref == "__initial__":
@@ -1309,6 +3378,12 @@ def resume_from_batch_diff(
     if tied_groups:
         _tie_state_dict_inplace(reconstructed, tied_groups)
 
+    # ---- Memory snapshot: before replay ----
+    _mem_proc = psutil.Process(os.getpid())
+    if device == 'cuda' and torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    _mem_cpu0, _mem_gpu0 = _log_memory("before replay", _mem_proc, device)
+
     t_replay_start = time.time()
     _replay_updates_on_state(reconstructed, updates, device=device,
                              move_to_device=False,
@@ -1318,11 +3393,20 @@ def resume_from_batch_diff(
                              replay_in_fp32=replay_in_fp32,
                              rng_device=rng_device,
                              zo2_mode=zo2_mode,
-                             initial_prev_seed=base_pending_seed)
+                             initial_prev_seed=base_pending_seed,
+                             adam_state=adam_state)
     if device == 'cuda' and torch.cuda.is_available():
         torch.cuda.synchronize()
     t_replay = time.time() - t_replay_start
     logger.info(f"[Resume Replay] {len(updates)} updates replayed in {t_replay:.3f}s (device={device})")
+
+    # Cache replayed Adam state for _init_for_resume to pick up
+    if is_adam and adam_state is not None:
+        _set_replay_adam_state(adam_state)
+        logger.info(f"[Resume] Cached replayed Adam state: t={adam_state.get('t', 0)}")
+
+    # ---- Memory snapshot: after replay ----
+    _log_memory("after replay", _mem_proc, device, _mem_cpu0, _mem_gpu0)
 
     # Verification logging
     if updates:

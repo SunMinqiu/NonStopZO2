@@ -47,7 +47,12 @@ def get_extensions():
             define_macros=[('ZO_RNG_WITH_CUDA', None)],
             extra_compile_args={
                 'cxx': ['-O3', '-fopenmp', '-DZO_RNG_WITH_CUDA', '-ffp-contract=off'] + r123_no_sse,
-                'nvcc': ['-O3', '--fmad=false'] + r123_no_sse,
+                'nvcc': [
+                    '-O3', '--fmad=false',
+                    '-gencode', 'arch=compute_80,code=sm_80',  # Ampere (A100)
+                    '-gencode', 'arch=compute_89,code=sm_89',  # Ada Lovelace (L40S, RTX 4090)
+                    '-gencode', 'arch=compute_90,code=sm_90',  # Hopper (H100)
+                ] + r123_no_sse,
             },
             extra_link_args=['-fopenmp'] + cuda_link_dirs,
         )
