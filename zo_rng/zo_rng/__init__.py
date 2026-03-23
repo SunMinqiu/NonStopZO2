@@ -16,7 +16,48 @@ Usage:
 import torch
 from ._ext import _generate_normal
 
-__all__ = ['Generator', 'randn']
+__all__ = ['Generator', 'randn', 'set_num_threads', 'get_num_threads',
+           'create_pool', 'destroy_pool']
+
+
+def set_num_threads(n: int):
+    """Set zo_rng's dedicated thread pool size (independent of PyTorch OMP)."""
+    try:
+        from zo_rng._ext_impl import set_num_threads as _set
+        _set(n)
+    except ImportError:
+        pass  # no native extension, single-threaded fallback
+
+
+def get_num_threads() -> int:
+    """Get zo_rng's current thread pool size."""
+    try:
+        from zo_rng._ext_impl import get_num_threads as _get
+        return _get()
+    except ImportError:
+        return 1
+
+
+def create_pool(num_threads: int) -> int:
+    """Create an independent thread pool. Returns pool_id (>= 1).
+
+    Each pool has its own set of worker threads, enabling truly parallel
+    z generation from multiple producer threads without mutex contention.
+    """
+    try:
+        from zo_rng._ext_impl import create_pool as _create
+        return _create(num_threads)
+    except ImportError:
+        return 0  # fallback: no native extension, use default
+
+
+def destroy_pool(pool_id: int):
+    """Destroy a thread pool created by create_pool()."""
+    try:
+        from zo_rng._ext_impl import destroy_pool as _destroy
+        _destroy(pool_id)
+    except ImportError:
+        pass
 
 
 class Generator:
@@ -27,9 +68,10 @@ class Generator:
     (seed, counter, shape) on any device.
     """
 
-    def __init__(self, seed: int):
+    def __init__(self, seed: int, pool_id: int = 0):
         self.seed = seed & 0xFFFFFFFFFFFFFFFF  # uint64 range
         self.counter = 0
+        self.pool_id = pool_id
 
     def randn(self, shape, dtype=torch.float32, device='cpu'):
         """Generate normal-distributed tensor.
@@ -47,7 +89,8 @@ class Generator:
         for s in shape:
             n *= s
 
-        result_fp32 = _generate_normal(self.seed, self.counter, n, str(device))
+        result_fp32 = _generate_normal(self.seed, self.counter, n, str(device),
+                                        self.pool_id)
         self.counter += (n + 3) // 4  # each Philox call produces 4 values
 
         result = result_fp32.view(shape)
@@ -65,7 +108,8 @@ class Generator:
         self.counter = d['counter']
 
     def __repr__(self):
-        return f"zo_rng.Generator(seed={self.seed}, counter={self.counter})"
+        pool_str = f", pool_id={self.pool_id}" if self.pool_id != 0 else ""
+        return f"zo_rng.Generator(seed={self.seed}, counter={self.counter}{pool_str})"
 
 
 def randn(seed: int, shape, dtype=torch.float32, device='cpu'):

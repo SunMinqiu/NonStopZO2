@@ -608,6 +608,40 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         self.recovery_done = ctx.Event()
         self.shadow_stop_event = ctx.Event()
 
+        # Pre-set OMP_NUM_THREADS so the spawned child's `import torch` creates
+        # exactly the right number of libgomp threads (spawn inherits parent env).
+        # If SHADOW_NUMA_NODE is set, use that NUMA node's core count instead of
+        # all cores, so libgomp doesn't over-provision threads outside the pinned set.
+        try:
+            shadow_cores = len(os.sched_getaffinity(0))
+        except AttributeError:
+            shadow_cores = os.cpu_count() or 64
+        if use_pipeline and rng_device == "zo_rng":
+            zo_frac = float(os.environ.get('ZO_RNG_THREAD_FRACTION', '0.25'))
+            zo_threads = max(1, int(shadow_cores * zo_frac))
+            aten_threads = shadow_cores - zo_threads
+        else:
+            # Serial mode: both pools alternate, use all cores
+            aten_threads = shadow_cores
+        # Set thread-pool env vars for the spawned child.
+        # OMP_NUM_THREADS = aten_threads (ATen element-wise ops need this).
+        # MKL/BLAS threads = 1: shadow does no matmul/BLAS, so MKL's libiomp5
+        # pool is pure waste — eliminates ~64 rogue threads.
+        # KMP_BLOCKTIME=0: any Intel OMP threads sleep immediately (no spin).
+        _thread_env = {
+            'OMP_NUM_THREADS': str(aten_threads),
+            'OMP_WAIT_POLICY': 'passive',
+            'GOMP_SPINCOUNT': '0',
+            'MKL_NUM_THREADS': '1',
+            'OPENBLAS_NUM_THREADS': '1',
+            'NUMEXPR_NUM_THREADS': '1',
+            'KMP_BLOCKTIME': '0',
+        }
+        _thread_env_keys = list(_thread_env.keys())
+        _old_env = {k: os.environ.get(k) for k in _thread_env_keys}
+        for k, v in _thread_env.items():
+            os.environ[k] = v
+
         self.shadow_process = ctx.Process(
             target=_shadow_process_main,
             args=(self.update_queue, self.base_checkpoint_state, self.shadow_shared,
@@ -620,8 +654,17 @@ class BatchDiffCheckpointCallback(TrainerCallback):
         )
 
         self.shadow_process.start()
+
+        # Restore parent env (training process keeps its own settings)
+        for k in _thread_env_keys:
+            if _old_env[k] is not None:
+                os.environ[k] = _old_env[k]
+            else:
+                os.environ.pop(k, None)
+
         logger.info(f"[BatchDiff] Started shadow process (PID={self.shadow_process.pid}, "
-                    f"pipeline={use_pipeline}, P={P}, rng={rng_device})")
+                    f"pipeline={use_pipeline}, P={P}, rng={rng_device}, "
+                    f"child OMP_NUM_THREADS={aten_threads})")
 
     # Keep legacy thread methods for reference / fallback
     def _start_shadow_thread(self):
@@ -1266,21 +1309,97 @@ def _shadow_process_main(update_queue, base_shared, shadow_shared, shadow_step_v
                         format='%(asctime)s - %(levelname)s - %(message)s')
     _logger = logging.getLogger(__name__ + '.shadow_process')
 
-    # Thread allocation: in pipeline mode, producer (zo_rng or torch.normal)
-    # and consumer (ATen ops) both use the same OpenMP thread pool.  Split
-    # cores evenly: n_cores // (P+1) per operation, so total = n_cores.
-    # (zo_rng also uses #pragma omp parallel, sharing the OpenMP runtime.)
-    n_cores = os.cpu_count() or 64
-    if use_pipeline:
+    # Kill inter-op thread pool — shadow never uses parallel op dispatch.
+    # Must be called before any torch computation in this process.
+    torch.set_num_interop_threads(1)
+
+    # Thread allocation: zo_rng + ATen threads must sum to available cores.
+    try:
+        n_cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n_cores = os.cpu_count() or 64
+
+    if use_pipeline and rng_device == "zo_rng":
+        zo_frac = float(os.environ.get('ZO_RNG_THREAD_FRACTION', '0.25'))
+        zo_threads = max(1, int(n_cores * zo_frac))
+        aten_threads = n_cores - zo_threads        # strict complement
+        import zo_rng as _zo_rng
+        _zo_rng.set_num_threads(zo_threads)
+        torch.set_num_threads(aten_threads)
+        _logger.info(f"[Shadow] threads: zo_rng={zo_threads} + ATen={aten_threads} "
+                     f"= {zo_threads+aten_threads} (phys_cores={n_cores})")
+    elif use_pipeline:
         threads_per_op = max(1, n_cores // (P + 1))
         torch.set_num_threads(threads_per_op)
     else:
-        torch.set_num_threads(n_cores)
+        # Serial mode: z_gen and apply alternate (never simultaneous), so both
+        # pools can safely use ALL available cores.
+        serial_threads = n_cores
+        torch.set_num_threads(serial_threads)
+        if rng_device == "zo_rng":
+            import zo_rng as _zo_rng
+            _zo_rng.set_num_threads(serial_threads)
+        _logger.info(f"[Shadow] serial zo_rng={serial_threads} ATen={serial_threads} "
+                     f"(alternating, n_cores={n_cores})")
 
-    _logger.info(f"[Shadow Process] Started (PID={os.getpid()}, pipeline={use_pipeline}, P={P}, "
-                 f"num_threads={torch.get_num_threads()}, cores={n_cores})")
-    _logger.info(f"[Shadow Process] OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS','unset')}, "
-                 f"OMP_WAIT_POLICY={os.environ.get('OMP_WAIT_POLICY','unset')}")
+    # ---- Probe A: comprehensive boot diagnostic ----
+    try:
+        _os_threads = len(os.listdir(f'/proc/{os.getpid()}/task'))
+    except Exception:
+        _os_threads = -1
+    try:
+        _affinity = sorted(os.sched_getaffinity(0))
+    except Exception:
+        _affinity = []
+    _zo_thr = 0
+    if rng_device == "zo_rng":
+        try:
+            import zo_rng as _zo_mod
+            _zo_thr = _zo_mod.get_num_threads()
+        except Exception:
+            pass
+    _model_bytes = sum(shadow_shared[nm].numel() * shadow_shared[nm].element_size()
+                       for nm in param_names)
+    _interop_thr = torch.get_num_interop_threads()
+    _logger.info(
+        f"[Shadow Boot] pid={os.getpid()}\n"
+        f"  affinity={{{','.join(str(c) for c in _affinity[:5])},...}} ({len(_affinity)} CPUs)\n"
+        f"  aten={torch.get_num_threads()}  zo_rng={_zo_thr}  interop={_interop_thr}  "
+        f"OS_threads={_os_threads}\n"
+        f"  OMP_NUM_THREADS={os.environ.get('OMP_NUM_THREADS','unset')}  "
+        f"OMP_WAIT_POLICY={os.environ.get('OMP_WAIT_POLICY','unset')}\n"
+        f"  model_bytes={_model_bytes/1e9:.2f}GB\n"
+        f"  pipeline={use_pipeline}  P={P}  rng={rng_device}  "
+        f"simulate_perturbation={simulate_perturbation}")
+
+    # ---- Probe B: thread scaling test ----
+    _bench_n = torch.get_num_threads()
+    _bench_half = max(1, _bench_n // 2)
+    _bench_t = torch.randn(1_000_000)  # 4MB
+    _bench_z = torch.randn(1_000_000)
+    # warmup
+    for _ in range(20):
+        _bench_t.add_(_bench_z, alpha=0.001)
+    # measure full threads
+    torch.set_num_threads(_bench_n)
+    _t0 = time.monotonic()
+    for _ in range(100):
+        _bench_t.add_(_bench_z, alpha=0.001)
+    _full_ms = (time.monotonic() - _t0) * 1000
+    # measure half threads
+    torch.set_num_threads(_bench_half)
+    _t0 = time.monotonic()
+    for _ in range(100):
+        _bench_t.add_(_bench_z, alpha=0.001)
+    _half_ms = (time.monotonic() - _t0) * 1000
+    torch.set_num_threads(_bench_n)  # restore
+    _ratio = _half_ms / _full_ms if _full_ms > 0 else 0
+    _verdict = "linear(OK)" if _ratio >= 1.8 else ("marginal" if _ratio >= 1.5 else "BW-saturated")
+    _logger.info(
+        f"[Shadow Scaling] N={_bench_n}: {_full_ms:.1f}ms  "
+        f"N/2={_bench_half}: {_half_ms:.1f}ms  "
+        f"ratio={_ratio:.2f} → {_verdict}")
+    del _bench_t, _bench_z
 
     try:
         # Initialize Adam state locally (not shared — only this process uses it)
@@ -1317,12 +1436,84 @@ def _shadow_process_serial(update_queue, base_shared, shadow_shared, shadow_step
     """Serial shadow: get update from queue, generate z + apply, repeat."""
     _logger.info(f"[Shadow Process] Running in serial mode (params={len(param_names)}, rng={rng_device})")
 
+    # Clone shared-memory tensors → local heap memory for fast computation.
+    # share_memory_() uses /dev/shm (tmpfs, 4KB pages, no THP) → massive TLB misses.
+    # Local heap gets Transparent Huge Pages (2MB) → ~2x faster element-wise ops.
+    # After each step, copy local → shared (for training's recovery reads).
+    _t0_clone = time.time()
+    shadow_local = OrderedDict()
+    for name in param_names:
+        shadow_local[name] = shadow_shared[name].clone()
+    _clone_ms = (time.time() - _t0_clone) * 1000
+    _logger.info(f"[Shadow] Cloned shared→local heap: {_clone_ms:.0f}ms "
+                 f"({sum(t.numel()*t.element_size() for t in shadow_local.values())/1e9:.2f}GB)")
+
+    # ---- Probe F: in-process apply benchmark (matches calibration exactly) ----
+    # Measures _apply_single_update_with_pregenerated_z on local heap tensors.
+    # If this matches calibration's 1478ms → shadow CAN be fast, real steps have overhead.
+    # If this is also ~3000ms → something about the shadow process itself is slow.
+    _bench_update = {'seed': 42, 'grad': 1e-4, 'lr': 1e-5, 'wd': 0.01,
+                     'zo_eps': default_zo_eps}
+    _bench_times = []
+    for _bi in range(5):  # 2 warmup + 3 measure
+        _bz = _generate_z_for_one_step(42, param_names, shadow_local, rng_device)
+        _bt0 = time.time()
+        _apply_single_update_with_pregenerated_z(
+            shadow_local, _bench_update, param_names, _bz,
+            default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            adam_state=None)  # SGD for benchmark
+        _bt1 = time.time()
+        if _bi >= 2:
+            _bench_times.append(_bt1 - _bt0)
+        del _bz
+    # Restore shadow_local from shared (benchmark modified it)
+    for name in param_names:
+        shadow_local[name].copy_(shadow_shared[name])
+    _bench_avg = sum(_bench_times) / len(_bench_times) if _bench_times else 0
+    _logger.info(f"[Shadow Bench] apply={_bench_avg*1000:.0f}ms "
+                 f"(3 runs, aten={torch.get_num_threads()}, local heap, "
+                 f"calib target=1478ms)")
+
+    # ---- Probe F2: try calibration's exact thread config (aten=96, zo_rng=32) ----
+    _saved_aten = torch.get_num_threads()
+    _saved_zo = 0
+    if rng_device == "zo_rng":
+        import zo_rng as _zo_mod2
+        _saved_zo = _zo_mod2.get_num_threads()
+        _zo_mod2.set_num_threads(32)
+    torch.set_num_threads(96)
+    _bench_times2 = []
+    for _bi in range(5):
+        _bz = _generate_z_for_one_step(42, param_names, shadow_local, rng_device)
+        _bt0 = time.time()
+        _apply_single_update_with_pregenerated_z(
+            shadow_local, _bench_update, param_names, _bz,
+            default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            adam_state=None)
+        _bt1 = time.time()
+        if _bi >= 2:
+            _bench_times2.append(_bt1 - _bt0)
+        del _bz
+    for name in param_names:
+        shadow_local[name].copy_(shadow_shared[name])
+    torch.set_num_threads(_saved_aten)
+    if rng_device == "zo_rng" and _saved_zo > 0:
+        _zo_mod2.set_num_threads(_saved_zo)
+    _bench_avg2 = sum(_bench_times2) / len(_bench_times2) if _bench_times2 else 0
+    _logger.info(f"[Shadow Bench2] apply={_bench_avg2*1000:.0f}ms "
+                 f"(3 runs, aten=96 zo_rng=32 — calibration config)")
+
     while True:
         if stop_event.is_set():
             break
 
         # Check recovery request (pause for safe cloning by training process)
         if recovery_req.is_set():
+            # Flush local → shared before signaling ready
+            for key in param_names:
+                shadow_shared[key].copy_(shadow_local[key])
             recovery_ready.set()
             while not recovery_done.is_set():
                 if stop_event.is_set():
@@ -1341,11 +1532,15 @@ def _shadow_process_serial(update_queue, base_shared, shadow_shared, shadow_step
             continue
 
         if isinstance(cmd, dict) and cmd.get('cmd') == 'stop':
+            # Flush local → shared before exit
+            for key in param_names:
+                shadow_shared[key].copy_(shadow_local[key])
             break
         elif isinstance(cmd, dict) and cmd.get('cmd') == 'refresh':
-            # Base was updated via DMA — copy base_shared → shadow_shared
+            # Base was updated via DMA — copy base_shared → local (and shared)
             for key in param_names:
-                if key in shadow_shared and key in base_shared:
+                if key in base_shared:
+                    shadow_local[key].copy_(base_shared[key])
                     shadow_shared[key].copy_(base_shared[key])
             shadow_step_val.value = cmd['new_step']
             if adam_state is not None:
@@ -1355,23 +1550,47 @@ def _shadow_process_serial(update_queue, base_shared, shadow_shared, shadow_step
             _logger.info(f"[Shadow Process] Refreshed from base at step {cmd['new_step']}")
             continue
 
-        # Normal update
+        # Normal update — pre-generate z once, reuse for perturbation + gradient.
         update = cmd
-        t_apply = time.time()
-        _apply_single_update(shadow_shared, update, param_names,
-                             default_zo_eps=default_zo_eps,
-                             rng_device=rng_device,
-                             simulate_perturbation=simulate_perturbation,
-                             adam_state=adam_state)
-        t_elapsed = time.time() - t_apply
-        shadow_step_val.value += 1
+        seed = update['seed']
 
+        _t_start = time.time()
+        z_dict = _generate_z_for_one_step(seed, param_names, shadow_local, rng_device)
+        _t_zgen = time.time() - _t_start
+
+        _t0 = time.time()
+        _apply_single_update_with_pregenerated_z(
+            shadow_local, update, param_names, z_dict,
+            default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            adam_state=adam_state)
+        _t_apply = time.time() - _t0
+
+        # Copy local → shared (so training can read for recovery)
+        _t0_sync = time.time()
+        for key in param_names:
+            shadow_shared[key].copy_(shadow_local[key])
+        _t_sync = time.time() - _t0_sync
+        _t_total = time.time() - _t_start
+
+        del z_dict
+
+        shadow_step_val.value += 1
         step = shadow_step_val.value
-        if step == 1:
-            _logger.info(f"[Shadow Process] First update applied in {t_elapsed:.3f}s, "
-                         f"shadow_step_val={step}")
-        if step % 10 == 0:
-            _logger.info(f"[Shadow Process] Caught up to step {step}")
+
+        # Probe C: per-step timing (first 20, then every 10)
+        if step <= 20 or step % 10 == 0:
+            try:
+                _os_thr = len(os.listdir(f'/proc/{os.getpid()}/task'))
+            except Exception:
+                _os_thr = -1
+            _logger.info(
+                f"[Shadow Serial] step={step} "
+                f"zgen={_t_zgen*1000:.0f}ms "
+                f"apply={_t_apply*1000:.0f}ms "
+                f"sync={_t_sync*1000:.0f}ms "
+                f"total={_t_total*1000:.0f}ms "
+                f"os_thr={_os_thr}")
 
     _logger.info("[Shadow Process] Stopped (serial)")
 
@@ -1443,7 +1662,8 @@ def _shadow_process_pipelined(update_queue, base_shared, shadow_shared, shadow_s
                     step_idx = next_step_to_assign[0]
                     next_step_to_assign[0] += 1
 
-                # Wait for update data
+                # Wait for update data (Probe D: measure wait time)
+                _t0_pwait = time.monotonic()
                 update = None
                 while not producer_stop.is_set():
                     with internal_lock:
@@ -1452,6 +1672,7 @@ def _shadow_process_pipelined(update_queue, base_shared, shadow_shared, shadow_s
                             break
                     update_available_event.wait(timeout=0.05)
                     update_available_event.clear()
+                _pwait_ms = (time.monotonic() - _t0_pwait) * 1000
 
                 if producer_stop.is_set():
                     free[current_slot].set()
@@ -1462,9 +1683,11 @@ def _shadow_process_pipelined(update_queue, base_shared, shadow_shared, shadow_s
                 z = _generate_z_for_one_step(update['seed'], param_names,
                                               shadow_shared, rng_device)
                 t1_zgen = time.monotonic()
+                _pzgen_ms = (t1_zgen - t0_zgen) * 1000
                 producer_timing['t0'] = t0_zgen
                 producer_timing['t1'] = t1_zgen
-                producer_timing['duration_ms'] = (t1_zgen - t0_zgen) * 1000
+                producer_timing['duration_ms'] = _pzgen_ms
+                producer_timing['wait_ms'] = _pwait_ms
 
                 buffer[current_slot] = (step_idx, z, update)
                 ready[current_slot].set()
@@ -1578,8 +1801,11 @@ def _shadow_process_pipelined(update_queue, base_shared, shadow_shared, shadow_s
             break
 
         # Check next slot in round-robin (buffer_size may be > P)
+        # Probe D: measure slot wait time
         slot = next_slot_to_check % buffer_size
+        _t0_slot_wait = time.monotonic()
         if ready[slot].wait(timeout=0.05):
+            _slot_wait_ms = (time.monotonic() - _t0_slot_wait) * 1000
             ready[slot].clear()
 
             if producer_error[0] is not None:
@@ -1621,13 +1847,20 @@ def _shadow_process_pipelined(update_queue, base_shared, shadow_shared, shadow_s
                 if consumer_step <= 50 or consumer_step % 10 == 0:
                     slots_occupied = sum(1 for r in ready if r.is_set())
                     slots_free = sum(1 for f in free if f.is_set())
+                    try:
+                        _os_thr = len(os.listdir(f'/proc/{os.getpid()}/task'))
+                    except Exception:
+                        _os_thr = -1
                     _logger.info(
                         f"[Diag] step={consumer_step} "
                         f"apply={apply_ms:.0f}ms "
                         f"zgen={producer_timing['duration_ms']:.0f}ms "
                         f"overlap={'YES' if overlap else 'no'} "
                         f"threads={torch.get_num_threads()} "
-                        f"buf: ready={slots_occupied} free={slots_free}"
+                        f"buf: ready={slots_occupied} free={slots_free} "
+                        f"p_wait={producer_timing.get('wait_ms',0):.0f}ms "
+                        f"slot_wait={_slot_wait_ms:.0f}ms "
+                        f"os_thr={_os_thr}"
                     )
 
     # Cleanup
@@ -1916,15 +2149,19 @@ def _apply_single_update_with_pregenerated_z(state, update, param_names, z_dict,
     # Determine which z to use for perturbation
     z_for_perturb = z_perturb_dict if z_perturb_dict is not None else z_dict
 
+    # Fused element-wise ops: use alpha= to eliminate temporary tensors.
+    # Bitwise identical for perturbation (sf ∈ {1,-2,1}: integer mul is exact)
+    # and gradient (lr*grad computed in fp64 then cast to fp32 in both paths).
+    _lr_grad = float(lr * grad)  # pre-compute scalar (fp64)
+
     if adam_state is not None:
         # ====== Adam path (regular ZO order only, no ZO2) ======
         # 1) Perturbation simulation [+1, -2, +1]
         if simulate_perturbation and zo_eps > 0:
             for scaling_factor in [1, -2, 1]:
+                _alpha = float(scaling_factor * zo_eps)
                 for name in param_names:
-                    param = state[name]
-                    z = z_dict[name]
-                    param.data.add_(scaling_factor * z * zo_eps)
+                    state[name].data.add_(z_dict[name], alpha=_alpha)
 
         # 2) Adam update (always runs — even for grad=0, m/v decay and t increments,
         #    matching training where zo_update is called unconditionally)
@@ -1959,37 +2196,41 @@ def _apply_single_update_with_pregenerated_z(state, update, param_names, z_dict,
 
     if zo2_mode and grad != 0:
         # ZO2 order: gradient FIRST (using prev step's z), then perturbation (current z)
+        _lr_wd = float(lr * wd)
         for name in param_names:
             param = state[name]
             z = z_dict[name]
             if _is_wd_param(name):
-                param.sub_(lr * (grad * z + wd * param))
+                # param -= lr*(grad*z + wd*param)  →  1 temp instead of 4
+                tmp = z.mul(grad)
+                tmp.add_(param, alpha=wd)
+                param.sub_(tmp, alpha=lr)
             else:
-                param.sub_(lr * grad * z)
+                param.sub_(z, alpha=_lr_grad)
 
         if simulate_perturbation and zo_eps > 0:
             for scaling_factor in [1, -2, 1]:
+                _alpha = float(scaling_factor * zo_eps)
                 for name in param_names:
-                    param = state[name]
-                    z = z_for_perturb[name]
-                    param.data.add_(scaling_factor * z * zo_eps)
+                    state[name].data.add_(z_for_perturb[name], alpha=_alpha)
     else:
         # Regular ZO order: perturbation first, then gradient
         if simulate_perturbation and zo_eps > 0:
             for scaling_factor in [1, -2, 1]:
+                _alpha = float(scaling_factor * zo_eps)
                 for name in param_names:
-                    param = state[name]
-                    z = z_dict[name]
-                    param.data.add_(scaling_factor * z * zo_eps)
+                    state[name].data.add_(z_dict[name], alpha=_alpha)
 
         if grad != 0:
             for name in param_names:
                 param = state[name]
                 z = z_dict[name]
                 if _is_wd_param(name):
-                    param.sub_(lr * (grad * z + wd * param))
+                    tmp = z.mul(grad)
+                    tmp.add_(param, alpha=wd)
+                    param.sub_(tmp, alpha=lr)
                 else:
-                    param.sub_(lr * grad * z)
+                    param.sub_(z, alpha=_lr_grad)
 
 
 def _parallel_replay_updates_on_state(
@@ -2617,131 +2858,379 @@ def calibrate_parallel_recovery(state, param_names, rng_device="native",
     return {'t_gen': t_gen, 't_update': t_update, 'recommended_P': recommended_P}
 
 
-def calibrate_shadow_pipeline(state, param_names, rng_device="zo_rng",
-                              n_warmup=3, n_measure=5, zo_eps=1e-3,
-                              adam_state=None, t_train=None):
-    """Measure t_gen and t_update for shadow pipeline, recommend optimal P and buffer_size.
+# ============================================================
+# Producer-Consumer Thread Allocation Optimization
+# ============================================================
 
-    Measurements are taken at reduced thread count (n_cores // (P+1)) to reflect
-    actual pipeline conditions where producer and consumer share CPU cores.
+
+def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
+                              n_warmup, n_measure, zo_eps, adam_state,
+                              core_points, result_dict):
+    """Measure t_gen(c) and t_update(n) for specified core counts in a spawned child.
+
+    t_gen(c): time to generate z for all params using c zo_rng + c aten threads.
+    t_update(n): time to apply one update (perturbation simulation + gradient + weight decay)
+                 using n aten threads with pre-generated z.
 
     Args:
-        state: state dict on CPU (will be modified in-place, clone first!)
-        param_names: ordered list of trainable param names
-        rng_device: "native", "cpu", or "zo_rng" (default "zo_rng" for shadow)
-        n_warmup: warmup iterations (discarded)
-        n_measure: measurement iterations
-        zo_eps: perturbation epsilon for update measurement
-        adam_state: If not None, measure Adam update path instead of SGD.
-            Dict with keys: m (dict), v (dict), t (int), betas (tuple), adam_eps (float).
-        t_train: GPU training step time in seconds. Used to compute buffer_size
-            via B = ceil(t_update / max(t_gen, t_train)). If None, defaults to P+1.
-
-    Returns:
-        dict with keys: t_gen, t_update, recommended_P, buffer_size,
-                        threads_per_op, t_pipeline_step,
-                        per_slot_bytes, total_bytes_at_P
+        core_points: list of core counts to benchmark (e.g. [1,20,40,...,126]).
     """
-    # Ensure state is on CPU
-    for k in state:
-        if state[k].device.type != 'cpu':
-            state[k] = state[k].cpu()
+    import torch, time, json
+    from collections import OrderedDict
 
-    n_cores = os.cpu_count() or 64
-    original_threads = torch.get_num_threads()
+    torch.set_num_interop_threads(1)
 
-    def _measure(n_threads):
-        """Measure t_gen and t_update at given thread count."""
-        torch.set_num_threads(n_threads)
+    try:
+        n_cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n_cores = os.cpu_count() or 64
 
-        times_gen = []
+    _zo_rng = None
+    if rng_device == "zo_rng":
+        import zo_rng as _zo_rng
+
+    # Clone shared → local heap
+    state = OrderedDict()
+    for name in param_names:
+        state[name] = shared_tensors[name].clone()
+
+    def _median(xs):
+        s = sorted(xs)
+        n = len(s)
+        return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+    C_max = min(C, n_cores)
+    # Filter core_points to valid range [1, C_max)
+    points = sorted(set(c for c in core_points if 1 <= c < C_max))
+    print(f"[BenchCurves] pid={os.getpid()} cores={n_cores} C={C_max} "
+          f"points={len(points)} range=[{points[0]}..{points[-1]}] "
+          f"warmup={n_warmup} measure={n_measure}", flush=True)
+
+    # --- Measure t_gen(c) ---
+    t_gen_curve = {}
+    for idx, c in enumerate(points):
+        torch.set_num_threads(c)
+        if _zo_rng is not None:
+            _zo_rng.set_num_threads(c)
+
+        times = []
         for i in range(n_warmup + n_measure):
             seed = 1000000 + i
-            t0 = time.time()
+            t0 = time.monotonic()
             z = _generate_z_for_one_step(seed, param_names, state, rng_device)
-            t1 = time.time()
+            t1 = time.monotonic()
             if i >= n_warmup:
-                times_gen.append(t1 - t0)
+                times.append(t1 - t0)
             del z
 
-        dummy_update = {'seed': 42, 'grad': 1e-4, 'lr': 1e-5, 'wd': 0.01, 'zo_eps': zo_eps}
-        times_update = []
+        t_gen_curve[c] = _median(times)
+        print(f"[BenchCurves] t_gen(c={c}) = {t_gen_curve[c]*1000:.1f}ms  "
+              f"[{idx+1}/{len(points)}]", flush=True)
+
+    # --- Measure t_update(n) ---
+    # Pre-generate z once (seed=42, shapes don't change) using max threads for speed.
+    # z_dict values are NOT modified by _apply_single_update_with_pregenerated_z
+    # (z.mul(grad) creates new tensor), so safe to reuse.
+    _prev_aten = torch.get_num_threads()
+    torch.set_num_threads(C_max)
+    if _zo_rng is not None:
+        _zo_rng.set_num_threads(C_max)
+    z_pregenerated = _generate_z_for_one_step(42, param_names, state, rng_device)
+    torch.set_num_threads(_prev_aten)
+    print(f"[BenchCurves] z pre-generated for t_update measurement", flush=True)
+
+    t_update_curve = {}
+    dummy_update = {'seed': 42, 'grad': 1e-4, 'lr': 1e-5, 'wd': 0.01, 'zo_eps': zo_eps}
+
+    for idx, n in enumerate(points):
+        torch.set_num_threads(n)
+
+        times = []
         for i in range(n_warmup + n_measure):
-            z = _generate_z_for_one_step(42, param_names, state, rng_device)
-            t0 = time.time()
+            t0 = time.monotonic()
             _apply_single_update_with_pregenerated_z(
-                state, dummy_update, param_names, z,
+                state, dummy_update, param_names, z_pregenerated,
                 default_zo_eps=zo_eps,
                 simulate_perturbation=True,
                 zo2_mode=False,
                 adam_state=adam_state,
             )
-            t1 = time.time()
+            t1 = time.monotonic()
             if i >= n_warmup:
-                times_update.append(t1 - t0)
-            del z
+                times.append(t1 - t0)
 
-        tg = sum(times_gen) / len(times_gen)
-        tu = sum(times_update) / len(times_update)
-        return tg, tu
+        t_update_curve[n] = _median(times)
+        print(f"[BenchCurves] t_update(n={n}) = {t_update_curve[n]*1000:.1f}ms  "
+              f"[{idx+1}/{len(points)}]", flush=True)
+    del z_pregenerated
 
-    # Phase 1: measure at n_cores//2 (assumes P=1)
-    threads_p1 = max(1, n_cores // 2)
-    t_gen, t_update = _measure(threads_p1)
-    recommended_P = max(1, math.ceil(t_gen / t_update))
-    logger.info(f"[CalibrateShadow] Phase 1 @ {threads_p1} threads: "
-                f"t_gen={t_gen*1000:.1f}ms, t_update={t_update*1000:.1f}ms → P={recommended_P}")
+    # Serialize to result_dict
+    result_dict['t_gen_json'] = json.dumps({str(k): v for k, v in t_gen_curve.items()})
+    result_dict['t_update_json'] = json.dumps({str(k): v for k, v in t_update_curve.items()})
+    result_dict['n_cores'] = n_cores
+    result_dict['C_max'] = C_max
 
-    # Phase 2: if P>1, re-measure at correct thread count
-    if recommended_P > 1:
-        threads_p2 = max(1, n_cores // (recommended_P + 1))
-        t_gen, t_update = _measure(threads_p2)
-        recommended_P = max(1, math.ceil(t_gen / t_update))
-        logger.info(f"[CalibrateShadow] Phase 2 @ {threads_p2} threads: "
-                    f"t_gen={t_gen*1000:.1f}ms, t_update={t_update*1000:.1f}ms → P={recommended_P}")
 
-    # Restore threads
-    torch.set_num_threads(original_threads)
+def _interp_curve(curve_dict, x):
+    """Linear interpolation on a sparse {int: float} curve. Clamps at boundaries."""
+    keys = sorted(curve_dict.keys())
+    if x in curve_dict:
+        return curve_dict[x]
+    if x <= keys[0]:
+        return curve_dict[keys[0]]
+    if x >= keys[-1]:
+        return curve_dict[keys[-1]]
+    for i in range(len(keys) - 1):
+        if keys[i] <= x <= keys[i + 1]:
+            x0, x1 = keys[i], keys[i + 1]
+            y0, y1 = curve_dict[x0], curve_dict[x1]
+            return y0 + (x - x0) / (x1 - x0) * (y1 - y0)
+    return curve_dict[keys[-1]]
 
-    threads_per_op = max(1, n_cores // (recommended_P + 1))
 
-    # Buffer size: B = ceil(t_update / max(t_gen, t_train))
-    if t_train is not None:
-        effective_producer_cycle = max(t_gen, t_train)
-        buffer_size = max(recommended_P + 1, math.ceil(t_update / effective_producer_cycle))
-    else:
-        buffer_size = recommended_P + 1
+def optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train, P_max=8):
+    """P-first search for optimal (c, P) minimizing pipeline step time.
 
-    t_pipeline_step = max(t_gen, t_update)
+    Outer loop: P from 1 upward (fewer producers preferred).
+    Inner loop: c (threads per producer), using interpolation on sparse curves.
 
-    # Memory analysis
-    per_slot_bytes = sum(state[nm].numel() * state[nm].element_size()
-                         for nm in param_names)
-    shadow_base_bytes = per_slot_bytes
-    adam_extra_bytes = sum(state[nm].numel() * 4 * 2 for nm in param_names) if adam_state is not None else 0
-    total_at_P = shadow_base_bytes + buffer_size * per_slot_bytes + adam_extra_bytes
+    Returns Pareto table (best config per P) + recommended config
+    (smallest P within 5% of global optimum).
 
-    logger.info(f"[CalibrateShadow] threads_per_op={threads_per_op}, "
-                f"t_gen={t_gen*1000:.1f}ms, t_update={t_update*1000:.1f}ms")
-    logger.info(f"[CalibrateShadow] P={recommended_P}, buffer_size={buffer_size}"
-                f"{f', t_train={t_train*1000:.1f}ms' if t_train else ''}")
-    logger.info(f"[CalibrateShadow] pipeline: {t_pipeline_step*1000:.1f}ms/step")
-    logger.info(f"[CalibrateShadow] memory: shadow={shadow_base_bytes/1e9:.2f}GB + "
-                f"z_buf={buffer_size}×{per_slot_bytes/1e9:.2f}GB = "
-                f"{(shadow_base_bytes + buffer_size * per_slot_bytes)/1e9:.2f}GB"
-                f"{f' + adam_mv={adam_extra_bytes/1e9:.2f}GB' if adam_extra_bytes else ''}"
-                f" → total={total_at_P/1e9:.2f}GB")
+    Args:
+        t_gen_curve: dict {c: seconds}
+        t_update_curve: dict {n: seconds}
+        C: total available CPU threads
+        t_train: GPU training step time in seconds
+        P_max: maximum number of producers to consider (default 8)
+    """
+    pareto = []
+    all_configs = []
+
+    for P in range(1, P_max + 1):
+        best_t = float('inf')
+        best_cfg = None
+
+        for c in range(1, C // P + 1):
+            c_cons = C - P * c
+            if c_cons < 1:
+                continue
+
+            t_gen_P = _interp_curve(t_gen_curve, c) / P
+            t_upd = _interp_curve(t_update_curve, c_cons)
+            t_step = max(t_gen_P, t_upd, t_train)
+
+            components = {'t_gen/P': t_gen_P, 't_update': t_upd, 't_train': t_train}
+            bottleneck = max(components, key=components.get)
+
+            t_produce = max(t_gen_P, t_train)
+            B = max(2, math.ceil(t_upd / t_produce)) if t_produce > 0 else 2
+            lag_frac = max(0.0, (t_step - t_train) / t_step) if t_step > 0 else 0.0
+
+            cfg = {
+                'c': c, 'P': P, 'c_cons': c_cons,
+                't_step': t_step, 'bottleneck': bottleneck,
+                'B': B, 'lag_frac': lag_frac,
+                't_gen_P': t_gen_P, 't_update_val': t_upd,
+            }
+            all_configs.append(cfg)
+
+            if t_step < best_t:
+                best_t = t_step
+                best_cfg = cfg
+
+        if best_cfg:
+            pareto.append(best_cfg)
+
+    if not pareto:
+        raise ValueError("No valid (c, P) configuration found")
+
+    # Recommend: smallest P within 5% of global best
+    global_best = min(pareto, key=lambda x: x['t_step'])
+    threshold = global_best['t_step'] * 1.05
+    recommended = next(p for p in pareto if p['t_step'] <= threshold)
 
     return {
-        't_gen': t_gen,
-        't_update': t_update,
-        'recommended_P': recommended_P,
-        'buffer_size': buffer_size,
-        'threads_per_op': threads_per_op,
-        't_pipeline_step': t_pipeline_step,
+        'pareto': pareto,
+        'recommended': recommended,
+        'all_configs': all_configs,
+        'C': C,
+        't_train': t_train,
+        # Backward compat keys (from recommended)
+        'best_c': recommended['c'],
+        'best_P': recommended['P'],
+        'best_c_cons': recommended['c_cons'],
+        'best_t_step': recommended['t_step'],
+        'best_bottleneck': recommended['bottleneck'],
+        'best_B': recommended['B'],
+        'best_lag_frac': recommended['lag_frac'],
+        'best_t_gen_P': recommended['t_gen_P'],
+        'best_t_update_val': recommended['t_update_val'],
+    }
+
+
+def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
+                                 C=None, t_train=None, dataloader_num_workers=0,
+                                 n_warmup=5, n_measure=8,
+                                 zo_eps=1e-3, adam_state=None,
+                                 core_start=1, core_stop=None, core_step=1):
+    """Benchmark t_gen/t_update curves and find optimal (c, P, c_cons).
+
+    Spawns a child process with shadow-identical env to measure:
+      t_gen(c): z generation time with c threads (zo_rng + aten)
+      t_update(n): update apply time with n aten threads (perturbation + grad + wd)
+
+    Then brute-force searches for optimal (c, P) minimizing:
+      t_step = max(t_gen(c)/P, t_update(C-P*c), t_train)
+
+    Args:
+        state: state dict on CPU (will be cloned, not modified)
+        param_names: ordered list of trainable param names
+        rng_device: "zo_rng" (default), "native", or "cpu"
+        C: total available CPU threads. If None: sched_getaffinity() - 1 - dataloader_num_workers
+        t_train: GPU training step time in seconds (required)
+        dataloader_num_workers: HF Trainer dataloader workers (default 0)
+        n_warmup: warmup iterations per measurement point
+        n_measure: measurement iterations per point (median taken)
+        zo_eps: perturbation epsilon
+        adam_state: if not None, measure Adam update path
+        core_start: first core count to benchmark (default 1)
+        core_stop: last core count to benchmark (default C-1, inclusive)
+        core_step: step size between core counts (default 1)
+
+    Returns:
+        dict with keys: t_gen_curve, t_update_curve, C, t_train,
+                        best_c, best_P, best_c_cons, best_t_step,
+                        best_B, best_lag_frac, best_bottleneck,
+                        all_configs, per_slot_bytes
+    """
+    if t_train is None:
+        raise ValueError("t_train (GPU step time in seconds) is required")
+
+    # Ensure state on CPU
+    for k in state:
+        if state[k].device.type != 'cpu':
+            state[k] = state[k].cpu()
+
+    try:
+        n_cores = len(os.sched_getaffinity(0))
+    except AttributeError:
+        n_cores = os.cpu_count() or 64
+
+    if C is None:
+        C = n_cores - 1 - dataloader_num_workers
+    C = max(3, C)  # need at least c=1, P=1, c_cons=1
+
+    # Generate core_points from start/stop/step
+    _stop = core_stop if core_stop is not None else C - 1
+    core_points = list(range(core_start, _stop + 1, core_step))
+    # Always include endpoint if not already there
+    if _stop not in core_points and _stop >= core_start:
+        core_points.append(_stop)
+    logger.info(f"[CalibratePC] core_points: {len(core_points)} points, "
+                f"range=[{core_points[0]}..{core_points[-1]}], step={core_step}")
+
+    # Shared memory for child process
+    shared_state = OrderedDict()
+    for name in param_names:
+        shared_state[name] = state[name].clone().share_memory_()
+
+    # Shadow-identical environment
+    _old_env = {}
+    _thread_env = {
+        'OMP_NUM_THREADS': str(n_cores),
+        'OMP_WAIT_POLICY': 'passive',
+        'GOMP_SPINCOUNT': '0',
+        'MKL_NUM_THREADS': '1',
+        'OPENBLAS_NUM_THREADS': '1',
+        'NUMEXPR_NUM_THREADS': '1',
+        'KMP_BLOCKTIME': '0',
+    }
+    for k, v in _thread_env.items():
+        _old_env[k] = os.environ.get(k)
+        os.environ[k] = v
+
+    ctx = mp.get_context('spawn')
+    manager = ctx.Manager()  # keep reference to prevent GC
+    result_dict = manager.dict()
+
+    # Estimate timeout: ~60s per point × 2 curves + 120s overhead
+    n_points = len(core_points)
+    timeout_s = max(300, n_points * 120 + 120)
+
+    p = ctx.Process(
+        target=_benchmark_curves_worker,
+        args=(shared_state, param_names, rng_device, C,
+              n_warmup, n_measure, zo_eps, adam_state,
+              core_points, result_dict),
+        daemon=True,
+    )
+    logger.info(f"[CalibratePC] Spawning benchmark worker: C={C}, t_train={t_train*1000:.0f}ms, "
+                f"points={n_points}, timeout={timeout_s}s, "
+                f"n_warmup={n_warmup}, n_measure={n_measure}")
+    p.start()
+    p.join(timeout=timeout_s)
+
+    # Restore env
+    for k in _thread_env:
+        if _old_env[k] is not None:
+            os.environ[k] = _old_env[k]
+        else:
+            os.environ.pop(k, None)
+
+    # Check child process result
+    if p.is_alive():
+        logger.error("[CalibratePC] Worker timed out, killing...")
+        p.kill()
+        p.join(timeout=10)
+        manager.shutdown()
+        raise RuntimeError(f"calibrate_producer_consumer: worker timed out after {timeout_s}s")
+    if p.exitcode != 0:
+        manager.shutdown()
+        raise RuntimeError(f"calibrate_producer_consumer: worker crashed with exitcode={p.exitcode}")
+
+    # Parse curves
+    import json
+    if 't_gen_json' not in result_dict:
+        manager.shutdown()
+        raise RuntimeError("calibrate_producer_consumer: worker produced no results")
+    t_gen_curve = {int(k): v for k, v in json.loads(result_dict['t_gen_json']).items()}
+    t_update_curve = {int(k): v for k, v in json.loads(result_dict['t_update_json']).items()}
+    manager.shutdown()
+
+    # Optimize
+    opt = optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train)
+
+    # Memory analysis
+    per_slot_bytes = sum(state[nm].numel() * state[nm].element_size() for nm in param_names)
+    adam_extra = sum(state[nm].numel() * 4 * 2 for nm in param_names) if adam_state is not None else 0
+    rec = opt['recommended']
+    total_mem = per_slot_bytes + rec['B'] * per_slot_bytes + adam_extra
+
+    # Print Pareto table
+    print(f"\n{'='*65}")
+    print(f"Producer-Consumer Optimization (C={C}, t_train={t_train*1000:.0f}ms)")
+    print(f"{'='*65}")
+    print(f"{'P':>3} {'c':>5} {'c_cons':>6} {'t_step':>8} {'bottleneck':>12} {'B':>3} {'lag':>6}")
+    print(f"{'-'*50}")
+    for row in opt['pareto']:
+        marker = ' <--' if row is rec else ''
+        print(f"{row['P']:>3} {row['c']:>5} {row['c_cons']:>6} "
+              f"{row['t_step']*1000:>7.0f}ms {row['bottleneck']:>12} "
+              f"{row['B']:>3} {row['lag_frac']:>5.3f}{marker}")
+    print(f"\n  Recommended: P={rec['P']}, c={rec['c']}, c_cons={rec['c_cons']} "
+          f"-> t_step={rec['t_step']*1000:.0f}ms")
+    print(f"  Memory: shadow={per_slot_bytes/1e9:.2f}GB + "
+          f"z_buf={rec['B']}x{per_slot_bytes/1e9:.2f}GB = {total_mem/1e9:.2f}GB")
+    print(f"{'='*65}\n")
+
+    return {
+        't_gen_curve': t_gen_curve,
+        't_update_curve': t_update_curve,
         'per_slot_bytes': per_slot_bytes,
-        'adam_extra_bytes': adam_extra_bytes,
-        'total_bytes_at_P': total_at_P,
+        'adam_extra_bytes': adam_extra,
+        'total_bytes': total_mem,
+        **opt,
     }
 
 
@@ -2842,7 +3331,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                     z = _generate_z_for_replay(param, rng_device, zo_gen)
                     t_z += time.time() - _t0
                     _t0 = time.time()
-                    param.data.add_(scaling_factor * z * zo_eps)
+                    param.data.add_(z, alpha=float(scaling_factor * zo_eps))
                     t_update += time.time() - _t0
 
         # 2) Adam update (always runs — even for grad=0, m/v decay and t increments,
@@ -2882,6 +3371,9 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
 
         return {'total': time.time() - t_start, 'z_gen': t_z, 'update': t_update}
 
+    # Pre-compute scalar in fp64 (matches pipeline path)
+    _lr_grad = float(lr * grad)
+
     if zo2_mode and grad != 0:
         # ZO2 order: gradient FIRST (using prev step's seed), then perturbation.
         # In ZO2 training, module_dual_forward does:
@@ -2895,10 +3387,12 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
             z = _generate_z_for_replay(param, rng_device, zo_gen)
             t_z += time.time() - _t0
             _t0 = time.time()
-            if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
-                param.sub_(lr * (grad * z + wd * param))
+            if _is_wd_param(name):
+                tmp = z.mul(grad)
+                tmp.add_(param, alpha=wd)
+                param.sub_(tmp, alpha=lr)
             else:
-                param.sub_(lr * grad * z)
+                param.sub_(z, alpha=_lr_grad)
             t_update += time.time() - _t0
 
         if simulate_perturbation and zo_eps > 0:
@@ -2910,7 +3404,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                     z = _generate_z_for_replay(param, rng_device, zo_gen)
                     t_z += time.time() - _t0
                     _t0 = time.time()
-                    param.data.add_(scaling_factor * z * zo_eps)
+                    param.data.add_(z, alpha=float(scaling_factor * zo_eps))
                     t_update += time.time() - _t0
     else:
         # Regular ZO order (or grad=0 perturbation-only): perturbation first, then gradient.
@@ -2923,7 +3417,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                     z = _generate_z_for_replay(param, rng_device, zo_gen)
                     t_z += time.time() - _t0
                     _t0 = time.time()
-                    param.data.add_(scaling_factor * z * zo_eps)
+                    param.data.add_(z, alpha=float(scaling_factor * zo_eps))
                     t_update += time.time() - _t0
 
         if grad != 0:
@@ -2934,10 +3428,12 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                 z = _generate_z_for_replay(param, rng_device, zo_gen)
                 t_z += time.time() - _t0
                 _t0 = time.time()
-                if 'bias' not in name and 'layer_norm' not in name and 'layernorm' not in name and 'ln' not in name:
-                    param.sub_(lr * (grad * z + wd * param))
+                if _is_wd_param(name):
+                    tmp = z.mul(grad)
+                    tmp.add_(param, alpha=wd)
+                    param.sub_(tmp, alpha=lr)
                 else:
-                    param.sub_(lr * grad * z)
+                    param.sub_(z, alpha=_lr_grad)
                 t_update += time.time() - _t0
 
     return {'total': time.time() - t_start, 'z_gen': t_z, 'update': t_update}

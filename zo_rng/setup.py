@@ -19,7 +19,7 @@ def get_extensions():
 
     sources_cpu = [
         os.path.join(CSRC, 'bindings.cpp'),
-        os.path.join(CSRC, 'generate_cpu.c'),
+        os.path.join(CSRC, 'generate_cpu.cpp'),
     ]
     include_dirs = [CSRC, RANDOM123_INCLUDE]
 
@@ -46,7 +46,7 @@ def get_extensions():
             include_dirs=include_dirs,
             define_macros=[('ZO_RNG_WITH_CUDA', None)],
             extra_compile_args={
-                'cxx': ['-O3', '-fopenmp', '-DZO_RNG_WITH_CUDA', '-ffp-contract=off'] + r123_no_sse,
+                'cxx': ['-O3', '-pthread', '-DZO_RNG_WITH_CUDA', '-ffp-contract=off'] + r123_no_sse,
                 'nvcc': [
                     '-O3', '--fmad=false',
                     '-gencode', 'arch=compute_80,code=sm_80',  # Ampere (A100)
@@ -54,7 +54,7 @@ def get_extensions():
                     '-gencode', 'arch=compute_90,code=sm_90',  # Hopper (H100)
                 ] + r123_no_sse,
             },
-            extra_link_args=['-fopenmp'] + cuda_link_dirs,
+            extra_link_args=['-pthread'] + cuda_link_dirs,
         )
     else:
         ext = CppExtension(
@@ -62,9 +62,9 @@ def get_extensions():
             sources=sources_cpu,
             include_dirs=include_dirs,
             extra_compile_args={
-                'cxx': ['-O3', '-fopenmp', '-ffp-contract=off'],
+                'cxx': ['-O3', '-pthread', '-ffp-contract=off'],
             },
-            extra_link_args=['-fopenmp'],
+            extra_link_args=['-pthread'],
         )
 
     return [ext]
