@@ -18,6 +18,15 @@ extern "C" torch::Tensor zo_rng_generate_cuda_tensor(
     int64_t seed, int64_t counter, int64_t n, int device_idx);
 #endif
 
+void generate_normal_inplace(int64_t seed, int64_t counter,
+                              torch::Tensor output, int pool_id) {
+    TORCH_CHECK(output.device().is_cpu(), "generate_normal_inplace: output must be CPU tensor");
+    TORCH_CHECK(output.dtype() == torch::kFloat32, "generate_normal_inplace: output must be float32");
+    TORCH_CHECK(output.is_contiguous(), "generate_normal_inplace: output must be contiguous");
+    zo_rng_generate_cpu(seed, counter, output.numel(),
+                        output.data_ptr<float>(), pool_id);
+}
+
 torch::Tensor generate_normal(int64_t seed, int64_t counter, int64_t n,
                                const std::string &device_str, int pool_id) {
     if (device_str == "cpu") {
@@ -71,6 +80,11 @@ void pool_destroy(int pool_id) {
 }
 
 PYBIND11_MODULE(_ext_impl, m) {
+    m.def("generate_normal_inplace", &generate_normal_inplace,
+          "Fill a pre-allocated float32 CPU tensor with Philox random normals (zero allocation)",
+          py::arg("seed"), py::arg("counter"), py::arg("output"),
+          py::arg("pool_id") = 0,
+          py::call_guard<py::gil_scoped_release>());
     m.def("generate_normal", &generate_normal,
           "Generate deterministic normal-distributed random numbers",
           py::arg("seed"), py::arg("counter"), py::arg("n"),

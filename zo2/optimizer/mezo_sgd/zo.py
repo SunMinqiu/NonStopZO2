@@ -1,6 +1,7 @@
 # Copyright (c) 2025 liangyuwang
 # Licensed under the Apache License, Version 2.0
 
+import os
 import sys
 sys.path.append('./zo2')
 
@@ -37,6 +38,7 @@ class MeZOSGD(BaseOptimizer):
         self.max_zo_random_seed = config.max_zo_random_seed
         self.debug_mode = config.debug_mode
         self.rng_device = getattr(config, 'rng_device', 'native')  # "native" or "cpu"
+        self.use_fma = os.environ.get('ZO_FMA', '0') == '1'
         defaults = dict(
             lr=self.lr,
             weight_decay=self.weight_decay,
@@ -46,7 +48,8 @@ class MeZOSGD(BaseOptimizer):
             fused=None,
         )
         super().__init__(model.parameters(), defaults)
-        
+        logger.info(f"[MeZOSGD] use_fma={self.use_fma}, rng_device={self.rng_device}, weight_decay={self.weight_decay}")
+
     def _reset_rng(self, seed):
         """Reset RNG state for z generation. Called before each perturb/update block."""
         if self.rng_device == "zo_rng":
@@ -81,7 +84,10 @@ class MeZOSGD(BaseOptimizer):
         for _, param in module.named_parameters():
             if param.requires_grad:
                 z = self._generate_z(param)
-                param.data.add_(scaling_factor * z * self.zo_eps)
+                if self.use_fma:
+                    param.data.add_(z, alpha=float(scaling_factor * self.zo_eps))
+                else:
+                    param.data.add_(scaling_factor * z * self.zo_eps)
 
     @torch.inference_mode
     def zo_update(self, module, weight_decay=None):
@@ -95,15 +101,26 @@ class MeZOSGD(BaseOptimizer):
         for name, param in module.named_parameters():
             if param.requires_grad:
                 z = self._generate_z(param)
-                if weight_decay != None:
-                    param.data.sub_(
-                        self.lr * (self.projected_grad * z + weight_decay * param.data))
-                else:
-                    if all(x not in name for x in ["bias", "layer_norm", "layernorm", "ln"]):
-                        param.data.sub_(
-                            self.lr * (self.projected_grad * z + self.weight_decay * param.data))
+                if self.use_fma:
+                    wd = weight_decay if weight_decay is not None else (
+                        self.weight_decay if all(x not in name for x in ["bias", "layer_norm", "layernorm", "ln"]) else 0.0
+                    )
+                    if wd != 0.0:
+                        tmp = z.mul(self.projected_grad)
+                        tmp.add_(param.data, alpha=wd)
+                        param.data.sub_(tmp, alpha=self.lr)
                     else:
-                        param.data.sub_(self.lr * self.projected_grad * z)
+                        param.data.sub_(z, alpha=float(self.lr * self.projected_grad))
+                else:
+                    if weight_decay != None:
+                        param.data.sub_(
+                            self.lr * (self.projected_grad * z + weight_decay * param.data))
+                    else:
+                        if all(x not in name for x in ["bias", "layer_norm", "layernorm", "ln"]):
+                            param.data.sub_(
+                                self.lr * (self.projected_grad * z + self.weight_decay * param.data))
+                        else:
+                            param.data.sub_(self.lr * self.projected_grad * z)
     
     def zo_perturb_shifts(self, first_perturb_shift=1, stride=2):
         """

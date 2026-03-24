@@ -11,11 +11,12 @@ _has_native_cuda = False
 
 try:
     from zo_rng._ext_impl import generate_normal as _generate_normal_native
+    from zo_rng._ext_impl import generate_normal_inplace as _generate_normal_inplace_native
     from zo_rng._ext_impl import has_cuda as _has_cuda_native
     _has_native = True
     _has_native_cuda = _has_cuda_native()
 except ImportError:
-    pass
+    _generate_normal_inplace_native = None
 
 
 def _generate_normal(seed, counter, n, device_str, pool_id=0):
@@ -40,3 +41,13 @@ def _generate_normal(seed, counter, n, device_str, pool_id=0):
     if device_str != 'cpu':
         result = result.to(device_str)
     return result
+
+
+def _generate_normal_inplace(seed, counter, output, pool_id=0):
+    """Fill pre-allocated float32 CPU tensor in-place. Zero allocation."""
+    if _generate_normal_inplace_native is not None:
+        _generate_normal_inplace_native(seed, counter, output, pool_id)
+    else:
+        # Fallback: allocate + copy
+        tmp = _generate_normal(seed, counter, output.numel(), 'cpu', pool_id)
+        output.copy_(tmp)

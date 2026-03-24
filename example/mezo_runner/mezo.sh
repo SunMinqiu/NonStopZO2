@@ -194,7 +194,7 @@ python /home/users/u0001609/NonStopZO2/example/mezo_runner/run.py \
     --num_eval $EVAL \
     --logging_steps $LOGGING_STEPS \
     --max_steps $STEPS \
-    --trainer zo2 \
+    --trainer zo \
     $([ "$DTYPE" == "fp16" ] && echo "--load_float16" || [ "$DTYPE" == "bf16" ] && echo "--load_bfloat16") \
     --learning_rate $LR \
     --zo_eps $EPS \

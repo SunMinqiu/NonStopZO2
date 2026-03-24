@@ -31,12 +31,35 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+# ---- Thread origin probe (temporary) ----
+def _tc():
+    try: return len(os.listdir(f'/proc/{os.getpid()}/task'))
+    except: return -1
+def _wchan():
+    from collections import Counter
+    pid = os.getpid()
+    wc = Counter()
+    for tid in os.listdir(f'/proc/{pid}/task'):
+        try:
+            with open(f'/proc/{pid}/task/{tid}/wchan') as f:
+                wc[f.read().strip()] += 1
+        except: pass
+    return wc.most_common()
+logger.info(f"[THR] bare python: {_tc()}")
+
 import argparse
 import time
 import tasks
+logger.info(f"[THR] after import tasks: {_tc()}")
+
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, Trainer, HfArgumentParser, Trainer, TrainingArguments, DataCollatorWithPadding, DataCollatorForTokenClassification
+logger.info(f"[THR] after import transformers: {_tc()}")
+
 from typing import Union, Optional
 import torch
+logger.info(f"[THR] after import torch: {_tc()}")
+logger.info(f"[THR] wchan: {_wchan()}")
+
 from torch.nn.parameter import Parameter
 import numpy as np
 from dataclasses import dataclass, is_dataclass, asdict
@@ -53,6 +76,7 @@ import random
 from zo2.trainer.hf_transformers.trainer import ZOTrainer
 from zo2.trainer.hf_transformers.batch_differential_checkpoint import BatchDiffCheckpointCallback, resume_from_batch_diff
 from zo2 import zo_hf_init, ZOConfig
+logger.info(f"[THR] after all imports: {_tc()}")
 
 @dataclass
 class OurArguments(TrainingArguments):
@@ -557,7 +581,12 @@ class Framework:
             trainer.add_callback(SIGUSR1Callback())
 
         # GPU 故障注入 (旁路，可单独使用或叠加在任意层级)
-        gpu_fail_step = self.args.gpu_fail_step
+        # Support env-var overrides for notebook bash cells
+        gpu_fail_step = int(os.environ.get('GPU_FAIL_STEP', str(self.args.gpu_fail_step)))
+        if os.environ.get('INSTANT_RECOVER', '') == '1':
+            self.args.instant_recover = True
+        if os.environ.get('ENABLE_SHADOW', '') == '1':
+            self.args.enable_shadow = True
 
         if self.args.batchdiff_ckpt >= 0:
             # Batch Differential Checkpoint enabled

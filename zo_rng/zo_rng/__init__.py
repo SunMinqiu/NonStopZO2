@@ -14,7 +14,7 @@ Usage:
 """
 
 import torch
-from ._ext import _generate_normal
+from ._ext import _generate_normal, _generate_normal_inplace
 
 __all__ = ['Generator', 'randn', 'set_num_threads', 'get_num_threads',
            'create_pool', 'destroy_pool']
@@ -97,6 +97,23 @@ class Generator:
         if dtype != torch.float32:
             result = result.to(dtype)
         return result
+
+    def randn_inplace(self, out):
+        """Fill pre-allocated float32 CPU tensor with Philox random normals.
+
+        Zero memory allocation — writes directly to out's data buffer.
+
+        Args:
+            out: Contiguous float32 CPU tensor to fill.
+
+        Returns:
+            out (same tensor, filled with random normals).
+        """
+        n = out.numel()
+        _generate_normal_inplace(self.seed, self.counter, out.view(-1),
+                                  self.pool_id)
+        self.counter += (n + 3) // 4
+        return out
 
     def state_dict(self):
         """Return generator state as a dict (for checkpointing)."""

@@ -150,13 +150,13 @@ batch_size<=0 时 enable_shadow 强制关闭。
 │   └─ if enable_shadow: _refresh_shadow_from_base()
 │
 ├─ 注册 _zo_update_hook
-├─ if enable_shadow: _start_shadow_thread()
+├─ if enable_shadow: _start_shadow_process()
 │
 │── 每一步: _zo_update_hook → update_history.append(...)
 │
-├─ Shadow 线程（如果 enable_shadow=True）：
+├─ Shadow 进程（如果 enable_shadow=True，独立进程，零 GIL 竞争）：
 │   ├─ [SHADOW_PIPELINE=0] 串行: 逐条 _apply_update_to_shadow()
-│   └─ [SHADOW_PIPELINE=1] 流水线: P producer 预生成 z → ring buffer → consumer 更新 shadow
+│   └─ [SHADOW_PIPELINE=1] 流水线: P producer 预生成 z → Queue(maxsize=1) → consumer 更新 shadow
 │
 └─ 保存检查点: trainer._save_checkpoint()
     │
@@ -266,19 +266,24 @@ resume_from_batch_diff()
         └─ _generate_z_for_replay()
     （并行 replay 选项见文末「不常用功能」）
 
-_start_shadow_thread()
-├─ [SHADOW_PIPELINE=0] _shadow_worker()              ← 串行 shadow
-│   └─ loop: _apply_update_to_shadow()
-│       └─ _apply_single_update()                     ← 每步重新生成 z
-│           └─ _generate_z_for_replay()
+_start_shadow_process()                                  ← 独立进程（spawn），零 GIL 竞争
+├─ _shadow_process_main()                                ← 进程入口
+│   ├─ 线程配置: SHADOW_RESERVE_THREADS / SHADOW_CONSUMER_THREADS
+│   │   └─ zo_rng.set_num_threads(c_prod), torch.set_num_threads(n_cons)
+│   │
+│   ├─ [SHADOW_PIPELINE=0] _shadow_process_serial()      ← 串行 shadow
+│   │   └─ loop: get update → _apply_single_update()
+│   │       └─ _generate_z_for_replay()
+│   │
+│   └─ [SHADOW_PIPELINE=1] _shadow_process_pipelined()   ← 流水线 shadow
+│       ├─ P producer threads → Queue(maxsize=1)
+│       │   └─ _generate_z_for_one_step()                ← 预生成 z，释放 GIL
+│       └─ consumer (main thread):
+│           └─ _apply_single_update_with_pregenerated_z() ← 用 pregenerated z 更新
+│               ├─ [adam_state=None] SGD 路径
+│               └─ [adam_state≠None] Adam 路径 (m/v/t on CPU)
 │
-└─ [SHADOW_PIPELINE=1] _shadow_worker_pipelined()     ← 流水线 shadow
-    ├─ P producer threads (ring buffer + threading.Event)
-    │   └─ _generate_z_for_one_step()                 ← 预生成 z，释放 GIL
-    └─ consumer (main shadow thread):
-        └─ _apply_single_update_with_pregenerated_z() ← 用 buffered z 更新
-            ├─ [adam_state=None] SGD 路径
-            └─ [adam_state≠None] Adam 路径 (m/v/t on CPU)
+└─ calibrate_producer_consumer()                         ← benchmark 找最优 (P, c, n_cons)
 ```
 
 ---
@@ -339,8 +344,11 @@ _start_shadow_thread()
 | `GPU_FAIL_STEP` | `-1` | 在第 N 步模拟 GPU 故障. `-1`=不注入. 可独立使用或叠加任意层级 |
 | `ASYNC_ANCHOR` | `0` | **异步 anchor**. 设为 `1` 启用异步写入 full checkpoint. **仅 `BATCHDIFF_CKPT>=1` 时有效**. GPU→CPU 异步拷贝 + 后台线程写盘，训练不阻塞. 若前一次写盘未完成则跳过本次 anchor (redo log 保证可恢复) |
 | `OUTPUT_LOG` | `""` | **仅 `ASYNC_ANCHOR=1` 时有效**. log checkpoint 输出目录. 设置后 log checkpoints (optimizer.pt) 写入此目录, full checkpoints 仍在 `OUTPUT_ROOT`. 可设为 `/dev/shm/ZO_ckpt`(DRAM) 加速频繁的 log 写入 |
-| `SHADOW_PIPELINE` | `0` | 设为 `1` 启用 **pipelined shadow**. P 个 producer 线程并行预生成 z，1 个 consumer 串行更新 shadow model，通过 ring buffer 连接. **需要 `ENABLE_SHADOW=1`**. GIL 不阻塞: PyTorch C++ ops 和 zo_rng C extension 均释放 GIL. 支持 SGD 和 Adam |
-| `SHADOW_PIPELINE_WORKERS` | `2` | P = producer 线程数 = ring buffer slot 数. P>=2 才有 overlap. 使用 `calibrate_shadow_pipeline()` 确定最优 P. 每个 slot 占用 1×model_size 内存 |
+| `SHADOW_PIPELINE` | `0` | 设为 `1` 启用 **pipelined shadow**. P 个 producer 线程并行预生成 z，1 个 consumer 串行更新 shadow model，通过 `Queue(maxsize=1)` 连接. **需要 `ENABLE_SHADOW=1`**. GIL 不阻塞: PyTorch C++ ops 和 zo_rng C extension 均释放 GIL. 支持 SGD 和 Adam |
+| `SHADOW_PIPELINE_WORKERS` | `2` | P = producer 线程数. P>=2 才有 overlap. 使用 `calibrate_producer_consumer()` 确定最优 P |
+| `SHADOW_RESERVE_THREADS` | `1` | Shadow 进程留给训练进程的核心数（不用于 shadow 计算） |
+| `SHADOW_CONSUMER_THREADS` | `total//2` | Consumer (ATen apply) 使用的线程数. `c_prod = total - reserve - n_cons` 自动分配给 producer (zo_rng) |
+| `ZO_RNG_TRAIN_THREADS` | (unset) | 可选: 降低训练进程的 zo_rng 线程数，减少与 shadow 的带宽竞争. 设为 `16` 等小值 |
 
 > 并行 replay 参数见文末「不常用功能」。
 
@@ -362,6 +370,7 @@ _start_shadow_thread()
 |------|--------|------|
 | `DETERMINISTIC` | `0` | 设为 `1` 启用 `torch.use_deterministic_algorithms(True)` + `CUBLAS_WORKSPACE_CONFIG=:4096:8`. 强制 cuBLAS matmul 等所有 PyTorch 算子使用确定性实现，保证同一硬件上两次独立训练产生 bitwise 相同的 loss 轨迹. **注意: 不影响 replay 正确性**（replay 不涉及 cuBLAS），仅影响训练 forward pass. 代价: ~5-15% 性能下降 |
 | `ZO_RNG_DEVICE` | `native` | ZO 扰动噪声 z 的生成设备. `native`=在参数所在设备上生成(快); `cpu`=始终在 CPU 生成再传到 GPU(跨设备可移植，但非常慢！); **`zo_rng`=使用 zo_rng 库生成跨设备 bit-exact 的噪声，使 `BATCHDIFF_REPLAY_DEVICE=cpu` 可以精确还原 GPU 训练** |
+| `ZO_FMA` | `0` | 设为 `1` 启用 FMA (Fused Multiply-Add) 模式. 训练时的 perturbation 和 gradient update 使用 `param.add_(z, alpha=scalar)` 而非 `param.add_(scalar * z * scalar2)`, 与 replay 代码的运算顺序一致, **确保 instant recovery replay 后权重 bitwise identical**. 默认关闭以保持原版 MeZO 行为 |
 
 > **关于确定性的说明**:
 > - 无论 `DETERMINISTIC` 设为何值，`cudnn.deterministic=True` 和 `cudnn.benchmark=False` **始终开启**
@@ -376,6 +385,46 @@ _start_shadow_thread()
 >   - `zo_rng.randn`: fp32 ~1.5s, fp16 ~2.3s, **bf16 ~2.7s** — 全 dtype 均快，bf16 仅比 fp32 慢 1.8x
 > - **结论: Shadow pipeline (`SHADOW_PIPELINE=1`) 和 CPU replay 在使用 bf16 时必须搭配 `ZO_RNG_DEVICE=zo_rng`**，否则 CPU 端 z 生成会成为瓶颈（50s/step vs 2.7s/step）
 
+## 线程控制参数
+
+> 控制训练进程和 shadow 进程的 CPU 线程分配。
+> 带 ★ 的参数建议在 notebook bash cell 里 export。不带 ★ 的由代码内部自动设置。
+
+### 训练进程
+
+| 参数 | 默认值 | 说明 | 效果体现 |
+|------|--------|------|----------|
+| ★ `MKL_NUM_THREADS` | (unset) | MKL BLAS 线程数。**副作用：未设 `OMP_NUM_THREADS` 时，PyTorch fallback 读此值作为 ATen 线程数** | `torch.get_num_threads()` |
+| ★ `OMP_WAIT_POLICY` | `passive` | OpenMP 空闲线程策略。`passive`=立即 sleep，`active`=spin wait | 训练 aten=1 时无实际影响 |
+| ★ `ZO_RNG_NUM_THREADS` | `1` | zo_rng C++ 线程池**初始**大小（C++ 侧 `init_pool()` 读取，仅首次创建时生效） | `zo_rng.get_num_threads()` |
+| ★ `TORCH_INTEROP_THREADS` | `1` | PyTorch inter-op 线程池大小。单 GPU 训练设 1 即可（默认=CPU核数，会白白创建 N 个空闲线程） | `torch.get_num_interop_threads()` |
+| `ZO_RNG_TRAIN_THREADS` | (unset) | 可选：运行时动态调整训练进程 zo_rng 线程数 | `zo_rng.set_num_threads()` |
+
+### Shadow 进程
+
+| 参数 | 默认值 | 说明 | 效果体现 |
+|------|--------|------|----------|
+| ★ `SHADOW_CONSUMER_THREADS` | `total//2` | Consumer (ATen) 线程数 | `torch.set_num_threads(n_cons)` |
+| ★ `SHADOW_RESERVE_THREADS` | `1` | 预留给训练进程的核心数 | `c_prod = total - reserve - n_cons` |
+| ★ `SHADOW_PIPELINE_WORKERS` | `2` | Producer Python 线程数 | pipeline producer count |
+| `OMP_NUM_THREADS` | = CONSUMER | 代码在 spawn 前设置，shadow 子进程继承 | shadow `torch.get_num_threads()` |
+| `KMP_BLOCKTIME` | `0` | Intel OpenMP spin 等待时间（代码内部设置） | 空闲线程立即 sleep |
+| `GOMP_SPINCOUNT` | `0` | GNU OpenMP spin 次数（代码内部设置） | 空闲线程不 spin |
+| `OPENBLAS_NUM_THREADS` | `1` | 代码内部设置 | 无 matmul，无实际影响 |
+| `NUMEXPR_NUM_THREADS` | `1` | 代码内部设置 | 无实际影响 |
+
+### 推荐 notebook 配置
+
+```bash
+export MKL_NUM_THREADS=1          # 训练 ATen=1（模型在 GPU，CPU tensor op 极少）
+export OMP_WAIT_POLICY=passive    # 空闲线程不 spin
+export ZO_RNG_NUM_THREADS=1       # 训练 zo_rng=1（只需生成 1 组 z）
+export TORCH_INTEROP_THREADS=1    # 砍掉默认 128 个无用 interop 线程
+export SHADOW_CONSUMER_THREADS=32 # 根据实际 benchmark 调整
+export SHADOW_RESERVE_THREADS=1
+export SHADOW_PIPELINE_WORKERS=1
+```
+
 ---
 
 # 不常用功能
@@ -387,7 +436,7 @@ _start_shadow_thread()
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `PARALLEL_RECOVERY` | `0` | 设为 `1` 启用流水线 producer-consumer replay. P 个 producer 线程/stream 并行生成 z，1 个 consumer 串行更新参数，通过 ring buffer 连接. 结果与串行 replay **bitwise exact**. GPU+native 使用 CUDA streams; 其他情况使用 CPU threads |
-| `PARALLEL_RECOVERY_WORKERS` | `1` | P = producer 数 = ring buffer 大小. P>=2 才有 overlap. 使用 `calibrate_parallel_recovery()` 确定最优 P. 每个 slot 占用 model_size 内存 (ZO2: 2×model_size) |
+| `PARALLEL_RECOVERY_WORKERS` | `1` | P = producer 数 = ring buffer 大小. P>=2 才有 overlap. 使用 `calibrate_producer_consumer()` 确定最优 P. 每个 slot 占用 model_size 内存 (ZO2: 2×model_size) |
 | `CLOSEDFORM_RECOVERY` | `0` | 设为 `1` 启用闭合形式并行 replay. 将 ZO-SGD 递推展开为独立项之和: `p_n = sp[0]*p_0 - Σ sp[t+1]*lr_t*grad_t*z_t`, W 个 worker 并行累加. 与串行 replay 近似相等 (非 bitwise exact). 不支持 perturbation simulation |
 | `CLOSEDFORM_WORKERS` | `1` | W = 并行 worker 数. 内存 = 1×accum_buffer + W×z_buffer (共享累加, 无 per-worker partial sum). W=1 即为串行闭合形式 |
 | `CLOSEDFORM_PRECISION` | `mixed` | 精度模式: `fp32`=全程 fp32(最准确); `fp16`=保持原始 dtype 累加(最快但累积误差大); `mixed`=参数保持原始 dtype, 累加用 fp32(默认, 推荐) |
