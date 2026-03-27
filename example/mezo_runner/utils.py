@@ -39,6 +39,8 @@ def custom_loss_fn_with_option_len(self, input_ids, logits, labels, option_len=N
     Modified from below 'forward_wrap_with_option_len'.
     """
     loss = None
+    if logits.size(-2) != input_ids.size(-1):
+        input_ids = input_ids[..., -logits.size(-2):]
     # Shift so that tokens < n predict n
     shift_logits = logits[..., :-1, :].contiguous()
     # Here we use input_ids (which should always = labels) bc sometimes labels are correct candidate IDs
@@ -103,6 +105,8 @@ def forward_wrap_with_option_len(self, input_ids=None, labels=None, option_len=N
     logits = outputs.logits
 
     loss = None
+    if logits.size(-2) != input_ids.size(-1):
+        input_ids = input_ids[..., -logits.size(-2):]
     # Shift so that tokens < n predict n
     shift_logits = logits[..., :-1, :].contiguous()
     # Here we use input_ids (which should always = labels) bc sometimes labels are correct candidate IDs

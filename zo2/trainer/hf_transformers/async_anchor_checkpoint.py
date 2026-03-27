@@ -3,7 +3,8 @@ Async Anchor Checkpoint for ZO Training.
 
 Two-phase async pipeline for full model checkpoint saving:
   Phase 1 (GPU→CPU): Dedicated CUDA stream async-copies model params to pinned CPU buffer
-  Phase 2 (CPU→disk): Background daemon thread clones buffer, forks subprocess to write
+  Phase 2 (CPU→/dev/shm latest→disk): Background daemon thread clones buffer,
+      publishes the latest anchor to /dev/shm, then forks a subprocess to write
 
 At most one checkpoint persist is in progress at any time. When a new checkpoint
 triggers, the training thread waits for the previous persist to finish before
@@ -17,19 +18,22 @@ Usage:
     anchor.shutdown()
 """
 
+import hashlib
 import os
-import time
+import logging
 import queue
 import threading
-import logging
+import time
+from collections import OrderedDict
 
 import torch
-from collections import OrderedDict
+
+from .log_based_utils import _atomic_save_state_dict_safetensors
 
 logger = logging.getLogger(__name__)
 
 
-def _subprocess_write_checkpoint(state_dict, save_path):
+def _subprocess_write_checkpoint(state_dict, save_path, step):
     """Write checkpoint in forked subprocess (independent GIL).
 
     Called only in the child process after os.fork(). Must NOT touch any CUDA
@@ -37,23 +41,45 @@ def _subprocess_write_checkpoint(state_dict, save_path):
     or CUDA cleanup.
     """
     try:
-        from safetensors.torch import save_file
-        save_file(state_dict, save_path)
+        _atomic_save_state_dict_safetensors(
+            state_dict,
+            save_path,
+            metadata={
+                "base_step": int(step),
+                "committed_step": int(step),
+            },
+        )
     except Exception:
-        import torch
-        fallback_path = save_path.replace('.safetensors', '.bin')
-        torch.save(state_dict, fallback_path)
+        os._exit(1)
     os._exit(0)
 
 
 class _PersistJob:
     """A pending CPU→disk persist job."""
-    __slots__ = ['step', 'output_dir', 'copy_done_event']
+    __slots__ = [
+        'step',
+        'output_dir',
+        'copy_start_event',
+        'copy_done_event',
+        'uses_cuda',
+        'd2h_fallback_s',
+    ]
 
-    def __init__(self, step, output_dir, copy_done_event):
+    def __init__(
+        self,
+        step,
+        output_dir,
+        copy_start_event,
+        copy_done_event,
+        uses_cuda,
+        d2h_fallback_s=0.0,
+    ):
         self.step = step
         self.output_dir = output_dir
+        self.copy_start_event = copy_start_event
         self.copy_done_event = copy_done_event
+        self.uses_cuda = uses_cuda
+        self.d2h_fallback_s = d2h_fallback_s
 
 
 class AsyncAnchorCheckpointer:
@@ -61,8 +87,9 @@ class AsyncAnchorCheckpointer:
 
     Pre-allocates a single CPU pinned buffer matching the model size.
     At anchor steps, async-copies GPU params to the pinned buffer via a
-    dedicated CUDA stream, then a background thread persists the buffer
-    to disk as model.safetensors.
+    dedicated CUDA stream, then a background thread first publishes
+    `/dev/shm/zo_anchor_latest_<hash>.safetensors` and finally persists
+    the same snapshot to disk as `model.safetensors`.
 
     Args:
         model: nn.Module (used to determine param shapes/dtypes)
@@ -74,6 +101,9 @@ class AsyncAnchorCheckpointer:
 
     def __init__(self, model, checkpoint_dir, tied_groups=None):
         self._checkpoint_dir = checkpoint_dir
+        self._anchor_latest_path = (
+            f"/dev/shm/zo_anchor_latest_{hashlib.md5(checkpoint_dir.encode()).hexdigest()[:8]}.safetensors"
+        )
 
         # Compute excluded keys from tied weight groups (keep first, exclude rest)
         self._excluded_keys = set()
@@ -88,7 +118,6 @@ class AsyncAnchorCheckpointer:
 
         # Pre-allocate single pinned buffer (excluding tied weight duplicates)
         self._pinned_buffer = OrderedDict()
-        self._copy_done_event = torch.cuda.Event()
 
         state_dict = model.state_dict()
         for name, tensor in state_dict.items():
@@ -112,6 +141,7 @@ class AsyncAnchorCheckpointer:
         # Completion tracking (protected by _lock)
         self._latest_completed_step = -1
         self._latest_completed_path = None
+        self._latest_published_step = -1
 
         # Background persist thread
         self._persist_queue = queue.Queue()
@@ -122,8 +152,9 @@ class AsyncAnchorCheckpointer:
 
         # Stats
         self._anchors_saved = 0
-        self._copy_times = []
-        self._persist_times = []
+        self._enqueue_times = []
+        self._d2h_times = []
+        self._cpu_persist_total_times = []
 
         total_bytes = sum(
             t.numel() * t.element_size() for t in self._pinned_buffer.values()
@@ -158,41 +189,50 @@ class AsyncAnchorCheckpointer:
         state_dict = model.state_dict()
         t_sd = time.time() - t_sd_start
 
-        event = self._copy_done_event
         pinned = self._pinned_buffer
 
         # Phase 1: async copy on dedicated CUDA stream
         t_copy_start = time.time()
         has_cuda = any(t.is_cuda for t in state_dict.values())
         if has_cuda:
+            copy_start_event = torch.cuda.Event(enable_timing=True)
+            copy_done_event = torch.cuda.Event(enable_timing=True)
             with torch.cuda.stream(self._ckpt_stream):
+                copy_start_event.record()
                 for name in pinned:
                     pinned[name].copy_(state_dict[name], non_blocking=True)
-                event.record()
+                copy_done_event.record()
             # GPU-side barrier: default stream waits for copy to finish
             # before next training step modifies the parameters.
             # This is a GPU-side dependency only — the CPU thread continues
             # immediately, so training never stalls on the CPU side.
             torch.cuda.current_stream().wait_stream(self._ckpt_stream)
         else:
+            copy_start_event = None
+            copy_done_event = None
             # All tensors on CPU (e.g. ZO2 offloading) — direct copy
             for name in pinned:
                 pinned[name].copy_(state_dict[name])
-            event.record()
         t_copy = time.time() - t_copy_start
 
         # Queue Phase 2 (CPU→disk) for background thread
         self._persist_queue.put(
-            _PersistJob(step, output_dir, event)
+            _PersistJob(
+                step=step,
+                output_dir=output_dir,
+                copy_start_event=copy_start_event,
+                copy_done_event=copy_done_event,
+                uses_cuda=has_cuda,
+                d2h_fallback_s=t_copy,
+            )
         )
         self._anchors_saved += 1
         t_total = time.time() - t_lock_start
-        self._copy_times.append(t_total)
+        self._enqueue_times.append(t_total)
 
         logger.info(
             f"[AsyncAnchor] Queued anchor step {step} "
-            f"(lock={t_lock:.3f}s, state_dict={t_sd:.3f}s, "
-            f"copy={t_copy:.3f}s, total_enqueue={t_total:.3f}s)"
+            f"(enqueue_cpu={t_total:.3f}s, wait={t_lock:.3f}s, state_dict={t_sd:.3f}s, launch={t_copy:.3f}s)"
         )
         return True
 
@@ -205,6 +245,13 @@ class AsyncAnchorCheckpointer:
         """Path of the most recent fully-persisted anchor (None if none)."""
         with self._lock:
             return self._latest_completed_path
+
+    def get_latest_published_anchor_step(self) -> int:
+        with self._lock:
+            return self._latest_published_step
+
+    def get_anchor_latest_path(self):
+        return self._anchor_latest_path
 
     def wait_for_completion(self):
         """Block until all pending persists finish."""
@@ -224,13 +271,20 @@ class AsyncAnchorCheckpointer:
         """Checkpoint statistics."""
         return {
             'anchors_saved': self._anchors_saved,
-            'avg_copy_time': (
-                sum(self._copy_times) / len(self._copy_times)
-                if self._copy_times else 0
+            'enqueue_cpu_count': len(self._enqueue_times),
+            'avg_enqueue_cpu_time': (
+                sum(self._enqueue_times) / len(self._enqueue_times)
+                if self._enqueue_times else 0
             ),
-            'avg_persist_time': (
-                sum(self._persist_times) / len(self._persist_times)
-                if self._persist_times else 0
+            'd2h_count': len(self._d2h_times),
+            'avg_d2h_time': (
+                sum(self._d2h_times) / len(self._d2h_times)
+                if self._d2h_times else 0
+            ),
+            'cpu_persist_total_count': len(self._cpu_persist_total_times),
+            'avg_cpu_persist_total_time': (
+                sum(self._cpu_persist_total_times) / len(self._cpu_persist_total_times)
+                if self._cpu_persist_total_times else 0
             ),
         }
 
@@ -259,17 +313,32 @@ class AsyncAnchorCheckpointer:
             job = item
             # Block here until GPU→CPU DMA completes — this is the ONLY
             # place that calls synchronize, never in the training thread.
-            job.copy_done_event.synchronize()
+            if job.uses_cuda:
+                job.copy_done_event.synchronize()
+                d2h_s = job.copy_start_event.elapsed_time(job.copy_done_event) / 1000.0
+            else:
+                d2h_s = job.d2h_fallback_s
+            cpu_ready_t0 = time.time()
 
             # Phase 2a: Clone pinned buffer → regular CPU memory.
-            t_clone_start = time.time()
             snapshot = {name: tensor.clone() for name, tensor in self._pinned_buffer.items()}
-            t_clone = time.time() - t_clone_start
 
             # Free pinned buffer IMMEDIATELY and wake up waiting try_save.
             with self._buffer_cond:
                 self._buffer_free = True
                 self._buffer_cond.notify()
+
+            _atomic_save_state_dict_safetensors(
+                snapshot,
+                self._anchor_latest_path,
+                metadata={
+                    "base_step": int(job.step),
+                    "committed_step": int(job.step),
+                },
+            )
+            with self._lock:
+                if job.step > self._latest_published_step:
+                    self._latest_published_step = job.step
 
             # Phase 2b: Fork subprocess for disk I/O.
             os.makedirs(job.output_dir, exist_ok=True)
@@ -279,19 +348,15 @@ class AsyncAnchorCheckpointer:
             t0 = time.time()
             pid = os.fork()
             if pid == 0:
-                _subprocess_write_checkpoint(snapshot, save_path)
+                _subprocess_write_checkpoint(snapshot, save_path, job.step)
                 os._exit(1)  # Safety net
             else:
                 del snapshot  # Parent doesn't need it; child has CoW copy
 
-            logger.info(
-                f"[AsyncAnchor] Forked persist for step {job.step} "
-                f"(clone={t_clone:.3f}s)"
-            )
-
             # Blocking wait — at most 1 child at a time.
             _, status = os.waitpid(pid, 0)
             t_total = time.time() - t0
+            cpu_total_s = time.time() - cpu_ready_t0
             child_ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
             if child_ok:
                 if force_fsync:
@@ -306,7 +371,7 @@ class AsyncAnchorCheckpointer:
                         self._latest_completed_path = job.output_dir
                 logger.info(
                     f"[AsyncAnchor] Persisted step {job.step} "
-                    f"(clone={t_clone:.3f}s, total={t_total:.3f}s) "
+                    f"(d2h={d2h_s:.3f}s, cpu_total={cpu_total_s:.3f}s) "
                     f"→ {save_path}"
                 )
             else:
@@ -321,5 +386,6 @@ class AsyncAnchorCheckpointer:
                         f"{os.WEXITSTATUS(status) if os.WIFEXITED(status) else '?'} "
                         f"for step {job.step}"
                     )
-            self._persist_times.append(t_total)
+            self._d2h_times.append(d2h_s)
+            self._cpu_persist_total_times.append(cpu_total_s)
             self._persist_done.set()  # Allow next checkpoint

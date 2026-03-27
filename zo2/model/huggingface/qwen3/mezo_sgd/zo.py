@@ -1,6 +1,7 @@
 # Copyright (c) 2025 liangyuwang
 # Licensed under the Apache License, Version 2.0
 
+import os
 import torch
 import torch.nn as nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
@@ -146,6 +147,23 @@ class Qwen3ForCausalLM(modeling_qwen3.Qwen3ForCausalLM, Qwen3PreTrainedModel, Ba
 
 
 class OptimizerQwen3ForCausalLM(MeZOSGD):
+    def _resolve_logits_to_keep(self, logits_to_keep, option_len):
+        if os.environ.get("ZO_TRIM_OPTION_LOGITS", "1") != "1":
+            return logits_to_keep
+        if not isinstance(logits_to_keep, int) or logits_to_keep != 0 or option_len is None:
+            return logits_to_keep
+
+        if isinstance(option_len, torch.Tensor):
+            if option_len.numel() == 0:
+                return logits_to_keep
+            max_option_len = int(option_len.max().item())
+        else:
+            if len(option_len) == 0:
+                return logits_to_keep
+            max_option_len = int(max(option_len))
+
+        # To score the last N target tokens we only need the last N+1 logits.
+        return max_option_len + 1 if max_option_len > 0 else logits_to_keep
     
     @torch.inference_mode
     def inner_zo_forward(
@@ -187,6 +205,7 @@ class OptimizerQwen3ForCausalLM(MeZOSGD):
         )
 
         hidden_states = outputs.last_hidden_state
+        logits_to_keep = self._resolve_logits_to_keep(logits_to_keep, kwargs.get("option_len"))
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
         logits = self.model.lm_head(hidden_states[:, slice_indices, :])
@@ -231,6 +250,7 @@ class OptimizerQwen3ForCausalLM(MeZOSGD):
                 input_ids, logits, labels = pre_hook_fn(self.model, input_ids, logits, labels)
 
         if self.model.zo_custom_eval_loss_fn:
+            logits_to_keep = self._resolve_logits_to_keep(logits_to_keep, kwargs.get("option_len"))
             output = eval_fn(input_ids, attention_mask, position_ids, 
                 past_key_values, inputs_embeds, None, use_cache, 
                 output_attentions, output_hidden_states, 

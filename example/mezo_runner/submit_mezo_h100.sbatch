@@ -28,7 +28,7 @@ export STEPS=${STEPS:-1000}
 export EVAL_STEPS=${EVAL_STEPS:-100}
 export SAVE_STEPS=${SAVE_STEPS:-1}
 export DO_EVAL=${DO_EVAL:-0}
-export BATCHDIFF_CKPT=${BATCHDIFF_CKPT:-0}
+export LOG_BASED_CKPT=${LOG_BASED_CKPT:-0}
 export DTYPE=${DTYPE:-fp16}
 
 # 其他默认参数
@@ -41,10 +41,10 @@ export EVAL=${EVAL:-1000}
 export ENABLE_SHADOW=${ENABLE_SHADOW:-0}
 export INSTANT_RECOVER=${INSTANT_RECOVER:-0}
 export GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
-export BATCHDIFF_RESUME=${BATCHDIFF_RESUME:-""}
-export BATCHDIFF_REPLAY_DEVICE=${BATCHDIFF_REPLAY_DEVICE:-cuda}
-export BATCHDIFF_SIMULATE_PERTURBATION=${BATCHDIFF_SIMULATE_PERTURBATION:-1}
-export BATCHDIFF_REPLAY_FP32=${BATCHDIFF_REPLAY_FP32:-0}
+export LOG_BASED_RESUME=${LOG_BASED_RESUME:-""}
+export LOG_BASED_REPLAY_DEVICE=${LOG_BASED_REPLAY_DEVICE:-cuda}
+export LOG_BASED_SIMULATE_PERTURBATION=${LOG_BASED_SIMULATE_PERTURBATION:-1}
+export LOG_BASED_REPLAY_FP32=${LOG_BASED_REPLAY_FP32:-0}
 export RESUME_CKPT=${RESUME_CKPT:-""}
 
 # GPU 设置 (SLURM 已分配，不需要手动设置 CUDA_VISIBLE_DEVICES)
@@ -59,8 +59,8 @@ MODEL_NAME="${MODEL_NAME[-1]}"
 # 构建 EXTRA_ARGS
 EXTRA_ARGS=""
 
-if [ "$BATCHDIFF_CKPT" != "-1" ]; then
-    EXTRA_ARGS="$EXTRA_ARGS --batchdiff_ckpt $BATCHDIFF_CKPT"
+if [ "$LOG_BASED_CKPT" != "-1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --log_based_ckpt $LOG_BASED_CKPT"
     if [ "$ENABLE_SHADOW" == "1" ]; then
         EXTRA_ARGS="$EXTRA_ARGS --enable_shadow"
         if [ "$INSTANT_RECOVER" == "1" ] && [ "$GPU_FAIL_STEP" != "-1" ]; then
@@ -73,13 +73,13 @@ if [ "$GPU_FAIL_STEP" != "-1" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --gpu_fail_step $GPU_FAIL_STEP"
 fi
 
-if [ -n "$BATCHDIFF_RESUME" ]; then
-    EXTRA_ARGS="$EXTRA_ARGS --batchdiff_resume $BATCHDIFF_RESUME --batchdiff_replay_device $BATCHDIFF_REPLAY_DEVICE"
-    if [ "$BATCHDIFF_SIMULATE_PERTURBATION" == "0" ]; then
-        EXTRA_ARGS="$EXTRA_ARGS --batchdiff_simulate_perturbation False"
+if [ -n "$LOG_BASED_RESUME" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --log_based_resume $LOG_BASED_RESUME --log_based_replay_device $LOG_BASED_REPLAY_DEVICE"
+    if [ "$LOG_BASED_SIMULATE_PERTURBATION" == "0" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --log_based_simulate_perturbation False"
     fi
-    if [ "$BATCHDIFF_REPLAY_FP32" == "1" ]; then
-        EXTRA_ARGS="$EXTRA_ARGS --batchdiff_replay_fp32"
+    if [ "$LOG_BASED_REPLAY_FP32" == "1" ]; then
+        EXTRA_ARGS="$EXTRA_ARGS --log_based_replay_fp32"
     fi
 elif [ -n "$RESUME_CKPT" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --resume_from_checkpoint $RESUME_CKPT"

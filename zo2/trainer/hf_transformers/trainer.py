@@ -46,6 +46,7 @@ from transformers.integrations import (
 
 import huggingface_hub.utils as hf_hub_utils
 import numpy as np
+import psutil
 import torch
 import torch.distributed as dist
 from huggingface_hub import ModelCard, create_repo, upload_folder
@@ -355,21 +356,72 @@ class ZOTrainer(Trainer):
             self.zo2_training_step_pre_hooks = []
             self.zo2_training_step_post_hooks = []
 
-        # ZO2 added: incremental checkpoint flag
-        self.use_incremental_checkpoint = False
+        # ZO2 added: log-based checkpoint flag
+        self.use_log_based_checkpoint = False
+        self._memory_debug_every = 0
+        self._memory_debug_sync = os.environ.get("ZO_MEMORY_DEBUG_SYNC", "1") != "0"
+        self._memory_debug_process = None
+
+        if self.zo and torch.cuda.is_available():
+            env_every = os.environ.get("ZO_MEMORY_DEBUG_EVERY")
+            if env_every is not None:
+                try:
+                    self._memory_debug_every = max(0, int(env_every))
+                except ValueError:
+                    logger.warning(f"[MemDebug] Invalid ZO_MEMORY_DEBUG_EVERY={env_every!r}, disabling memory debug")
+                    self._memory_debug_every = 0
+            elif os.environ.get("ZO_MEMORY_DEBUG", "0") == "1":
+                self._memory_debug_every = 1
+            elif isinstance(getattr(args, "logging_steps", 0), int) and args.logging_steps > 0:
+                self._memory_debug_every = args.logging_steps
+
+            if self._memory_debug_every > 0:
+                self._memory_debug_process = psutil.Process(os.getpid())
+                logger.info(
+                    f"[MemDebug] Enabled: every={self._memory_debug_every} steps, "
+                    f"sync={self._memory_debug_sync}"
+                )
+
+    def _memory_debug_due(self, step: int) -> bool:
+        if not self.zo or self._memory_debug_every <= 0 or not torch.cuda.is_available():
+            return False
+        return step <= 3 or step % self._memory_debug_every == 0
+
+    def _log_memory_debug(self, tag: str, step: int, *, reset_peak: bool = False) -> None:
+        if not torch.cuda.is_available():
+            return
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats()
+        if self._memory_debug_sync:
+            torch.cuda.synchronize()
+
+        alloc_mb = torch.cuda.memory_allocated() / 1024**2
+        reserved_mb = torch.cuda.memory_reserved() / 1024**2
+        peak_alloc_mb = torch.cuda.max_memory_allocated() / 1024**2
+        peak_reserved_mb = torch.cuda.max_memory_reserved() / 1024**2
+        cpu_rss_mb = 0.0
+        if self._memory_debug_process is not None:
+            cpu_rss_mb = self._memory_debug_process.memory_info().rss / 1024**2
+
+        logger.info(
+            f"[MemDebug] step={step} {tag} | "
+            f"GPU alloc={alloc_mb:.0f}MB rsv={reserved_mb:.0f}MB "
+            f"peak_alloc={peak_alloc_mb:.0f}MB peak_rsv={peak_reserved_mb:.0f}MB "
+            f"| CPU RSS={cpu_rss_mb:.0f}MB"
+        )
 
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
         """
-        Override: skip model weight loading when batchdiff resume is active,
+        Override: skip model weight loading when log-based resume is active,
         since the model weights have already been recovered via replay.
         For standard resume (RESUME_CKPT), add timing measurement.
         """
-        if getattr(self.args, "batchdiff_resume", ""):
-            logger.info("[BatchDiff Resume] Skipping _load_from_checkpoint (model already recovered via replay)")
+        if getattr(self.args, "log_based_resume", ""):
+            logger.info("[LogBased Resume] Skipping _load_from_checkpoint (model already recovered via replay)")
             return
 
-        # Detect diff checkpoint mismatch: checkpoint has no model files but has
-        # ZO replay metadata, meaning it was saved with batch_size>=0 (differential mode).
+        # Detect log-based checkpoint mismatch: checkpoint has no model files but has
+        # ZO replay metadata, meaning it was saved with batch_size>=0.
         # If the current run uses batch_size=-1 (disabled), this is a configuration error.
         if os.path.isdir(resume_from_checkpoint):
             has_model = (
@@ -383,11 +435,11 @@ class ZOTrainer(Trainer):
                 if os.path.isfile(opt_path):
                     raise ValueError(
                         f"[Resume Error] The checkpoint at {resume_from_checkpoint} appears to be "
-                        f"a differential checkpoint (no model files, but has ZO replay metadata). "
-                        f"This means the previous run used differential checkpointing (batch_size>=0), "
+                        f"a log-based checkpoint (no model files, but has ZO replay metadata). "
+                        f"This means the previous run used log-based checkpointing (batch_size>=0), "
                         f"but the current run has batch_size=-1 (disabled). To fix this:\n"
                         f"  1. Use the same batch_size as the previous run (e.g. batch_size=0), OR\n"
-                        f"  2. Use --batchdiff_resume={resume_from_checkpoint} for explicit replay-based recovery, OR\n"
+                        f"  2. Use --log_based_resume={resume_from_checkpoint} for explicit replay-based recovery, OR\n"
                         f"  3. Use --overwrite_output_dir to start fresh training."
                     )
 
@@ -403,6 +455,7 @@ class ZOTrainer(Trainer):
     ):
         """Override to measure total checkpoint time (including on_save callback)."""
         import time as time_module
+        step = self.state.global_step
 
         # Let parent handle log and evaluate, but intercept the save block
         # --- Log ---
@@ -430,18 +483,36 @@ class ZOTrainer(Trainer):
         # --- Evaluate ---
         metrics = None
         if self.control.should_evaluate:
+            if self._memory_debug_due(step):
+                self._log_memory_debug("before_evaluate", step, reset_peak=True)
             metrics = self._evaluate(trial, ignore_keys_for_eval)
+            if self._memory_debug_due(step):
+                self._log_memory_debug("after_evaluate", step)
             is_new_best_metric = self._determine_best_metric(metrics=metrics, trial=trial)
             if self.args.save_strategy == SaveStrategy.BEST:
                 self.control.should_save = is_new_best_metric
 
         # --- Save (with timing) ---
         if self.control.should_save:
+            if self._memory_debug_due(step):
+                self._log_memory_debug("before_save", step, reset_peak=True)
             t_ckpt_start = time_module.time()
             self._save_checkpoint(model, trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
             t_ckpt_elapsed = time_module.time() - t_ckpt_start
-            logger.info(f"[ZOTrainer] Checkpoint at step {self.state.global_step} took {t_ckpt_elapsed:.3f}s")
+            log_based_callback = None
+            from .log_based_checkpoint import LogBasedCheckpointCallback
+
+            for callback in self.callback_handler.callbacks:
+                if isinstance(callback, LogBasedCheckpointCallback):
+                    log_based_callback = callback
+                    break
+            if self._memory_debug_due(step):
+                self._log_memory_debug("after_save", step)
+            if log_based_callback is not None and not log_based_callback.enable_shadow:
+                log_based_callback.timing_stats['checkpoint_total_times'].append(t_ckpt_elapsed)
+            if log_based_callback is None or not log_based_callback.enable_shadow:
+                logger.info(f"[ZOTrainer] Checkpoint at step {self.state.global_step} took {t_ckpt_elapsed:.3f}s")
 
     def _save_checkpoint(self, model, trial, metrics=None):
         """
@@ -449,139 +520,135 @@ class ZOTrainer(Trainer):
         zo_update_history). On full checkpoint steps, also save model files via Trainer.
         For batch_size = -1 (disabled), falls through to default Trainer save.
         """
-        from .batch_differential_checkpoint import BatchDiffCheckpointCallback
+        from .log_based_checkpoint import LogBasedCheckpointCallback
 
-        # Check if batch differential checkpoint callback is registered
-        batchdiff_callback = None
+        # Check if the log-based checkpoint callback is registered
+        log_based_callback = None
         for callback in self.callback_handler.callbacks:
-            if isinstance(callback, BatchDiffCheckpointCallback):
-                batchdiff_callback = callback
-                self.use_incremental_checkpoint = True
+            if isinstance(callback, LogBasedCheckpointCallback):
+                log_based_callback = callback
+                self.use_log_based_checkpoint = True
                 break
 
-        if self.use_incremental_checkpoint and batchdiff_callback is not None and batchdiff_callback.batch_size >= 0:
+        if self.use_log_based_checkpoint and log_based_callback is not None and log_based_callback.batch_size >= 0:
             # Unified log-based save for all batch_size >= 0 modes
-            batch_size = batchdiff_callback.batch_size
+            batch_size = log_based_callback.batch_size
 
             # Async anchor: check if a background persist completed and update base
             async_anchor = getattr(self, '_async_anchor', None)
             if async_anchor is not None and batch_size >= 1:
                 completed_step = async_anchor.get_latest_completed_anchor_step()
-                if completed_step > batchdiff_callback.base_checkpoint_step:
+                if completed_step > log_based_callback.base_checkpoint_step:
                     completed_path = async_anchor.get_latest_completed_anchor_path()
-                    batchdiff_callback.base_checkpoint_path = completed_path
-                    batchdiff_callback.base_checkpoint_step = completed_step
-                    with batchdiff_callback.update_lock:
-                        # Capture base_pending_seed from the completed step's entry before trimming
-                        for u in reversed(batchdiff_callback.update_history):
-                            if u['step'] <= completed_step:
-                                batchdiff_callback._base_pending_seed = u['seed']
-                                break
-                        batchdiff_callback.update_history = [
-                            u for u in batchdiff_callback.update_history
-                            if u['step'] > completed_step
-                        ]
+                    log_based_callback.on_async_anchor_persisted(completed_step, completed_path)
                     logger.info(f"[AsyncAnchor] Base updated to step {completed_step}, "
-                               f"trimmed to {len(batchdiff_callback.update_history)} entries")
+                               f"trimmed to {len(log_based_callback.update_history)} entries")
 
             # Determine if this is a full checkpoint step (batch_size >= 1 only)
             is_full_step = False
             if batch_size >= 1:
                 if async_anchor is not None:
                     # Use last-attempted step for scheduling to avoid repeated triggers
-                    effective_base = getattr(batchdiff_callback, '_async_anchor_last_attempted',
-                                             batchdiff_callback.base_checkpoint_step)
+                    effective_base = getattr(log_based_callback, '_async_anchor_last_attempted',
+                                             log_based_callback.base_checkpoint_step)
                     steps_since_base = self.state.global_step - effective_base
                 else:
-                    steps_since_base = self.state.global_step - batchdiff_callback.base_checkpoint_step
+                    steps_since_base = self.state.global_step - log_based_callback.base_checkpoint_step
                 is_full_step = (steps_since_base >= batch_size)
 
-            # Choose output directory: log checkpoints → log_output_dir, full → output_dir
-            # With async anchor, ALL log files (optimizer.pt etc.) go to log_output_dir
-            # even on full steps — model.safetensors is written separately by the subprocess.
-            # Without this, skipped anchors cause is_full_step=True on every step,
-            # routing all I/O to the slow OUTPUT_ROOT filesystem.
+            # With shadow enabled, redo logs stay in memory/IPC only.
+            # Without shadow, per-step log checkpoints are still persisted and may use a separate log dir.
             checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
             log_output_dir = getattr(self, '_log_output_dir', None)
-            if log_output_dir and (not is_full_step or async_anchor is not None):
+            shadow_keeps_log_only = async_anchor is not None and log_based_callback.enable_shadow
+            if log_output_dir and not shadow_keeps_log_only and (not is_full_step or async_anchor is not None):
                 run_dir = log_output_dir
             else:
                 run_dir = self._get_output_dir(trial=trial)
             output_dir = os.path.join(run_dir, checkpoint_folder)
-            os.makedirs(output_dir, exist_ok=True)
+            if (not shadow_keeps_log_only) or is_full_step:
+                os.makedirs(output_dir, exist_ok=True)
 
-            # Save trainer state
-            self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
+            if not shadow_keeps_log_only:
+                # Save trainer state
+                self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
 
-            # Save scheduler state
-            if self.lr_scheduler is not None:
-                torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+                # Save scheduler state
+                if self.lr_scheduler is not None:
+                    torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
 
-            # Save RNG state for deterministic resume
-            self._save_rng_state(output_dir)
+                # Save RNG state for deterministic resume
+                self._save_rng_state(output_dir)
 
-            with batchdiff_callback.update_lock:
-                updates = batchdiff_callback.update_history.copy()
+                with log_based_callback.update_lock:
+                    updates = log_based_callback.update_history.copy()
 
-            # Detect model dtype for replay consistency
-            model_dtype = None
-            for p in model.parameters():
-                model_dtype = str(p.dtype)  # e.g. "torch.float16"
-                break
+                # Detect model dtype for replay consistency
+                model_dtype = None
+                for p in model.parameters():
+                    model_dtype = str(p.dtype)  # e.g. "torch.float16"
+                    break
 
-            # Get the default optimizer state dict
-            optimizer_state = self.optimizer.state_dict()
+                # Get the default optimizer state dict
+                optimizer_state = self.optimizer.state_dict()
 
-            # Add zo_update_history and metadata for replay
-            optimizer_state['zo_update_history'] = updates
-            if batch_size == 0:
-                optimizer_state['base_checkpoint'] = '__initial__'
+                # Add zo_update_history and metadata for replay
+                optimizer_state['zo_update_history'] = updates
+                if batch_size == 0:
+                    optimizer_state['base_checkpoint'] = '__initial__'
+                else:
+                    optimizer_state['base_checkpoint'] = log_based_callback.base_checkpoint_path
+                optimizer_state['current_step'] = self.state.global_step
+                optimizer_state['batch_size'] = batch_size
+                optimizer_state['num_updates'] = len(updates)
+                optimizer_state['tied_weights'] = getattr(log_based_callback, '_tied_weight_groups', [])
+                optimizer_state['model_dtype'] = model_dtype
+                optimizer_state['pending_grad'] = getattr(log_based_callback, '_pending_grad', 0.0)
+                optimizer_state['pending_seed'] = getattr(log_based_callback, '_pending_seed', 0)
+                optimizer_state['base_pending_seed'] = getattr(log_based_callback, '_base_pending_seed', 0)
+                optimizer_state['zo2'] = hasattr(model, 'opt') and hasattr(model.opt, 'rstate_queue')
+                optimizer_state['trainable_param_names'] = getattr(log_based_callback, '_trainable_param_names', None)
+                # With async anchor, is_full_checkpoint is always False because
+                # model.safetensors may not be on disk yet when optimizer.pt is written.
+                # Recovery will use the replay path (base + redo log) which is always correct.
+                if async_anchor is not None:
+                    optimizer_state['is_full_checkpoint'] = False
+                else:
+                    optimizer_state['is_full_checkpoint'] = is_full_step
+
+                # Save zo_eps for replay: needed to simulate fp16 perturbation residuals
+                zo_eps = getattr(model.opt, 'zo_eps', 0.0) if hasattr(model, 'opt') else 0.0
+                optimizer_state['zo_eps'] = zo_eps
+
+                # Save rng_device for replay: ensures replay uses same RNG device as training
+                rng_device = getattr(model.opt, 'rng_device', 'native') if hasattr(model, 'opt') else 'native'
+                optimizer_state['rng_device'] = rng_device
+
+                # Save zo_method for Adam detection during replay
+                zo_method = 'mezo-sgd'
+                if hasattr(model, 'opt') and hasattr(model.opt, 'betas'):
+                    zo_method = 'mezo-adam'
+                    optimizer_state['adam_betas'] = model.opt.betas
+                    optimizer_state['adam_eps_value'] = model.opt.adam_eps
+                optimizer_state['zo_method'] = zo_method
+
+                opt_path = os.path.join(output_dir, OPTIMIZER_NAME)
+                torch.save(optimizer_state, opt_path)
+                from .log_based_utils import _fsync_file
+                _fsync_file(opt_path)
+                log_based_callback.disk_log_save_count += 1
+                logger.info(
+                    f"[ZOTrainer] Saved {len(updates)} updates to disk, "
+                    f"pending_grad={optimizer_state['pending_grad']:.6e}, is_full_step={is_full_step}"
+                )
             else:
-                optimizer_state['base_checkpoint'] = batchdiff_callback.base_checkpoint_path
-            optimizer_state['current_step'] = self.state.global_step
-            optimizer_state['batch_size'] = batch_size
-            optimizer_state['num_updates'] = len(updates)
-            optimizer_state['tied_weights'] = getattr(batchdiff_callback, '_tied_weight_groups', [])
-            optimizer_state['model_dtype'] = model_dtype
-            optimizer_state['pending_grad'] = getattr(batchdiff_callback, '_pending_grad', 0.0)
-            optimizer_state['pending_seed'] = getattr(batchdiff_callback, '_pending_seed', 0)
-            optimizer_state['base_pending_seed'] = getattr(batchdiff_callback, '_base_pending_seed', 0)
-            optimizer_state['zo2'] = hasattr(model, 'opt') and hasattr(model.opt, 'rstate_queue')
-            optimizer_state['trainable_param_names'] = getattr(batchdiff_callback, '_trainable_param_names', None)
-            # With async anchor, is_full_checkpoint is always False because
-            # model.safetensors may not be on disk yet when optimizer.pt is written.
-            # Recovery will use the replay path (base + redo log) which is always correct.
-            if async_anchor is not None:
-                optimizer_state['is_full_checkpoint'] = False
-            else:
-                optimizer_state['is_full_checkpoint'] = is_full_step
-
-            # Save zo_eps for replay: needed to simulate fp16 perturbation residuals
-            zo_eps = getattr(model.opt, 'zo_eps', 0.0) if hasattr(model, 'opt') else 0.0
-            optimizer_state['zo_eps'] = zo_eps
-
-            # Save rng_device for replay: ensures replay uses same RNG device as training
-            rng_device = getattr(model.opt, 'rng_device', 'native') if hasattr(model, 'opt') else 'native'
-            optimizer_state['rng_device'] = rng_device
-
-            # Save zo_method for Adam detection during replay
-            zo_method = 'mezo-sgd'
-            if hasattr(model, 'opt') and hasattr(model.opt, 'betas'):
-                zo_method = 'mezo-adam'
-                optimizer_state['adam_betas'] = model.opt.betas
-                optimizer_state['adam_eps_value'] = model.opt.adam_eps
-            optimizer_state['zo_method'] = zo_method
-
-            opt_path = os.path.join(output_dir, OPTIMIZER_NAME)
-            torch.save(optimizer_state, opt_path)
-            from .batch_differential_checkpoint import _fsync_file
-            _fsync_file(opt_path)
-            logger.info(f"[ZOTrainer] Saved {len(updates)} updates, pending_grad={optimizer_state['pending_grad']:.6e}"
-                        f", is_full_step={is_full_step}")
+                logger.info(
+                    f"[ZOTrainer] Shadow-only log at step {self.state.global_step}; disk log persistence skipped"
+                )
 
             if is_full_step:
                 if async_anchor is not None:
-                    # Async path: anchor model.safetensors → OUTPUT_ROOT (not OUTPUT_LOG)
+                    # Async path: anchor model.safetensors is persisted in the same checkpoint dir.
                     anchor_run_dir = self._get_output_dir(trial=trial)
                     anchor_output_dir = os.path.join(anchor_run_dir, checkpoint_folder)
                     accepted = async_anchor.try_save_full_checkpoint(
@@ -590,8 +657,9 @@ class ZOTrainer(Trainer):
                     # triggering is_full_step on every subsequent step.
                     # A rejected anchor simply means we skip this one and try again
                     # batch_size steps later (redo log guarantees recoverability).
-                    batchdiff_callback._async_anchor_last_attempted = self.state.global_step
+                    log_based_callback._async_anchor_last_attempted = self.state.global_step
                     if accepted:
+                        log_based_callback.full_anchor_save_count += 1
                         logger.info(f"[AsyncAnchor] Async anchor queued at step {self.state.global_step}")
                     else:
                         logger.info(f"[AsyncAnchor] Anchor skipped at step {self.state.global_step}, "
@@ -600,20 +668,21 @@ class ZOTrainer(Trainer):
                 else:
                     # Sync path: save model files via Trainer, then clear history
                     super()._save_checkpoint(model, trial)
+                    log_based_callback.full_anchor_save_count += 1
                     # Update callback state
-                    batchdiff_callback.base_checkpoint_path = output_dir
-                    batchdiff_callback.base_checkpoint_step = self.state.global_step
-                    batchdiff_callback._base_pending_seed = batchdiff_callback._pending_seed
-                    with batchdiff_callback.update_lock:
-                        batchdiff_callback.update_history = []
+                    log_based_callback.base_checkpoint_path = output_dir
+                    log_based_callback.base_checkpoint_step = self.state.global_step
+                    log_based_callback._base_pending_seed = log_based_callback._pending_seed
+                    with log_based_callback.update_lock:
+                        log_based_callback.update_history = []
                     logger.info(f"[ZOTrainer] Full checkpoint at step {self.state.global_step}, cleared update history")
             # Log checkpoint step: only optimizer.pt + metadata saved above, no model files created
             return
 
-        # Default behavior: save full checkpoint (when NOT using incremental checkpoint)
+        # Default behavior: save full checkpoint when log-based checkpointing is disabled
         super()._save_checkpoint(model, trial)
         # Fsync full checkpoint directory for L0 baseline
-        from .batch_differential_checkpoint import _fsync_directory
+        from .log_based_utils import _fsync_directory
         run_dir = self._get_output_dir(trial=trial)
         ckpt_dir = os.path.join(run_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
         _fsync_directory(ckpt_dir)
@@ -1280,15 +1349,27 @@ class ZOTrainer(Trainer):
         self.zo2_training_step_post_hooks.append(hook_fn)
 
     def zo2_training_step(self, model: nn.Module, inputs: dict[str, Union[torch.Tensor, Any]]) -> torch.Tensor:
+        step = self.state.global_step + 1
+        mem_debug = self._memory_debug_due(step)
+        if mem_debug:
+            self._log_memory_debug("step_start", step, reset_peak=True)
         if self.zo2_training_step_pre_hooks != []:
             for pre_hook_fn in self.zo2_training_step_pre_hooks:
                 model, inputs = pre_hook_fn(model, inputs)
+        if mem_debug:
+            self._log_memory_debug("after_pre_hooks", step)
         model.zo_train()
         inputs = self._prepare_inputs(inputs)
+        if mem_debug:
+            self._log_memory_debug("after_prepare_inputs", step)
         loss = model(**inputs)
+        if mem_debug:
+            self._log_memory_debug("after_model_forward", step)
         model.zo_eval()
         if self.zo2_training_step_post_hooks != []:
             for post_hook_fn in self.zo2_training_step_post_hooks:
                 model, inputs, loss = post_hook_fn(model, inputs, loss)
+        if mem_debug:
+            self._log_memory_debug("after_post_hooks", step)
         return loss
     

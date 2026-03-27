@@ -1,472 +1,791 @@
-# Checkpoint 模式流程图与代码分析
+# Log-Based Checkpoint 架构与流程
 
-## 模式总览
+本文档只覆盖和 checkpoint / replay / RNG / shadow / failure injection / async anchor 直接相关的逻辑。
+不展开训练算法本身，也不展开 `zo` / `zo2` 的推导细节。
 
-```
-BATCHDIFF_CKPT 参数值
-├── -1  ：Full Checkpoint（禁用 log，使用默认 Trainer 保存）
-├──  0  ：Log-based（每次保存都累积从初始模型开始的全部 update log）
-└── >=1 ：Full + Log（每 N 步保存完整模型，中间步只保存 update log）
-              └─ 可选: enable_shadow（CPU 实时 shadow 模型，用于即时恢复）
+## 0. 当前实现说明
 
-enable_shadow 只对 batch_size>=1 有效（默认关闭）。
-batch_size<=0 时 enable_shadow 强制关闭。
-```
+当前 `shadow` / `async anchor latest` 已经不再使用 PyTorch shared memory、`torch_shm_manager`、`resource_tracker`、manifest、step file。
 
----
+现在的语义是：
 
-## 模式 1: `batch_size = -1`（Full Checkpoint / 禁用）
+- shadow 子进程只维护一份普通 CPU working copy
+- committed shadow 通过 `safetensors` 原子写到 `/dev/shm/zo_shadow_latest_<hash>.safetensors`
+- async anchor latest 通过 `safetensors` 原子写到 `/dev/shm/zo_anchor_latest_<hash>.safetensors`
+- `base_step` / `committed_step` 写在 safetensors metadata 里
+- soft recovery / resume 直接读这些 safetensors 文件，不再读 shm handle manifest
 
-### 目标
-禁用差分检查点，使用 HuggingFace Trainer 的默认保存机制。
+下面仍然提到 manifest / shm / resource_tracker 的段落是旧设计，待继续清理；以代码实现为准。
 
-### 流程
+## 1. 文件边界
 
-```
-训练开始 (on_train_begin)
-│
-├─ batch_size < 0 → 直接 return（不缓存模型、不注册 hook）
-│
-├─ 保存检查点: trainer._save_checkpoint()
-│   ├─ batch_size < 0 → 跳过自定义逻辑
-│   └─ super()._save_checkpoint(model, trial) → 默认 Trainer 保存
-│
-└─ 结果：标准 checkpoint 目录（model.safetensors + optimizer.pt + 其他）
-```
+| 文件 | 主要职责 | 关键函数 / 方法 |
+|------|----------|-----------------|
+| `zo2/trainer/hf_transformers/log_based_checkpoint.py` | 训练期 callback、运行期状态、shadow orchestration、兼容别名 | `LogBasedCheckpointCallback.on_train_begin` / `_cache_initial_model` / `_init_for_resume` / `_start_shadow_process` / `_zo_update_hook` / `recover_from_shadow` / `_reconstruct_on_demand` / `get_recovery_status` / `on_save` / `on_train_end` |
+| `zo2/trainer/hf_transformers/log_based_resume.py` | checkpoint 读取、base model 选择、replay 恢复入口 | `load_log_based_checkpoint` / `_load_base_state` / `resume_from_log_based` |
+| `zo2/trainer/hf_transformers/log_based_replay.py` | 当前仍在使用的串行 replay 主路径；按环境变量分发到 legacy replay | `_generate_z_for_replay` / `_generate_z_for_one_step` / `_apply_single_update` / `_apply_single_update_with_pregenerated_z` / `_replay_updates_on_state` |
+| `zo2/trainer/hf_transformers/legacy_pipeline_closed_form_replay.py` | 已废弃但暂留的 pipelined replay 和 closed-form replay | `_parallel_replay_updates_on_state` / `_closedform_replay_on_state` / `validate_closedform_replay` |
+| `zo2/trainer/hf_transformers/log_based_shadow.py` | shadow 子进程入口、串行/pipelined shadow、shadow safetensors 读写 | `_shadow_process_main` / `_shadow_process_serial` / `_shadow_process_pipelined` / `_commit_shadow_state` / `_load_shadow_replica` |
+| `zo2/trainer/hf_transformers/log_based_failure_injection.py` | GPU 故障注入、`SIGKILL` 顺序控制 | `GPUFailureSimulator.set_fail_step` / `check_and_fail` / `trigger_failure` |
+| `zo2/trainer/hf_transformers/log_based_utils.py` | tied weights、fsync、内存统计、线程快照 | `_detect_tied_weights` / `_tie_state_dict_inplace` / `_restore_tied_weights` / `_fsync_file` / `_fsync_directory` / `_log_memory` / `_thread_snapshot` |
+| `zo2/trainer/hf_transformers/async_anchor_checkpoint.py` | async anchor 的 GPU→CPU→`/dev/shm latest`→disk 两阶段异步落盘 | `AsyncAnchorCheckpointer.try_save_full_checkpoint` / `_persist_worker` / `get_latest_published_anchor_step` / `get_latest_completed_anchor_step` / `shutdown` |
+| `zo2/trainer/hf_transformers/log_based_tuning.py` | shadow / replay 的 benchmark 和线程分配标定 | `calibrate_producer_consumer` / `optimize_thread_allocation` |
+| `zo2/trainer/hf_transformers/trainer.py` | HF Trainer 接线、保存 `optimizer.pt` 元数据、恢复优化器状态 | `ZOTrainer._load_from_checkpoint` / `_save_checkpoint` / `_load_optimizer_and_scheduler` |
 
----
+## 2. 运行期状态
 
-## 模式 2: `batch_size = 0`（Log-based）
+核心运行期状态都挂在 `LogBasedCheckpointCallback` 上：
 
-### 目标
-从初始预训练模型开始，累积**所有** update log。恢复时通过 replay 重建模型。
-**无 shadow**（enable_shadow 强制关闭）。
+| 状态 | 含义 | 定义位置 |
+|------|------|----------|
+| `base_checkpoint_state` | 当前 base model 的 CPU 副本；恢复和 on-demand replay 的起点 | `log_based_checkpoint.py` `LogBasedCheckpointCallback.__init__` |
+| `base_checkpoint_path` / `base_checkpoint_step` | 当前 redo log 依附的 base checkpoint 路径与步数 | `log_based_checkpoint.py` `LogBasedCheckpointCallback.__init__` |
+| `update_history` | 从 base 之后记录的 update log | `log_based_checkpoint.py` `LogBasedCheckpointCallback.__init__` |
+| `_pending_grad` | 本步新算出、下步才会真正应用的 grad | `log_based_checkpoint.py` `_zo_update_hook` |
+| `_pending_seed` | 生成 `_pending_grad` 的 seed；ZO2 恢复 RNG 用 | `log_based_checkpoint.py` `_zo_update_hook` |
+| `_base_pending_seed` | 当前 base 对应的“前置 seed”；replay 第一条 update 会用到 | `trainer.py` `_save_checkpoint` / `log_based_checkpoint.py` `on_train_end` |
+| `shadow_shared` / `shadow_model` | shadow 的共享内存张量 | `log_based_checkpoint.py` `_refresh_shadow_from_base` |
+| `shadow_step_val` | shadow 子进程共享步数计数器 | `log_based_checkpoint.py` `_start_shadow_process` |
+| `failure_simulator` | GPU 故障注入器 | `log_based_checkpoint.py` `__init__` |
+| `shadow_adam_state` | shadow 端的 CPU Adam m/v/t | `log_based_checkpoint.py` `_init_shadow_adam_state` |
 
-### 保存流程
+## 3. 模式总览
 
-```
-训练开始 (on_train_begin)
-│
-├─ [首次训练] _cache_initial_model(model)
-│   ├─ _detect_tied_weights() → 记录 tied weight groups
-│   ├─ 记录 _trainable_param_names
-│   ├─ model.state_dict() → base_checkpoint_state (CPU 副本)
-│   ├─ base_checkpoint_path = "__initial__"
-│   └─ base_checkpoint_step = 0
-│
-├─ [恢复训练] _init_for_resume(model, state, batchdiff_resume)
-│   ├─ _detect_tied_weights()、记录 _trainable_param_names
-│   ├─ 加载 optimizer.pt（一次性读取所有元数据）
-│   ├─ 恢复 pending_grad、全量 update_history
-│   ├─ base = "__initial__"、base_step = 0
-│   └─ 缓存 model.state_dict() → base_checkpoint_state (CPU)
-│
-├─ 注册 _zo_update_hook (post-hook)
-│
-│── 每一步: _zo_update_hook(model, inputs, loss)
-│   ├─ 获取 seed, applied_grad, new_grad, lr, wd, zo_eps
-│   ├─ _pending_grad = new_grad
-│   └─ if applied_grad != 0: update_history.append({step, seed, grad, lr, wd, zo_eps})
-│
-└─ 保存检查点: trainer._save_checkpoint()
-    │
-    ├─ os.makedirs(output_dir)
-    ├─ 保存 trainer_state.json, scheduler.pt, rng_state
-    │
-    ├─ batch_size = 0 → is_full_step = False
-    ├─ 复制 update_history (with update_lock)
-    ├─ 构建 optimizer_state（原始 optimizer state + zo 元数据）
-    │   └─ 元数据: zo_update_history, base_checkpoint="__initial__",
-    │             current_step, batch_size=0, num_updates,
-    │             tied_weights, model_dtype, pending_grad,
-    │             trainable_param_names, is_full_checkpoint=False,
-    │             zo_eps, rng_device
-    ├─ torch.save(optimizer_state, optimizer.pt)
-    ├─ is_full_step=False → 不调用 super()._save_checkpoint()
-    └─ return（只保存了 optimizer.pt，无模型文件）
+`LOG_BASED_CKPT` 控制 checkpoint 模式：
 
-    on_save callback:
-    ├─ save_count += 1
-    └─ 无其他操作（base 永远是初始模型，不需要更新）
+```text
+LOG_BASED_CKPT = -1   -> L0: Disabled, 使用默认 Trainer full checkpoint
+LOG_BASED_CKPT = 0    -> L1: Log-based, base 固定为 "__initial__"
+LOG_BASED_CKPT >= 1   -> L1/L2/L3: Full + Log, 每 N 步更新 base
+
+ENABLE_SHADOW=1       -> L2: 维护 CPU shadow
+INSTANT_RECOVER=1     -> L3: 配置上启用即时恢复
+GPU_FAIL_STEP>0       -> 配置故障注入，触发 SIGKILL
+ASYNC_ANCHOR=1        -> full checkpoint 改成 async anchor 语义
 ```
 
-### 恢复流程
+注意：
 
+- `enable_shadow` 对 `batch_size >= 0` 都有效。
+- 只有 `batch_size = -1` 会强制关闭 shadow。
+- `batch_size = 0` 时也允许 shadow 和 soft recovery。
+
+## 4. 训练开始阶段
+
+### 4.1 入口
+
+文件 / 函数：
+
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `LogBasedCheckpointCallback.on_train_begin`
+
+### 4.2 行为
+
+`on_train_begin` 按下面顺序初始化：
+
+1. 记录 `output_dir` 和 `trainer`。
+2. 如果 `batch_size < 0`，直接返回，只保留 L0 路径。
+3. 注册 ZO post-hook：`_zo_update_hook`。
+4. 探测 `model_dtype`，用于恢复时复用相同 dtype。
+5. 如果 `args.log_based_resume` 非空，走 `_init_for_resume`。
+6. 否则走 `_cache_initial_model`。
+7. 同步 `current_step = state.global_step`。
+8. 如果 `enable_shadow=True`，初始化 shadow 的 Adam state。
+9. 启动 shadow 子进程：`_start_shadow_process`。
+10. 打印 checkpoint / replay / shadow / thread env 配置。
+
+## 5. 初始模型缓存与 base 建立
+
+### 5.1 Fresh training
+
+文件 / 函数：
+
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `LogBasedCheckpointCallback._cache_initial_model`
+- `zo2/trainer/hf_transformers/log_based_utils.py`
+  - `_detect_tied_weights`
+  - `_fsync_file`
+
+### 5.2 逻辑
+
+`_cache_initial_model` 会做这些事：
+
+1. 检测 tied weights，记录到 `_tied_weight_groups`。
+2. 记录 trainable param 名称顺序 `_trainable_param_names`。
+3. 把 `model.state_dict()` clone 到 CPU，建立 `base_checkpoint_state`。
+4. 如果启用了 shadow：
+   - 切换到 `torch.multiprocessing.set_sharing_strategy('file_system')`
+   - 把 `base_checkpoint_state` 放到 POSIX shared memory
+   - 从 `resource_tracker` 注销 shm 文件，避免 `SIGKILL` 后被自动清理
+5. 如果启用了 shadow，调用 `_refresh_shadow_from_base` 建立 `shadow_shared`。
+6. 设置 `base_checkpoint_path="__initial__"`、`base_checkpoint_step=0`。
+7. 把 initial model 落盘到 `output_dir/initial_model/`，作为后续 resume 的本地 base cache。
+8. 保存时会剔除 tied duplicate key，避免和 HuggingFace `save_pretrained()` 约定冲突。
+
+### 5.3 文档上容易漏掉的点
+
+- `initial_model/` 是 resume 时优先读取的本地 base，不只是调试产物。
+- tied weights 在这里已经开始参与“保存格式”设计。
+- `FORCE_FSYNC=1` 时，initial model 也会 `fsync`。
+
+## 6. Resume 初始化与 callback 状态重建
+
+### 6.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `LogBasedCheckpointCallback._init_for_resume`
+
+### 6.2 逻辑
+
+`_init_for_resume` 处理的是“模型权重已经被恢复好了，callback 自己的运行时状态还没补上”的阶段。
+
+它会：
+
+1. 重新检测 tied weights。
+2. 重新记录 `_trainable_param_names`。
+3. 读取目标 checkpoint 的 `optimizer.pt`。
+4. 如果有 `pending_grad`，恢复到 `model.opt.projected_grad`。
+5. 如果有 `pending_seed`，恢复 ZO2 用的 `last_rstate`。
+6. 如果是 Adam，优先恢复 replay 后的 Adam state；否则回退 checkpoint 自带的 `adam_state`。
+7. 根据 `is_full_checkpoint` 区分：
+   - full checkpoint：当前 checkpoint 自己就是新的 base，`update_history=[]`
+   - log checkpoint：从 metadata 继承 `base_checkpoint_path/base_checkpoint_step/update_history`
+8. 如果 `batch_size==0`，强制把 base 设回 `"__initial__"`。
+9. 重新缓存当前模型到 `base_checkpoint_state`。
+10. 如果启用 shadow，调用 `_refresh_shadow_from_base`，让 shadow 从“已恢复后的模型”开始跟跑。
+
+### 6.3 文件 / 函数映射
+
+| 逻辑 | 文件 / 函数 |
+|------|-------------|
+| 恢复 `pending_grad` | `log_based_checkpoint.py` `LogBasedCheckpointCallback._init_for_resume` |
+| 恢复 `pending_seed` / `last_rstate` | `log_based_checkpoint.py` `LogBasedCheckpointCallback._init_for_resume` |
+| 恢复 replay 后的 Adam state | `log_based_checkpoint.py` `LogBasedCheckpointCallback._init_for_resume` + `log_based_replay.py` `_get_and_clear_replay_adam_state` |
+| 从 full/log checkpoint 分流 | `log_based_checkpoint.py` `LogBasedCheckpointCallback._init_for_resume` |
+
+## 7. update log 记录
+
+### 7.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `LogBasedCheckpointCallback._zo_update_hook`
+
+### 7.2 逻辑
+
+每个训练步结束后，`_zo_update_hook` 会：
+
+1. 读出 `seed / applied_grad / new_grad / lr / wd / zo_eps`。
+2. 把 `new_grad` 保存到 `_pending_grad`。
+3. 把当前 seed 保存到 `_pending_seed`。
+4. 把当前 step 的 update 追加到 `update_history`。
+5. 如果存在 shadow queue，非阻塞地把 update 送进 shadow 子进程。
+
+这里有两个容易被忽略的设计：
+
+- 即使 `grad == 0` 也照样记录 entry。
+  作用：保留 perturbation-restore 的数值痕迹，并维持 seed chain。
+- `actual_step = current_step + 1`。
+  作用：hook 调用时机在 `global_step` 自增之前，所以需要手动补一。
+
+## 8. 训练期 checkpoint 保存
+
+### 8.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/trainer.py`
+  - `ZOTrainer._save_checkpoint`
+  - `ZOTrainer._maybe_log_save_evaluate`
+- `zo2/trainer/hf_transformers/log_based_utils.py`
+  - `_fsync_file`
+  - `_fsync_directory`
+
+### 8.2 统一保存逻辑
+
+当 callback 存在且 `batch_size >= 0` 时，`ZOTrainer._save_checkpoint` 统一保存：
+
+1. `trainer_state.json`
+2. `scheduler.pt`
+3. RNG state：`self._save_rng_state(output_dir)`
+4. `optimizer.pt`
+
+其中 `optimizer.pt` 不只是 optimizer state，还会额外挂这些 checkpoint metadata：
+
+| 字段 | 含义 |
+|------|------|
+| `zo_update_history` | 当前 redo log |
+| `base_checkpoint` | 当前 redo log 依附的 base |
+| `current_step` | 当前步数 |
+| `batch_size` | checkpoint mode |
+| `num_updates` | redo log 条数 |
+| `tied_weights` | tied groups |
+| `model_dtype` | 模型 dtype |
+| `pending_grad` | 下一步待应用 grad |
+| `pending_seed` | 生成 `pending_grad` 的 seed |
+| `base_pending_seed` | base 对应的前置 seed |
+| `zo2` | 是否启用 ZO2 delayed update 语义 |
+| `trainable_param_names` | replay 参数顺序 |
+| `zo_eps` | replay 需要的扰动幅度 |
+| `rng_device` | replay 用同一种 RNG 设备策略 |
+| `is_full_checkpoint` | 这个目录是否能直接 load model 文件 |
+| `zo_method` | `mezo-sgd` / `mezo-adam` |
+| `adam_betas` / `adam_eps_value` | Adam replay 初始化需要的超参 |
+
+### 8.3 L0 / Log-based / Full+Log 三种保存路径
+
+#### L0: `LOG_BASED_CKPT=-1`
+
+文件 / 函数：
+
+- `trainer.py` `ZOTrainer._save_checkpoint`
+
+逻辑：
+
+- 直接走 `super()._save_checkpoint()`
+- 如果 `FORCE_FSYNC=1`，额外对整个 checkpoint 目录执行 `_fsync_directory`
+
+#### Log-based: `LOG_BASED_CKPT=0`
+
+文件 / 函数：
+
+- `trainer.py` `ZOTrainer._save_checkpoint`
+- `log_based_checkpoint.py` `LogBasedCheckpointCallback.on_save`
+
+逻辑：
+
+- `base_checkpoint` 固定写成 `"__initial__"`
+- `is_full_step=False`
+- 只写 `optimizer.pt` 和常规 trainer 状态
+- 不写模型文件
+- `on_save` 只递增计数，不更新 base
+
+#### Full + Log: `LOG_BASED_CKPT>=1`
+
+文件 / 函数：
+
+- `trainer.py` `ZOTrainer._save_checkpoint`
+- `log_based_checkpoint.py` `LogBasedCheckpointCallback.on_save`
+- `log_based_checkpoint.py` `LogBasedCheckpointCallback._update_base_and_shadow`
+
+逻辑：
+
+1. 根据 `global_step - base_checkpoint_step` 判断是否到 full step。
+2. 普通 log step：
+   - 只写 `optimizer.pt`
+3. full step：
+   - 同步模式：调用 `super()._save_checkpoint()` 写模型文件
+   - 然后把 `base_checkpoint_path/base_checkpoint_step` 更新到当前 step
+   - 把 `_base_pending_seed` 更新为当前 `_pending_seed`
+   - 清空 `update_history`
+4. `on_save` 中，如果这是 full step，再调用 `_update_base_and_shadow`
+
+## 9. Resume / Load 分流
+
+### 9.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_resume.py`
+  - `load_log_based_checkpoint`
+  - `_load_base_state`
+  - `resume_from_log_based`
+- `zo2/trainer/hf_transformers/trainer.py`
+  - `ZOTrainer._load_from_checkpoint`
+  - `ZOTrainer._load_optimizer_and_scheduler`
+
+### 9.2 三路分流
+
+`resume_from_log_based()` 不是“永远 replay”。它会先分流：
+
+1. 如果 checkpoint 目录里有 `model.safetensors` / `pytorch_model.bin`
+   - 直接走 `load_log_based_checkpoint`
+2. 如果有 `optimizer.pt` 但没有 `zo_update_history`
+   - 视为 regular checkpoint，仍然走 `load_log_based_checkpoint`
+3. 只有 `optimizer.pt` 且里面有 `zo_update_history`
+   - 才进入 log-based replay 路径
+
+### 9.3 `base` 的选择顺序
+
+`_load_base_state()` 的优先级：
+
+1. `base_checkpoint_ref == "__initial__"` 时
+   - 先看 `output_dir/initial_model/model.safetensors`
+   - 再看 `output_dir/initial_model/pytorch_model.bin`
+   - 本地都没有，才回退到 `AutoModelForCausalLM.from_pretrained(pretrained_model_name)`
+2. `base_checkpoint_ref != "__initial__"` 时
+   - 直接 `load_log_based_checkpoint(base_checkpoint_ref)`
+
+### 9.4 Trainer 接线层的保护逻辑
+
+| 逻辑 | 文件 / 函数 |
+|------|-------------|
+| `--log_based_resume` 时跳过 HF 默认 model load | `trainer.py` `ZOTrainer._load_from_checkpoint` |
+| `batch_size=-1` 却误用 log-based checkpoint 时直接报错 | `trainer.py` `ZOTrainer._load_from_checkpoint` |
+| 读取 `optimizer.pt` 后剥掉 log-based metadata 再加载 optimizer | `trainer.py` `ZOTrainer._load_optimizer_and_scheduler` |
+
+## 10. replay 主路径
+
+### 10.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_replay.py`
+  - `_generate_z_for_replay`
+  - `_generate_z_for_one_step`
+  - `_apply_single_update`
+  - `_apply_single_update_with_pregenerated_z`
+  - `_replay_updates_on_state`
+
+### 10.2 核心分支
+
+`_replay_updates_on_state()` 先决定三件事：
+
+1. 设备：CPU 还是 CUDA
+2. RNG 设备策略：`native` / `cpu` / `zo_rng`
+3. dtype：原 dtype 还是 `replay_in_fp32`
+
+### 10.3 RNG 分支
+
+| 模式 | 行为 | 文件 / 函数 |
+|------|------|-------------|
+| `rng_device="native"` | 在参数当前所在设备上生成 z | `log_based_replay.py` `_generate_z_for_replay` |
+| `rng_device="cpu"` | 在 CPU 生成，再搬到参数设备 | `log_based_replay.py` `_generate_z_for_replay` |
+| `rng_device="zo_rng"` | 用 zo_rng 生成跨设备 bit-exact z | `log_based_replay.py` `_generate_z_for_replay` / `_generate_z_for_one_step` |
+
+如果在 CPU 上 replay、机器又有 CUDA、且 `rng_device != "zo_rng"`，代码会显式打 warning：
+
+- `log_based_replay.py` `_replay_updates_on_state`
+- `legacy_pipeline_closed_form_replay.py` `_parallel_replay_updates_on_state`
+- `legacy_pipeline_closed_form_replay.py` `_closedform_replay_on_state`
+
+### 10.4 dtype 分支
+
+如果 `replay_in_fp32=True` 且实际 replay 设备是 CPU，代码会：
+
+1. 把 fp16 / bf16 参数临时 upcast 到 fp32
+2. replay 完后再 downcast 回原 dtype
+
+对应函数：
+
+- `log_based_replay.py` `_replay_updates_on_state`
+- `legacy_pipeline_closed_form_replay.py` `_parallel_replay_updates_on_state`
+
+### 10.5 Adam replay
+
+文件 / 函数：
+
+- `log_based_replay.py`
+  - `_load_adam_state_from_base`
+  - `_set_replay_adam_state`
+  - `_get_and_clear_replay_adam_state`
+
+逻辑：
+
+- full checkpoint 直接 load model，不做 Adam replay
+- log checkpoint 恢复时，如 `zo_method == mezo-adam`：
+  - 先从 base checkpoint 的 `optimizer.pt` 取 Adam state
+  - replay 时同步推进 `m/v/t`
+  - replay 完后缓存给 callback，供 `_init_for_resume` 恢复回 optimizer
+
+## 11. legacy replay 路径
+
+### 11.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_replay.py`
+  - `_replay_updates_on_state`
+- `zo2/trainer/hf_transformers/legacy_pipeline_closed_form_replay.py`
+  - `_parallel_replay_updates_on_state`
+  - `_closedform_replay_on_state`
+  - `validate_closedform_replay`
+
+### 11.2 现状
+
+这些路径已经是 legacy / discarded：
+
+- `PARALLEL_RECOVERY=1` 时，active replay 会转发到 `_parallel_replay_updates_on_state`
+- `CLOSEDFORM_RECOVERY=1` 时，active replay 会转发到 `_closedform_replay_on_state`
+
+文档保留它们，是为了说明为什么主 replay 文件仍然 import 它们，而不是推荐继续扩展。
+
+## 12. shadow 生命周期
+
+### 12.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `_init_shadow_adam_state`
+  - `_refresh_shadow_from_base`
+  - `_manifest_path`
+  - `_step_file_path`
+  - `_unregister_shm`
+  - `_save_shadow_manifest`
+  - `_start_shadow_process`
+  - `recover_from_shadow`
+  - `get_recovery_status`
+  - `on_train_end`
+- `zo2/trainer/hf_transformers/log_based_shadow.py`
+  - `_shadow_process_main`
+  - `_shadow_process_serial`
+  - `_shadow_process_pipelined`
+  - `_load_shadow_from_manifest`
+
+### 12.2 建立 shadow
+
+`_refresh_shadow_from_base()` 会：
+
+1. clone `base_checkpoint_state`
+2. 放入 shared memory，形成 `shadow_shared`
+3. 重新 tie tied weights
+4. 从 `resource_tracker` 注销这些 shm 文件
+5. 生成 manifest，写到 `/dev/shm/zo_shadow_manifest_<hash>.json`
+6. 设置 `shadow_step = len(update_history)`
+
+### 12.3 启动 shadow 子进程
+
+`_start_shadow_process()` 会建立这些 IPC 通道：
+
+| 通道 | 作用 |
+|------|------|
+| `update_queue` | 训练进程把 update / refresh / stop 发给 shadow |
+| `shadow_step_val` | 共享步数计数器 |
+| `recovery_req` | 请求 shadow 暂停 |
+| `recovery_ready` | shadow 表示“现在可以 clone” |
+| `recovery_done` | clone 完毕，shadow 可以继续跑 |
+| `shadow_stop_event` | 训练结束时快速停机 |
+
+### 12.4 shadow 子进程模式
+
+#### 串行 shadow
+
+文件 / 函数：
+
+- `log_based_shadow.py` `_shadow_process_serial`
+
+逻辑：
+
+1. 先把 `shadow_shared` clone 到本地 heap `shadow_local`
+2. 循环处理：
+   - `stop`
+   - `refresh`
+   - 普通 update
+3. 普通 update 时：
+   - 先生成 z
+   - 再应用 update
+   - 再把本地结果 copy 回 `shadow_shared`
+   - 写 step file
+
+#### pipelined shadow
+
+文件 / 函数：
+
+- `log_based_shadow.py` `_shadow_process_pipelined`
+
+逻辑：
+
+1. P 个 producer 线程负责预生成 z
+2. consumer 主线程按 step 顺序消费结果并更新 `shadow_shared`
+3. 支持：
+   - `stop`
+   - `refresh`
+   - producer 异常传递
+   - tied weights 健康检查
+   - Adam state reset
+
+### 12.5 Shadow refresh
+
+full checkpoint / resume 后，shadow 不是“自己推断新 base”，而是显式 `refresh`：
+
+- `log_based_checkpoint.py` `_update_base_and_shadow`
+- `log_based_shadow.py` `_shadow_process_serial`
+- `log_based_shadow.py` `_shadow_process_pipelined`
+
+训练进程把 `base_checkpoint_state` 更新好后，往 `update_queue` 发：
+
+```python
+{'cmd': 'refresh', 'new_step': len(self.update_history)}
 ```
-恢复 resume_from_batch_diff(checkpoint_path)
-│
-├─ 尝试加载 model.safetensors / pytorch_model.bin → 都不存在（log checkpoint）
-├─ 加载 optimizer.pt → 有 zo_update_history
-│
-├─ 提取元数据: batch_size=0, base_checkpoint="__initial__", updates, ...
-├─ base_checkpoint_ref = "__initial__"
-├─ is_full_checkpoint = False
-│
-├─ _load_base_state("__initial__", pretrained_model_name, ...)
-│   └─ AutoModelForCausalLM.from_pretrained(pretrained_model_name)
-│
-├─ _tie_state_dict_inplace(reconstructed, tied_groups)
-├─ _replay_updates_on_state(reconstructed, updates, ...)  ← 重放所有 update
-└─ return reconstructed
-```
 
-### 涉及的核心函数
+shadow 收到后会：
 
-| 函数 | 文件 | 作用 |
-|------|------|------|
-| `_cache_initial_model` | callback | 首次训练时缓存模型到 CPU |
-| `_init_for_resume` | callback | 恢复训练时从 optimizer.pt 加载所有元数据 |
-| `_zo_update_hook` | callback | 每步记录 {seed, grad, lr, wd, zo_eps} |
-| `_save_checkpoint` | trainer.py | 保存 optimizer.pt（含全量 update log） |
-| `resume_from_batch_diff` | callback | 从 base + replay 重建模型 |
-| `_load_base_state` | callback | 加载基础模型（pretrained 或 checkpoint） |
-| `_replay_updates_on_state` | callback | 按序重放 update log |
+1. 用 `base_shared` 覆盖 shadow 当前状态
+2. 更新 `shadow_step_val`
+3. 清空 pipeline 内部缓存
+4. 如果是 Adam，清空 `m/v/t`
 
----
+## 13. soft recovery 与 instant recovery
 
-## 模式 3: `batch_size >= 1`（Full + Log）
+### 13.1 in-process shadow recovery
 
-### 目标
-每 `batch_size` 步保存一次完整模型，中间步只保存 update log。
-恢复时：完整检查点直接加载，日志检查点从基础模型 + replay 重建。
+文件 / 函数：
 
-可选 `enable_shadow=True`：启用 CPU shadow 模型，用于即时恢复（默认关闭）。
+- `log_based_checkpoint.py` `recover_from_shadow`
 
-### 保存流程
+逻辑：
 
-```
-训练开始 (on_train_begin)
-│
-├─ [首次训练] _cache_initial_model(model)
-│   ├─ base_checkpoint_step = 0
-│   └─ if enable_shadow: _refresh_shadow_from_base()
-│
-├─ [恢复训练] _init_for_resume(model, state, batchdiff_resume)
-│   ├─ 加载 optimizer.pt（一次性读取所有元数据）
-│   ├─ 恢复 pending_grad
-│   ├─ 完整检查点恢复 → base = resume_path, base_step = global_step, history = []
-│   ├─ 日志检查点恢复 → 继承 base_checkpoint_path/step，加载 update_history
-│   ├─ 缓存 model.state_dict() → base_checkpoint_state (CPU)
-│   └─ if enable_shadow: _refresh_shadow_from_base()
-│
-├─ 注册 _zo_update_hook
-├─ if enable_shadow: _start_shadow_process()
-│
-│── 每一步: _zo_update_hook → update_history.append(...)
-│
-├─ Shadow 进程（如果 enable_shadow=True，独立进程，零 GIL 竞争）：
-│   ├─ [SHADOW_PIPELINE=0] 串行: 逐条 _apply_update_to_shadow()
-│   └─ [SHADOW_PIPELINE=1] 流水线: P producer 预生成 z → Queue(maxsize=1) → consumer 更新 shadow
-│
-└─ 保存检查点: trainer._save_checkpoint()
-    │
-    ├─ batch_size >= 1
-    ├─ steps_since_base = global_step - base_checkpoint_step
-    ├─ is_full_step = (steps_since_base >= batch_size)
-    │
-    ├─ 构建 optimizer_state + zo 元数据
-    │   └─ base_checkpoint = batchdiff_callback.base_checkpoint_path
-    ├─ torch.save(optimizer_state, optimizer.pt)
-    │
-    ├─ if is_full_step:                          ← 完整检查点
-    │   ├─ super()._save_checkpoint(model, trial)   → 保存 model.safetensors 等
-    │   ├─ base_checkpoint_path = output_dir
-    │   ├─ base_checkpoint_step = global_step
-    │   └─ update_history = []                      → 清空 log
-    │
-    └─ else:                                     ← 日志检查点
-        └─ return（只有 optimizer.pt，无模型文件）
+1. 请求 shadow pause
+2. clone `shadow_shared`
+3. 读取 `shadow_step`
+4. 释放 shadow 继续跑
+5. 返回“已恢复到 shadow_step 的 state_dict”
 
-    on_save callback:
-    ├─ save_count += 1
-    ├─ if is_full_step:
-    │   ├─ _update_base_and_shadow(model, step)  ← 更新 base_checkpoint_state
-    │   └─ if enable_shadow: _refresh_shadow_from_base()
-    └─ else (log step):
-        └─ 无操作（shadow worker 异步追赶中）
-```
+如果没有 shadow，就回退到：
 
-### 保存示例（batch_size=50, save_steps=10）
+- `log_based_checkpoint.py` `_reconstruct_on_demand`
 
-```
-Step 10:  [Log]  optimizer.pt (10 updates, base="__initial__")
-Step 20:  [Log]  optimizer.pt (20 updates, base="__initial__")
-Step 30:  [Log]  optimizer.pt (30 updates, base="__initial__")
-Step 40:  [Log]  optimizer.pt (40 updates, base="__initial__")
-Step 50:  [Full] optimizer.pt (50 updates) + model.safetensors
-                 → base 更新为 checkpoint-50, history 清空
-Step 60:  [Log]  optimizer.pt (10 updates, base=checkpoint-50)
-Step 70:  [Log]  optimizer.pt (20 updates, base=checkpoint-50)
-...
-Step 100: [Full] optimizer.pt (50 updates) + model.safetensors
-                 → base 更新为 checkpoint-100, history 清空
-```
+### 13.2 out-of-process soft recovery
 
-### 恢复流程
+文件 / 函数：
 
-```
-恢复 resume_from_batch_diff(checkpoint_path)
-│
-├─ 加载 optimizer.pt → 提取元数据
-├─ is_full_checkpoint?
-│
-├─ YES (完整检查点):
-│   └─ load_batch_diff_checkpoint(ckpt_dir) → 直接加载 model.safetensors
-│
-└─ NO (日志检查点):
-    ├─ base_checkpoint_ref = "checkpoint-50"（上一个完整检查点）
-    ├─ _load_base_state(base_checkpoint_ref, ...)
-    │   └─ load_batch_diff_checkpoint("checkpoint-50") → 加载基础模型
-    ├─ _tie_state_dict_inplace(...)
-    ├─ _replay_updates_on_state(reconstructed, updates)
-    └─ return reconstructed
-```
+- `log_based_resume.py` `resume_from_log_based`
+- `log_based_shadow.py` `_load_shadow_from_manifest`
 
-### 恢复后初始化（`_init_for_resume`）
+逻辑：
 
-恢复时不再调用 `_cache_initial_model`，而是使用 `_init_for_resume`：
-- 从 `optimizer.pt` 一次性加载所有元数据（pending_grad、update_history、base 信息）
-- `batch_size>=1` 完整检查点恢复 → `base_step = global_step`，`history = []`
-- `batch_size>=1` 日志检查点恢复 → 从元数据继承 `base_checkpoint_path` 和 `base_checkpoint_step`
-- `batch_size=0` → 加载全量 history，`base = "__initial__"`
+1. 新进程通过 `shadow_manifest` 读取 shadow 的 shm 文件
+2. 读出 `shadow_step`
+3. 只 replay `updates[shadow_step:]`
 
----
+这就是“DRAM survives”的 soft recovery 路径。
 
-## 公共函数调用关系
+### 13.3 recovery status
 
-```
-trainer._save_checkpoint()
-├─ [batch_size >= 0] 自定义逻辑
-│   ├─ torch.save(optimizer_state, optimizer.pt)      ← 所有模式共用
-│   ├─ [is_full_step] super()._save_checkpoint()      ← 只有 batch_size>=1 的完整步
-│   └─ callback.on_save()
-│       ├─ [batch_size=0] 无操作（base 永远是初始模型）
-│       └─ [batch_size>=1, full step] _update_base_and_shadow()
-│           └─ [enable_shadow] _refresh_shadow_from_base()
-│
-└─ [batch_size == -1] super()._save_checkpoint()       ← 默认 Trainer 保存
+文件 / 函数：
 
-trainer._load_from_checkpoint()
-├─ [batchdiff_resume] skip（模型已通过 replay 恢复）
-└─ [标准恢复] super()._load_from_checkpoint()
+- `log_based_checkpoint.py` `get_recovery_status`
 
-trainer._load_optimizer_and_scheduler()
-├─ 加载 optimizer.pt
-├─ 检测 zo_update_history → 剥离 zo 元数据
-├─ optimizer.load_state_dict(cleaned_state)
-└─ 加载 scheduler.pt
+提供：
 
-resume_from_batch_diff()
-├─ load optimizer.pt → 提取元数据
-├─ [is_full_checkpoint] load_batch_diff_checkpoint()    → 直接返回
-├─ _load_base_state()                                   → 加载基础模型
-├─ _tie_state_dict_inplace()
-└─ _replay_updates_on_state()
-    └─ _apply_single_update() × N          ← 串行重放（默认）
-        └─ _generate_z_for_replay()
-    （并行 replay 选项见文末「不常用功能」）
+- `gpu_step`
+- `shadow_step`
+- `shadow_available`
+- `shadow_lag`
+- `can_recover`
+- `batch_size`
 
-_start_shadow_process()                                  ← 独立进程（spawn），零 GIL 竞争
-├─ _shadow_process_main()                                ← 进程入口
-│   ├─ 线程配置: SHADOW_RESERVE_THREADS / SHADOW_CONSUMER_THREADS
-│   │   └─ zo_rng.set_num_threads(c_prod), torch.set_num_threads(n_cons)
-│   │
-│   ├─ [SHADOW_PIPELINE=0] _shadow_process_serial()      ← 串行 shadow
-│   │   └─ loop: get update → _apply_single_update()
-│   │       └─ _generate_z_for_replay()
-│   │
-│   └─ [SHADOW_PIPELINE=1] _shadow_process_pipelined()   ← 流水线 shadow
-│       ├─ P producer threads → Queue(maxsize=1)
-│       │   └─ _generate_z_for_one_step()                ← 预生成 z，释放 GIL
-│       └─ consumer (main thread):
-│           └─ _apply_single_update_with_pregenerated_z() ← 用 pregenerated z 更新
-│               ├─ [adam_state=None] SGD 路径
-│               └─ [adam_state≠None] Adam 路径 (m/v/t on CPU)
-│
-└─ calibrate_producer_consumer()                         ← benchmark 找最优 (P, c, n_cons)
-```
+## 14. failure injection
 
----
+### 14.1 文件 / 函数
 
-# `mezo.sh` 参数速查表
+- `zo2/trainer/hf_transformers/log_based_failure_injection.py`
+  - `GPUFailureSimulator.set_fail_step`
+  - `GPUFailureSimulator.check_and_fail`
+  - `GPUFailureSimulator.trigger_failure`
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `LogBasedCheckpointCallback.on_step_begin`
 
-> 所有参数均通过**环境变量**传入，格式: `KEY=VALUE bash mezo.sh`
+### 14.2 触发时机
 
-## 训练基础参数
+故障检查发生在 `on_step_begin()`，不是 `_zo_update_hook()`。
+
+原因：
+
+- 要在下一次 ZO forward 之前就把进程打掉
+- 这样 resumed run 才能拿到和原始 run 一样的数据 batch
+
+### 14.3 kill 顺序
+
+`trigger_failure()` 的顺序是：
+
+1. 扫当前进程和 shadow 进程的子进程，找到 `torch_shm_manager`
+2. 先 `SIGKILL` 这些 shm manager
+3. 再 `SIGKILL` shadow 子进程
+4. flush logging handler
+5. 最后 `SIGKILL` 主进程
+
+这段顺序是 soft recovery 成败的关键，不能只写成“模拟 GPU failure”。
+
+## 15. tied weights
+
+### 15.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_utils.py`
+  - `_detect_tied_weights`
+  - `_tie_state_dict_inplace`
+  - `_restore_tied_weights`
+
+### 15.2 三个阶段
+
+1. 训练开始：
+   - `_detect_tied_weights(model)`
+2. 保存 initial/full checkpoint：
+   - 去掉 tied duplicate key
+3. 读取 regular/full checkpoint 或 replay 前：
+   - `_restore_tied_weights(state_dict, checkpoint_dir)`
+   - `_tie_state_dict_inplace(reconstructed, tied_groups)`
+
+## 16. RNG 与确定性
+
+### 16.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_replay.py`
+  - `_generate_z_for_replay`
+  - `_generate_z_for_one_step`
+  - `_apply_single_update`
+  - `_replay_updates_on_state`
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `_apply_update_to_shadow`
+  - `on_train_begin`
+- `zo2/trainer/hf_transformers/trainer.py`
+  - `_save_checkpoint` 中的 `optimizer_state['rng_device']`
+  - `_save_checkpoint` 中的 `self._save_rng_state(output_dir)`
+
+### 16.2 需要明确写到文档里的行为
+
+- replay 会优先使用 checkpoint 里保存的 `rng_device`
+- `ZO_RNG_DEVICE=zo_rng` 是跨设备精确 replay 的唯一安全选项
+- `shadow` 在 `rng_device="native"` 且训练跑在 CUDA 上时，只是近似 shadow，不是 bitwise exact
+- `pending_seed` 和 `base_pending_seed` 都是为了恢复 seed chain，不是冗余元数据
+
+## 17. async anchor
+
+### 17.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/async_anchor_checkpoint.py`
+  - `AsyncAnchorCheckpointer.try_save_full_checkpoint`
+  - `_persist_worker`
+  - `get_latest_completed_anchor_step`
+  - `get_latest_completed_anchor_path`
+  - `shutdown`
+- `zo2/trainer/hf_transformers/trainer.py`
+  - `ZOTrainer._save_checkpoint`
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `LogBasedCheckpointCallback.on_train_end`
+
+### 17.2 两阶段语义
+
+#### Phase 1: 训练线程
+
+文件 / 函数：
+
+- `async_anchor_checkpoint.py` `AsyncAnchorCheckpointer.try_save_full_checkpoint`
+
+逻辑：
+
+1. 等前一个 persist 完成：`self._persist_done.wait()`
+2. 等 pinned buffer 空闲：`self._buffer_free`
+3. 把 GPU 参数异步 copy 到 pinned CPU buffer
+4. 把 persist job 放到后台线程队列
+
+#### Phase 2: persist 线程
+
+文件 / 函数：
+
+- `async_anchor_checkpoint.py` `AsyncAnchorCheckpointer._persist_worker`
+
+逻辑：
+
+1. 等 copy event 完成
+2. clone pinned buffer 到普通 CPU 内存
+3. 立刻释放 pinned buffer 给下一次 anchor
+4. `fork` 子进程写 `model.safetensors`
+5. 父进程 `waitpid` 等待写完
+6. 成功后更新 `latest_completed_step/path`
+
+### 17.3 base 更新语义
+
+对应文件 / 函数：
+
+- `trainer.py` `ZOTrainer._save_checkpoint`
+- `log_based_checkpoint.py` `LogBasedCheckpointCallback.on_train_end`
+
+注意：
+
+- async anchor 模式下，写 `optimizer.pt` 时 `is_full_checkpoint` 永远记为 `False`
+- base 不会在 enqueue anchor 时立刻更新
+- 只有 anchor 真正持久化完成后，才会：
+  - 更新 `base_checkpoint_path/base_checkpoint_step`
+  - 截断 `update_history`
+  - 记录新的 `_base_pending_seed`
+
+这保证了恢复总能走“已持久化 base + redo log”而不是指向一个还没写完的 full checkpoint。
+
+## 18. 清理与收尾
+
+### 18.1 文件 / 函数
+
+- `zo2/trainer/hf_transformers/log_based_checkpoint.py`
+  - `LogBasedCheckpointCallback.on_train_end`
+
+### 18.2 逻辑
+
+训练结束时会：
+
+1. `async_anchor.shutdown()`，等待最后一个 persist 完成
+2. 如有必要，做最终 base trim
+3. 停止 shadow：
+   - `shadow_stop_event.set()`
+   - `recovery_done.set()` 防止等待死锁
+   - `update_queue.put_nowait({'cmd': 'stop'})` 作为 fallback
+4. join shadow 子进程；超时则 terminate
+5. 删除：
+   - `base_checkpoint_state`
+   - `shadow_shared`
+   - `shadow_model`
+6. 清理：
+   - manifest 文件
+   - step 文件
+   - `/dev/shm` 中对应的 shm data file
+
+## 19. 参数速查
+
+### checkpoint / shadow / resume
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `MODEL` | `facebook/opt-1.3b` | HuggingFace 模型名 |
-| `TASK` | (必填) | 任务名: SST2, SQuAD, CB, Copa, ReCoRD, DROP 等 |
-| `MODE` | `ft` | 训练模式: `ft`(全参数), `prefix`(prefix tuning), `lora` |
-| `DTYPE` | `fp16` | 模型精度: `fp16`(float16), `bf16`(bfloat16), `fp32`(float32) |
-| `LR` | `1e-5` | 学习率 |
-| `EPS` | `1e-3` | ZO perturbation epsilon |
-| `ZO_METHOD` | `mezo-sgd` | ZO 优化器: `mezo-sgd`(SGD) 或 `mezo-adam`(Adam) |
-| `BS` | `16` | per_device_train_batch_size |
-| `SEED` | `0` | 全局随机种子 (控制数据顺序 + ZO perturbation seed 生成) |
-| `STEPS` | `20000` | max_steps |
-| `EVAL_STEPS` | `4000` | 每隔多少步做一次 evaluation |
-| `LOGGING_STEPS` | `10` | 每隔多少步记录一次 training loss |
-| `SAVE_STEPS` | `20000` | 每隔多少步保存一次 checkpoint |
-| `TRAIN` | `1000` | 训练样本数 |
-| `DEV` | `500` | 验证集样本数 (CB/Copa 自动改为 100) |
-| `EVAL` | `1000` | 测试集样本数 |
+| `LOG_BASED_CKPT` | `-1` | `-1`=L0；`0`=Log-based；`N>=1`=Full+Log |
+| `ENABLE_SHADOW` | `0` | `LOG_BASED_CKPT>=0` 时可启用 shadow |
+| `INSTANT_RECOVER` | `0` | 开启即时恢复流程 |
+| `GPU_FAIL_STEP` | `-1` | 在给定步数触发故障注入 |
+| `LOG_BASED_RESUME` | `""` | 明确指定 replay 恢复入口 |
+| `LOG_BASED_REPLAY_DEVICE` | `cuda` | replay 的执行设备 |
+| `LOG_BASED_SIMULATE_PERTURBATION` | `1` | 是否模拟 perturbation-restore 轮次 |
+| `LOG_BASED_REPLAY_FP32` | `0` | CPU replay 时临时 upcast 到 fp32 |
+| `SHADOW_PIPELINE` | `0` | 是否启用 pipelined shadow |
+| `SHADOW_PIPELINE_WORKERS` | `2` | shadow pipeline producer 数 |
+| `SHADOW_RESERVE_THREADS` | `1` | shadow 为训练预留的核数 |
+| `SHADOW_CONSUMER_THREADS` | `auto` | shadow consumer 的 ATen 线程数 |
+| `ASYNC_ANCHOR` | `0` | 启用 async anchor |
+| `OUTPUT_LOG` | `""` | log checkpoint 的独立输出目录 |
 
-## MeZO-Adam 参数
-
-> 以下参数仅在 `ZO_METHOD=mezo-adam` 时生效
+### RNG / persistence
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `ADAM_BETA1` | `0.9` | Adam 一阶矩衰减系数 β1 |
-| `ADAM_BETA2` | `0.999` | Adam 二阶矩衰减系数 β2 |
-| `ADAM_EPS` | `1e-8` | Adam epsilon (分母稳定项)，与 `EPS`(ZO perturbation ε) 不同 |
+| `ZO_RNG_DEVICE` | `native` | `native` / `cpu` / `zo_rng` |
+| `ZO_RNG_TRAIN_THREADS` | unset | 训练进程 zo_rng 线程数 |
+| `ZO_RNG_NUM_THREADS` | 环境决定 | zo_rng 线程池初始大小 |
+| `FORCE_FSYNC` | `0` | 对 initial model、optimizer.pt、full checkpoint 启用 fsync |
+| `PARALLEL_RECOVERY` | `0` | legacy pipelined replay 开关 |
+| `PARALLEL_RECOVERY_WORKERS` | `1` | legacy pipelined replay worker 数 |
+| `CLOSEDFORM_RECOVERY` | `0` | legacy closed-form replay 开关 |
+| `CLOSEDFORM_WORKERS` | `1` | legacy closed-form worker 数 |
+| `CLOSEDFORM_PRECISION` | `mixed` | legacy closed-form 精度模式 |
 
-## 输出与控制
+## 20. 最短调用图
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `OUTPUT_ROOT` | `/lvs0/rccs-hpbdrt/minqiu/ZO_ckpt` | checkpoint 输出根目录. 可改为 `/tmp/ZO_ckpt`(本地NVMe) 或 `/dev/shm/ZO_ckpt`(DRAM) 测性能 |
-|`FORCE_FSYNC` | `0`| FORCE_FSYNC=1时会强制将ckpt同步写入Local SSD, 但是其他模式下不会触发|
-| `TRAIN_NAME` | `Test_staging_8` | 实验名前缀，拼入 output_dir |
-| `DO_EVAL` | `1` | 设为 `0` 跳过训练后的 evaluation 阶段 (`--no_eval`) |
-| `GPU_ID` | `0` | 使用哪块 GPU (设置 CUDA_VISIBLE_DEVICES) |
-| `WANDB_PROJECT` | `NonStopZO2` | Weights & Biases 项目名 |
+```text
+训练开始
+└─ LogBasedCheckpointCallback.on_train_begin()
+   ├─ _cache_initial_model() / _init_for_resume()
+   ├─ _init_shadow_adam_state()
+   └─ _start_shadow_process()
 
-## L0-L3 Checkpoint 层级
+每步训练
+├─ on_step_begin() -> failure_simulator.check_and_fail() / trigger_failure()
+├─ _zo_update_hook() -> 记录 update_history / pending_grad / pending_seed
+└─ on_step_end() -> 打印 health / shadow lag
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `BATCHDIFF_CKPT` | `-1` | **核心开关**. `-1`=L0 Full Checkpoint; `0`=Log-based(累积所有updates); `N>=1`=Full+Log(每N步做一次full，中间存log) |
-| `ENABLE_SHADOW` | `0` | 设为 `1` 启用 CPU Shadow Model. **对 `BATCHDIFF_CKPT>=0` 有效**（`=0` log-based 模式也可开启），仅 `=-1`(禁用模式) 时强制关闭 |
-| `INSTANT_RECOVER` | `0` | 设为 `1` 启用即时恢复. 需要 `ENABLE_SHADOW=1`. GPU 故障时直接从 shadow 拷贝到 GPU，无需 replay |
-| `GPU_FAIL_STEP` | `-1` | 在第 N 步模拟 GPU 故障. `-1`=不注入. 可独立使用或叠加任意层级 |
-| `ASYNC_ANCHOR` | `0` | **异步 anchor**. 设为 `1` 启用异步写入 full checkpoint. **仅 `BATCHDIFF_CKPT>=1` 时有效**. GPU→CPU 异步拷贝 + 后台线程写盘，训练不阻塞. 若前一次写盘未完成则跳过本次 anchor (redo log 保证可恢复) |
-| `OUTPUT_LOG` | `""` | **仅 `ASYNC_ANCHOR=1` 时有效**. log checkpoint 输出目录. 设置后 log checkpoints (optimizer.pt) 写入此目录, full checkpoints 仍在 `OUTPUT_ROOT`. 可设为 `/dev/shm/ZO_ckpt`(DRAM) 加速频繁的 log 写入 |
-| `SHADOW_PIPELINE` | `0` | 设为 `1` 启用 **pipelined shadow**. P 个 producer 线程并行预生成 z，1 个 consumer 串行更新 shadow model，通过 `Queue(maxsize=1)` 连接. **需要 `ENABLE_SHADOW=1`**. GIL 不阻塞: PyTorch C++ ops 和 zo_rng C extension 均释放 GIL. 支持 SGD 和 Adam |
-| `SHADOW_PIPELINE_WORKERS` | `2` | P = producer 线程数. P>=2 才有 overlap. 使用 `calibrate_producer_consumer()` 确定最优 P |
-| `SHADOW_RESERVE_THREADS` | `1` | Shadow 进程留给训练进程的核心数（不用于 shadow 计算） |
-| `SHADOW_CONSUMER_THREADS` | `total//2` | Consumer (ATen apply) 使用的线程数. `c_prod = total - reserve - n_cons` 自动分配给 producer (zo_rng) |
-| `ZO_RNG_TRAIN_THREADS` | (unset) | 可选: 降低训练进程的 zo_rng 线程数，减少与 shadow 的带宽竞争. 设为 `16` 等小值 |
+保存 checkpoint
+└─ ZOTrainer._save_checkpoint()
+   ├─ 写 trainer_state / scheduler / rng_state
+   ├─ 写 optimizer.pt + log metadata
+   ├─ [full step] super()._save_checkpoint() 或 async_anchor.try_save_full_checkpoint()
+   └─ callback.on_save() -> _update_base_and_shadow()
 
-> 并行 replay 参数见文末「不常用功能」。
+恢复
+├─ ZOTrainer._load_from_checkpoint() -> log_based_resume 时跳过默认权重加载
+├─ resume_from_log_based()
+│  ├─ load_log_based_checkpoint() / _load_base_state()
+│  ├─ [_load_shadow_from_manifest()] 软恢复
+│  └─ _replay_updates_on_state()
+└─ LogBasedCheckpointCallback._init_for_resume()
 
-## Resume / Replay 参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `RESUME_CKPT` | `""` | L0 标准恢复: HuggingFace `resume_from_checkpoint` 路径 |
-| `BATCHDIFF_RESUME` | `""` | L1+ 差分恢复: 指定 full checkpoint 路径，自动扫描并重放后续 differential checkpoints. **优先于 RESUME_CKPT** |
-| `BATCHDIFF_REPLAY_DEVICE` | `cuda` | Replay 设备: `cpu` 或 `cuda`. **使用 `ZO_RNG_DEVICE=zo_rng` 时可安全设为 `cpu`**; 否则 replay 设备必须与训练设备一致 |
-| `BATCHDIFF_SIMULATE_PERTURBATION` | `1` | `1`=replay 时模拟 [+1,-2,+1] perturbation 序列以精确还原 fp16 舍入; `0`=跳过, ~4x 更快但非 bitwise exact |
-| `BATCHDIFF_REPLAY_FP32` | `0` | 设为 `1` 使用 fp32 精度做 replay. **仅对 `BATCHDIFF_REPLAY_DEVICE=cpu` 有效**（GPU replay 时忽略此参数）. 动机: CPU 上 `torch.normal(fp16)` 比 fp32 慢约 22x，upcast 到 fp32 做 replay 可大幅加速. **注意: 会引入累积误差**——训练在 fp16 下每步都有 fp16 舍入，而 fp32 replay 的舍入路径不同，步数越多偏差越大，重建结果**非 bitwise exact** |
-
-> 并行 replay 参数（`PARALLEL_RECOVERY`、`CLOSEDFORM_RECOVERY` 等）见文末「不常用功能」。
-
-## 确定性与随机数控制
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `DETERMINISTIC` | `0` | 设为 `1` 启用 `torch.use_deterministic_algorithms(True)` + `CUBLAS_WORKSPACE_CONFIG=:4096:8`. 强制 cuBLAS matmul 等所有 PyTorch 算子使用确定性实现，保证同一硬件上两次独立训练产生 bitwise 相同的 loss 轨迹. **注意: 不影响 replay 正确性**（replay 不涉及 cuBLAS），仅影响训练 forward pass. 代价: ~5-15% 性能下降 |
-| `ZO_RNG_DEVICE` | `native` | ZO 扰动噪声 z 的生成设备. `native`=在参数所在设备上生成(快); `cpu`=始终在 CPU 生成再传到 GPU(跨设备可移植，但非常慢！); **`zo_rng`=使用 zo_rng 库生成跨设备 bit-exact 的噪声，使 `BATCHDIFF_REPLAY_DEVICE=cpu` 可以精确还原 GPU 训练** |
-| `ZO_FMA` | `0` | 设为 `1` 启用 FMA (Fused Multiply-Add) 模式. 训练时的 perturbation 和 gradient update 使用 `param.add_(z, alpha=scalar)` 而非 `param.add_(scalar * z * scalar2)`, 与 replay 代码的运算顺序一致, **确保 instant recovery replay 后权重 bitwise identical**. 默认关闭以保持原版 MeZO 行为 |
-
-> **关于确定性的说明**:
-> - 无论 `DETERMINISTIC` 设为何值，`cudnn.deterministic=True` 和 `cudnn.benchmark=False` **始终开启**
-> - `DETERMINISTIC=1` 额外强制 cuBLAS 使用确定性 GEMM kernel，但**不保证跨 GPU 架构一致**（如 A100 vs H200），只保证同一硬件多次运行一致
-> - **Replay (seed log 回放) 的正确性不依赖 `DETERMINISTIC` 设置**，因为 replay 全程只做 RNG + 逐元素运算，不涉及 cuBLAS matmul
-> - **`ZO_RNG_DEVICE=zo_rng` 是唯一能保证 CPU replay = GPU 训练的选项**。原理: 使用 Philox4x32 PRNG + 多项式近似的 Box-Muller 变换，整个流程只用 IEEE 754 浮点加减乘除，在 CPU 和 GPU 上产生完全相同的结果
->
-> **BF16 支持说明**:
-> - `DTYPE=bf16` 完全支持. 训练、replay、shadow 均可使用 bfloat16
-> - **CPU 上 z 生成速度**（Qwen3-1.7B, 903M params 为例）:
->   - `torch.randn`: fp32 ~12s, fp16 ~59s, **bf16 ~50s** — bf16 和 fp16 同样慢（PyTorch CPU 缺乏 bf16 native randn）
->   - `zo_rng.randn`: fp32 ~1.5s, fp16 ~2.3s, **bf16 ~2.7s** — 全 dtype 均快，bf16 仅比 fp32 慢 1.8x
-> - **结论: Shadow pipeline (`SHADOW_PIPELINE=1`) 和 CPU replay 在使用 bf16 时必须搭配 `ZO_RNG_DEVICE=zo_rng`**，否则 CPU 端 z 生成会成为瓶颈（50s/step vs 2.7s/step）
-
-## 线程控制参数
-
-> 控制训练进程和 shadow 进程的 CPU 线程分配。
-> 带 ★ 的参数建议在 notebook bash cell 里 export。不带 ★ 的由代码内部自动设置。
-
-### 训练进程
-
-| 参数 | 默认值 | 说明 | 效果体现 |
-|------|--------|------|----------|
-| ★ `MKL_NUM_THREADS` | (unset) | MKL BLAS 线程数。**副作用：未设 `OMP_NUM_THREADS` 时，PyTorch fallback 读此值作为 ATen 线程数** | `torch.get_num_threads()` |
-| ★ `OMP_WAIT_POLICY` | `passive` | OpenMP 空闲线程策略。`passive`=立即 sleep，`active`=spin wait | 训练 aten=1 时无实际影响 |
-| ★ `ZO_RNG_NUM_THREADS` | `1` | zo_rng C++ 线程池**初始**大小（C++ 侧 `init_pool()` 读取，仅首次创建时生效） | `zo_rng.get_num_threads()` |
-| ★ `TORCH_INTEROP_THREADS` | `1` | PyTorch inter-op 线程池大小。单 GPU 训练设 1 即可（默认=CPU核数，会白白创建 N 个空闲线程） | `torch.get_num_interop_threads()` |
-| `ZO_RNG_TRAIN_THREADS` | (unset) | 可选：运行时动态调整训练进程 zo_rng 线程数 | `zo_rng.set_num_threads()` |
-
-### Shadow 进程
-
-| 参数 | 默认值 | 说明 | 效果体现 |
-|------|--------|------|----------|
-| ★ `SHADOW_CONSUMER_THREADS` | `total//2` | Consumer (ATen) 线程数 | `torch.set_num_threads(n_cons)` |
-| ★ `SHADOW_RESERVE_THREADS` | `1` | 预留给训练进程的核心数 | `c_prod = total - reserve - n_cons` |
-| ★ `SHADOW_PIPELINE_WORKERS` | `2` | Producer Python 线程数 | pipeline producer count |
-| `OMP_NUM_THREADS` | = CONSUMER | 代码在 spawn 前设置，shadow 子进程继承 | shadow `torch.get_num_threads()` |
-| `KMP_BLOCKTIME` | `0` | Intel OpenMP spin 等待时间（代码内部设置） | 空闲线程立即 sleep |
-| `GOMP_SPINCOUNT` | `0` | GNU OpenMP spin 次数（代码内部设置） | 空闲线程不 spin |
-| `OPENBLAS_NUM_THREADS` | `1` | 代码内部设置 | 无 matmul，无实际影响 |
-| `NUMEXPR_NUM_THREADS` | `1` | 代码内部设置 | 无实际影响 |
-
-### 推荐 notebook 配置
-
-```bash
-export MKL_NUM_THREADS=1          # 训练 ATen=1（模型在 GPU，CPU tensor op 极少）
-export OMP_WAIT_POLICY=passive    # 空闲线程不 spin
-export ZO_RNG_NUM_THREADS=1       # 训练 zo_rng=1（只需生成 1 组 z）
-export TORCH_INTEROP_THREADS=1    # 砍掉默认 128 个无用 interop 线程
-export SHADOW_CONSUMER_THREADS=32 # 根据实际 benchmark 调整
-export SHADOW_RESERVE_THREADS=1
-export SHADOW_PIPELINE_WORKERS=1
-```
-
----
-
-# 不常用功能
-
-> 以下功能为实验性质或仅用于特定场景，一般情况下不需要开启。
-
-## 并行 Replay 参数
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `PARALLEL_RECOVERY` | `0` | 设为 `1` 启用流水线 producer-consumer replay. P 个 producer 线程/stream 并行生成 z，1 个 consumer 串行更新参数，通过 ring buffer 连接. 结果与串行 replay **bitwise exact**. GPU+native 使用 CUDA streams; 其他情况使用 CPU threads |
-| `PARALLEL_RECOVERY_WORKERS` | `1` | P = producer 数 = ring buffer 大小. P>=2 才有 overlap. 使用 `calibrate_producer_consumer()` 确定最优 P. 每个 slot 占用 model_size 内存 (ZO2: 2×model_size) |
-| `CLOSEDFORM_RECOVERY` | `0` | 设为 `1` 启用闭合形式并行 replay. 将 ZO-SGD 递推展开为独立项之和: `p_n = sp[0]*p_0 - Σ sp[t+1]*lr_t*grad_t*z_t`, W 个 worker 并行累加. 与串行 replay 近似相等 (非 bitwise exact). 不支持 perturbation simulation |
-| `CLOSEDFORM_WORKERS` | `1` | W = 并行 worker 数. 内存 = 1×accum_buffer + W×z_buffer (共享累加, 无 per-worker partial sum). W=1 即为串行闭合形式 |
-| `CLOSEDFORM_PRECISION` | `mixed` | 精度模式: `fp32`=全程 fp32(最准确); `fp16`=保持原始 dtype 累加(最快但累积误差大); `mixed`=参数保持原始 dtype, 累加用 fp32(默认, 推荐) |
-
-## 并行 Replay 函数调用关系
-
-```
-_replay_updates_on_state()
-├─ [默认: PARALLEL_RECOVERY=0, CLOSEDFORM_RECOVERY=0] 串行:
-│   └─ _apply_single_update() × N
-│       └─ _generate_z_for_replay()
-│
-├─ [PARALLEL_RECOVERY=1] 流水线 producer-consumer (bitwise exact):
-│   └─ _parallel_replay_updates_on_state()
-│       ├─ pre-compute seeds_info
-│       ├─ [GPU+native] _pipelined_replay_gpu()
-│       │   ├─ P CUDA streams (ring buffer)
-│       │   ├─ pre-fill: schedule first P z on separate streams
-│       │   └─ loop: default_stream.wait_event → apply update → schedule next z
-│       └─ [CPU / other] _pipelined_replay_cpu()
-│           ├─ P producer threads (ring buffer + threading.Event)
-│           └─ main thread consumer: wait ready → apply update → signal free
-│
-└─ [CLOSEDFORM_RECOVERY=1] 闭合形式并行 (近似, 无 perturbation):
-    └─ _closedform_replay_on_state()
-        ├─ pre-compute suffix product sp[i] = Π_{j=i}^{n-1} (1-lr_j*wd_j)
-        ├─ build term list: (coeff_wd, coeff_nowd, seed) per non-zero grad step
-        ├─ [GPU+native] _closedform_gpu()
-        │   └─ batches of W CUDA streams generate z, sync, accumulate into shared buffer
-        ├─ [CPU / other] _closedform_cpu()
-        │   └─ W threads generate z in parallel, lock-accumulate into shared buffer
-        └─ finalize: p_n = sp[0]*p_0 - total_sum
+训练结束
+└─ LogBasedCheckpointCallback.on_train_end()
+   ├─ async_anchor.shutdown()
+   ├─ 停止 shadow
+   └─ 清理 manifest / shm / 本地状态
 ```

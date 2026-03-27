@@ -19,10 +19,8 @@ from collections import OrderedDict
 # Ensure project root is importable
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-from zo2.trainer.hf_transformers.batch_differential_checkpoint import (
-    _replay_updates_on_state,
-    _parallel_replay_updates_on_state,
-)
+from zo2.trainer.hf_transformers.legacy_pipeline_closed_form_replay import _parallel_replay_updates_on_state
+from zo2.trainer.hf_transformers.log_based_replay import _replay_updates_on_state
 
 
 def _make_state(param_names, size=512, dtype=torch.float32, device='cpu'):

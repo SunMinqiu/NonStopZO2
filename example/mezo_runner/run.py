@@ -26,6 +26,7 @@ import sys
 sys.path.append("../../../zo2")
 
 import logging
+import gc
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -74,7 +75,8 @@ from utils import *
 import random
 
 from zo2.trainer.hf_transformers.trainer import ZOTrainer
-from zo2.trainer.hf_transformers.batch_differential_checkpoint import BatchDiffCheckpointCallback, resume_from_batch_diff
+from zo2.trainer.hf_transformers.log_based_checkpoint import LogBasedCheckpointCallback
+from zo2.trainer.hf_transformers.log_based_resume import resume_from_log_based
 from zo2 import zo_hf_init, ZOConfig
 logger.info(f"[THR] after all imports: {_tc()}")
 
@@ -162,31 +164,32 @@ class OurArguments(TrainingArguments):
     # Auto saving when interrupted
     save_on_interrupt: bool = False # save model when interrupted (useful for long training)
 
-    # Batch Differential Checkpoint (实验层级配置)
-    # BATCHDIFF_CKPT: batch differential checkpoint mode
+    # Log-Based Checkpoint (实验层级配置)
+    # LOG_BASED_CKPT: log-based checkpoint mode
     #   -1: Disabled (L0 baseline, uses default Trainer checkpoint)
     #   0: Log-based (accumulate all updates from base)
     #   >=1: Full + Log (full checkpoint every N steps, log checkpoints in between)
-    batchdiff_ckpt: int = -1  # batch differential checkpoint mode
-    # L2: CPU Shadow (需要 batchdiff_ckpt >= 0)
+    log_based_ckpt: int = -1  # log-based checkpoint mode
+    # L2: CPU Shadow (需要 log_based_ckpt >= 0)
     enable_shadow: bool = False  # enable real-time shadow model on CPU
-    # L3: 即时恢复 (需要 batchdiff_ckpt >= 0 + enable_shadow + gpu_fail_step)
+    # L3: 即时恢复 (需要 log_based_ckpt >= 0 + enable_shadow + gpu_fail_step)
     instant_recover: bool = False  # instantly recover from shadow model when GPU failure occurs
     # GPU 故障注入 (旁路，可单独使用)
     gpu_fail_step: int = -1  # simulate GPU failure at this step (-1 = disabled)
-    # Batch Diff Resume: specify the full checkpoint path to resume from
-    # Will automatically scan parent directory for checkpoints and replay them
-    batchdiff_resume: str = ""  # path to base full checkpoint for resuming
-    batchdiff_replay_device: str = "cuda"  # device for replay computation: 'cpu' or 'cuda' (must match training device for correct RNG)
-    batchdiff_simulate_perturbation: bool = True  # simulate fp16 perturbation loop during replay (disable for ~4x speedup)
-    batchdiff_replay_fp32: bool = False  # upcast fp16→fp32 during CPU replay to avoid slow torch.normal(fp16) on CPU (~7x speedup)
+    # Log-Based Resume: specify the full checkpoint path to resume from.
+    # Will automatically scan parent directory for checkpoints and replay them.
+    log_based_resume: str = ""  # path to base full checkpoint for resuming
+    log_based_replay_device: str = "cuda"  # device for replay computation: 'cpu' or 'cuda' (must match training device for correct RNG)
+    log_based_simulate_perturbation: bool = True  # simulate fp16 perturbation loop during replay (disable for ~4x speedup)
+    log_based_replay_fp32: bool = False  # upcast fp16→fp32 during CPU replay to avoid slow torch.normal(fp16) on CPU (~7x speedup)
 
-    # Async Anchor Checkpoint (requires batchdiff_ckpt >= 1)
+    # Async Anchor Checkpoint (requires log_based_ckpt >= 1)
     # Replaces synchronous full checkpoint with two-phase async pipeline:
     #   Phase 1: GPU→CPU async copy via dedicated CUDA stream
     #   Phase 2: CPU→disk persist in background thread
     async_anchor: bool = False  # enable async anchor checkpoint
-    log_output_dir: str = ""  # separate directory for log checkpoints (only with async_anchor)
+    log_output_dir: str = ""  # separate directory for log checkpoints when shadow is disabled
+    shadow_resume: str = ""  # soft failure: /dev/shm shadow replica safetensors path
 
     # Deterministic reproducibility
     deterministic: bool = False  # enable torch.use_deterministic_algorithms for cross-process reproducibility
@@ -580,71 +583,87 @@ class Framework:
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
-        # GPU 故障注入 (旁路，可单独使用或叠加在任意层级)
-        # Support env-var overrides for notebook bash cells
+        # GPU failure / shadow config
+        # Env vars may override CLI args, but we compute and log effective values explicitly.
         gpu_fail_step = int(os.environ.get('GPU_FAIL_STEP', str(self.args.gpu_fail_step)))
-        if os.environ.get('INSTANT_RECOVER', '') == '1':
-            self.args.instant_recover = True
-        if os.environ.get('ENABLE_SHADOW', '') == '1':
-            self.args.enable_shadow = True
+        requested_enable_shadow = self.args.enable_shadow or os.environ.get('ENABLE_SHADOW', '') == '1'
+        requested_instant_recover = self.args.instant_recover or os.environ.get('INSTANT_RECOVER', '') == '1'
+        effective_enable_shadow = requested_enable_shadow
+        effective_instant_recover = requested_instant_recover and effective_enable_shadow and gpu_fail_step > 0
 
-        if self.args.batchdiff_ckpt >= 0:
+        self.args.enable_shadow = effective_enable_shadow
+        self.args.instant_recover = effective_instant_recover
+
+        logger.info(
+            "[LogBased Requested] "
+            f"log_based_ckpt={self.args.log_based_ckpt}, "
+            f"enable_shadow={requested_enable_shadow}, "
+            f"instant_recover={requested_instant_recover}, "
+            f"gpu_fail_step={gpu_fail_step}, "
+            f"async_anchor={self.args.async_anchor}"
+        )
+        logger.info(
+            "[LogBased Effective] "
+            f"log_based_ckpt={self.args.log_based_ckpt}, "
+            f"enable_shadow={effective_enable_shadow}, "
+            f"instant_recover={effective_instant_recover}, "
+            f"gpu_fail_step={gpu_fail_step if gpu_fail_step > 0 else -1}, "
+            f"async_anchor={self.args.async_anchor}"
+        )
+
+        if self.args.log_based_ckpt >= 0:
             # Batch Differential Checkpoint enabled
-            batchdiff_callback = BatchDiffCheckpointCallback(
-                batch_size=self.args.batchdiff_ckpt,
+            log_based_callback = LogBasedCheckpointCallback(
+                batch_size=self.args.log_based_ckpt,
                 enable_shadow=self.args.enable_shadow,  # L2: CPU Shadow
                 instant_recover=self.args.instant_recover  # L3: 即时恢复
             )
 
-            # 打印层级配置 (use actual callback state — shadow is forced off for batch_size<=0)
-            if self.args.batchdiff_ckpt == 0:
+            # Print effective experiment level only.
+            if self.args.log_based_ckpt == 0:
                 mode_desc = "Log-based (accumulate all)"
             else:
-                mode_desc = f"Full + Log (every {self.args.batchdiff_ckpt} steps)"
+                mode_desc = f"Full + Log (every {self.args.log_based_ckpt} steps)"
 
             level = f"L1 ({mode_desc})"
-            if batchdiff_callback.enable_shadow:
+            if log_based_callback.enable_shadow:
                 level = f"L2 (CPU Shadow) + {mode_desc}"
-                if batchdiff_callback.instant_recover and gpu_fail_step > 0:
+                if log_based_callback.instant_recover and gpu_fail_step > 0:
                     level = f"L3 (Instant Recovery) + {mode_desc}"
-            logger.info(f"[BatchDiff] Experiment level: {level}")
+            logger.info(f"[LogBased] Experiment level: {level}")
 
-            trainer.add_callback(batchdiff_callback)
+            trainer.add_callback(log_based_callback)
             # 这里是注册一个 post hook，用于在每次 ZO（Zero-Order）训练步完成后，记录本次参数更新的相关信息
             if hasattr(trainer, 'zo') and trainer.zo:
-                trainer.register_zo2_training_step_post_hook(batchdiff_callback._zo_update_hook)
-                batchdiff_callback.trainer = trainer
-                batchdiff_callback._hook_registered = True
+                trainer.register_zo2_training_step_post_hook(log_based_callback._zo_update_hook)
+                log_based_callback.trainer = trainer
+                log_based_callback._hook_registered = True
 
-            # Async anchor checkpoint (requires batchdiff_ckpt >= 1)
-            if self.args.async_anchor and self.args.batchdiff_ckpt >= 1:
-                if self.args.enable_shadow:
-                    logger.warning("[AsyncAnchor] Shadow model is not supported with async anchor. Disabling shadow.")
-                    batchdiff_callback.enable_shadow = False
-                    batchdiff_callback.instant_recover = False
+            # Async anchor checkpoint (requires log_based_ckpt >= 1)
+            if self.args.async_anchor and self.args.log_based_ckpt >= 1:
                 from zo2.trainer.hf_transformers.async_anchor_checkpoint import AsyncAnchorCheckpointer
-                from zo2.trainer.hf_transformers.batch_differential_checkpoint import _detect_tied_weights
+                from zo2.trainer.hf_transformers.log_based_utils import _detect_tied_weights
                 async_ckpt = AsyncAnchorCheckpointer(
                     model=self.model,
                     checkpoint_dir=self.args.output_dir,
                     tied_groups=_detect_tied_weights(self.model),
                 )
                 trainer._async_anchor = async_ckpt
-                batchdiff_callback._async_anchor = async_ckpt
+                log_based_callback._async_anchor = async_ckpt
                 if self.args.log_output_dir:
                     trainer._log_output_dir = self.args.log_output_dir
                     logger.info(f"[AsyncAnchor] Log checkpoints → {self.args.log_output_dir}")
-                logger.info(f"[AsyncAnchor] Enabled (anchor every {self.args.batchdiff_ckpt} steps)")
-            elif self.args.async_anchor and self.args.batchdiff_ckpt < 1:
-                logger.warning("[AsyncAnchor] async_anchor requires batchdiff_ckpt >= 1, ignoring")
+                logger.info(f"[AsyncAnchor] Enabled (anchor every {self.args.log_based_ckpt} steps)")
+            elif self.args.async_anchor and self.args.log_based_ckpt < 1:
+                logger.warning("[AsyncAnchor] async_anchor requires log_based_ckpt >= 1, ignoring")
 
             # 设置 GPU 故障注入
             if gpu_fail_step > 0:
-                batchdiff_callback.failure_simulator.set_fail_step(gpu_fail_step)
+                log_based_callback.failure_simulator.set_fail_step(gpu_fail_step)
                 logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step}")
         else:
-            # L0: Baseline (batchdiff_ckpt=-1)，也可以单独使用 GPU 故障注入
-            logger.info("[BatchDiff] Disabled (L0 baseline), using default Trainer checkpoint")
+            # L0: Baseline (log_based_ckpt=-1)，也可以单独使用 GPU 故障注入
+            logger.info("[LogBased] Disabled (L0 baseline), using default Trainer checkpoint")
             if gpu_fail_step > 0:
                 logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step} (L0 baseline, no recovery)")
 
@@ -652,36 +671,68 @@ class Framework:
         last_checkpoint = None
         from transformers.trainer_utils import get_last_checkpoint
 
-        # Handle batch differential resume
+        # Handle log-based resume
         # Timer starts here — from_pretrained is before this (same for both paths).
         t_full_resume_start = time.time()
-        if self.args.batchdiff_resume:
-            logger.info(f"[BatchDiff Resume] Resuming from batch differential checkpoint: {self.args.batchdiff_resume}")
+        if self.args.log_based_resume:
+            logger.info(f"[LogBased Resume] Resuming from log-based checkpoint: {self.args.log_based_resume}")
 
-            # Both full and log-based go through resume_from_batch_diff.
+            # Both full and log-based go through resume_from_log_based.
             # Full: loads checkpoint from disk, returns state_dict
             # Log-based: loads base from _load_base_state (page cache hit) + replay
-            recovered_state = resume_from_batch_diff(
-                checkpoint_path=self.args.batchdiff_resume,
+            recovered_state = resume_from_log_based(
+                checkpoint_path=self.args.log_based_resume,
                 output_dir=self.args.output_dir,
                 pretrained_model_name=self.args.model_name,
-                device=self.args.batchdiff_replay_device,
-                simulate_perturbation=self.args.batchdiff_simulate_perturbation,
-                replay_in_fp32=self.args.batchdiff_replay_fp32,
+                device=self.args.log_based_replay_device,
+                simulate_perturbation=self.args.log_based_simulate_perturbation,
+                replay_in_fp32=self.args.log_based_replay_fp32,
                 rng_device=self.args.zo_rng_device,
                 zo2_mode=(self.args.zo_mode == "zo2"),
+                shadow_path=self.args.shadow_resume or None,
+            )
+            recovered_state_on_cuda = any(
+                torch.is_tensor(tensor) and tensor.is_cuda for tensor in recovered_state.values()
             )
             self.model.load_state_dict(recovered_state)
 
-            last_checkpoint = self.args.batchdiff_resume
+            # Diagnostic: verify recovered model CKSUM matches original
+            _cksum_recovered = sum(p.data.float().sum().item() for p in self.model.parameters())
+            _seen_ptrs = set()
+            _cksum_unique = 0.0
+            for p in self.model.parameters():
+                if p.data_ptr() not in _seen_ptrs:
+                    _seen_ptrs.add(p.data_ptr())
+                    _cksum_unique += p.data.float().sum().item()
+            logger.info(
+                f"[DIAG] CKSUM immediately after load_state_dict: "
+                f"all_params={_cksum_recovered:.10e} unique_params={_cksum_unique:.10e}"
+            )
+            for name, param in self.model.named_parameters():
+                if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                    logger.info(f"[DIAG] post-load {name}={param.data.float().sum().item():.10e}")
+
+            # The replay path can return a full CUDA state_dict. After load_state_dict,
+            # drop that temporary copy so resumed training does not keep two model copies on GPU.
+            del recovered_state
+            gc.collect()
+            if recovered_state_on_cuda and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                logger.info(
+                    "[LogBased Resume] Released temporary replay state "
+                    f"(GPU alloc={torch.cuda.memory_allocated() / 1024**3:.2f} GB, "
+                    f"reserved={torch.cuda.memory_reserved() / 1024**3:.2f} GB)"
+                )
+
+            last_checkpoint = self.args.log_based_resume
             import re
             match = re.search(r'checkpoint-(\d+)', last_checkpoint)
             resumed_step = int(match.group(1)) if match else 0
-            logger.info(f"[BatchDiff Resume] Will continue training from step {resumed_step}")
-        elif self.args.batchdiff_ckpt < 0 and os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
-            # HuggingFace auto-resume: only when batchdiff is NOT active.
-            # Batchdiff checkpoint dirs only contain log files (no model weights),
-            # so HF's auto-resume can't load them. Use --batchdiff_resume instead.
+            logger.info(f"[LogBased Resume] Will continue training from step {resumed_step}")
+        elif self.args.log_based_ckpt < 0 and os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
+            # HuggingFace auto-resume: only when log-based checkpointing is NOT active.
+            # Log-based checkpoint dirs only contain log files (no model weights),
+            # so HF's auto-resume can't load them. Use --log_based_resume instead.
             last_checkpoint = get_last_checkpoint(self.args.output_dir)
 
         if last_checkpoint is not None and self.args.resume_from_checkpoint is None:
