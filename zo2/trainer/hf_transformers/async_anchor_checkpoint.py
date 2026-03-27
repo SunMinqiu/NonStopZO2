@@ -142,6 +142,7 @@ class AsyncAnchorCheckpointer:
         self._latest_completed_step = -1
         self._latest_completed_path = None
         self._latest_published_step = -1
+        self._latest_published_snapshot = None
 
         # Background persist thread
         self._persist_queue = queue.Queue()
@@ -250,6 +251,17 @@ class AsyncAnchorCheckpointer:
         with self._lock:
             return self._latest_published_step
 
+    def consume_latest_published_snapshot(self, min_step_exclusive: int = -1):
+        """Return the newest published in-memory snapshot if it is newer than min_step_exclusive."""
+        with self._lock:
+            if self._latest_published_step <= min_step_exclusive:
+                return None
+            snapshot = self._latest_published_snapshot
+            if snapshot is None:
+                return None
+            self._latest_published_snapshot = None
+            return self._latest_published_step, snapshot
+
     def get_anchor_latest_path(self):
         return self._anchor_latest_path
 
@@ -339,6 +351,7 @@ class AsyncAnchorCheckpointer:
             with self._lock:
                 if job.step > self._latest_published_step:
                     self._latest_published_step = job.step
+                    self._latest_published_snapshot = snapshot
 
             # Phase 2b: Fork subprocess for disk I/O.
             os.makedirs(job.output_dir, exist_ok=True)

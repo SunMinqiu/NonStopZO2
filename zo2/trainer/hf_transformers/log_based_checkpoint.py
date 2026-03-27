@@ -34,6 +34,8 @@ Environment variables:
       to determine optimal P. Memory: P × model_size per z-buffer slot.
   - SHADOW_COMMIT_INTERVAL=N: Shadow commits `/dev/shm` replica every N updates
       (default: 1). Rebase always forces an immediate commit.
+  - SHADOW_FLAT_COMMIT=1: Use preallocated flat `/dev/shm` buffers for shadow
+      commit/recover instead of writing a safetensors replica on every commit.
 """
 
 import hashlib
@@ -67,7 +69,13 @@ from .log_based_replay import (
     _replay_updates_on_state,
     _set_replay_adam_state,
 )
-from .log_based_shadow import _load_shadow_replica, _shadow_process_main
+from .log_based_shadow import (
+    _build_shadow_flat_layout,
+    _init_shadow_flat_storage,
+    _load_shadow_flat_replica,
+    _load_shadow_replica,
+    _shadow_process_main,
+)
 from .log_based_utils import (
     _DTYPE_MAP,
     _atomic_save_state_dict_safetensors,
@@ -115,6 +123,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         # Base checkpoint state (CPU)
         self.base_checkpoint_state: OrderedDict = None
+        self.active_base_step: int = 0
         self.base_checkpoint_path: str = None
         self.base_checkpoint_step: int = 0
         self.is_first_save = True
@@ -135,6 +144,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
         # Base pending seed: the seed from the step that became the current base checkpoint.
         # Needed by ZO2 replay: the first entry after a base uses this as prev_seed for z generation.
         self._base_pending_seed = 0
+        self._active_base_pending_seed = 0
 
         # Shadow model (real-time tracking)
         self.shadow_step = 0
@@ -147,6 +157,10 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self.shadow_step_val = None      # mp.Value('i', lock=False): latest committed step
         self.shadow_replica_path = None  # /dev/shm committed shadow replica
         self.anchor_latest_path = None   # /dev/shm async/sync anchor latest
+        self.use_shadow_flat_commit = False
+        self.shadow_flat_header_path = None
+        self.shadow_flat_buffer_paths = ()
+        self.shadow_flat_storage = None
         self.shadow_commit_interval = 1
         self._last_shadow_rebased_anchor_step = -1
 
@@ -185,8 +199,39 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def _shadow_replica_path(self):
         return f"/dev/shm/zo_shadow_latest_{self._run_hash()}.safetensors"
 
+    def _shadow_flat_header_storage_path(self):
+        return f"/dev/shm/zo_shadow_latest_{self._run_hash()}.flat.header.json"
+
+    def _shadow_flat_buffer_storage_paths(self):
+        stem = f"/dev/shm/zo_shadow_latest_{self._run_hash()}.flat"
+        return (f"{stem}.0.bin", f"{stem}.1.bin")
+
     def _anchor_latest_path(self):
         return f"/dev/shm/zo_anchor_latest_{self._run_hash()}.safetensors"
+
+    def _ensure_shadow_flat_storage(self, state_dict):
+        if not self.use_shadow_flat_commit:
+            return
+        if self.shadow_flat_storage is None:
+            self.shadow_flat_storage = {
+                "enabled": True,
+                "layout": _build_shadow_flat_layout(
+                    state_dict,
+                    tied_groups=getattr(self, "_tied_weight_groups", []),
+                ),
+                "header_path": self.shadow_flat_header_path,
+                "buffer_paths": tuple(self.shadow_flat_buffer_paths),
+            }
+
+    def _shadow_storage_available(self):
+        if not self.enable_shadow:
+            return False
+        if self.use_shadow_flat_commit:
+            return bool(
+                self.shadow_flat_header_path and
+                os.path.exists(self.shadow_flat_header_path)
+            )
+        return bool(self.shadow_replica_path and os.path.exists(self.shadow_replica_path))
 
     def _shadow_secondary_keys(self):
         excluded = set()
@@ -238,28 +283,65 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def _refresh_shadow_from_base(self, *, step=None, commit_now=True):
         if self.base_checkpoint_state is None:
             return
-        step = int(self.base_checkpoint_step if step is None else step)
+        step = int(self.active_base_step if step is None else step)
         self.shadow_base_step = step
         self.shadow_step = step
-        if commit_now and self.enable_shadow and self.shadow_replica_path:
-            save_state = OrderedDict(
-                (key, value)
-                for key, value in self.base_checkpoint_state.items()
-                if key not in self._shadow_secondary_keys()
-            )
-            _atomic_save_state_dict_safetensors(
-                save_state,
-                self.shadow_replica_path,
-                metadata={
-                    "base_step": step,
-                    "committed_step": step,
-                },
-            )
+        if commit_now and self.enable_shadow:
+            if self.use_shadow_flat_commit:
+                self._ensure_shadow_flat_storage(self.base_checkpoint_state)
+                _init_shadow_flat_storage(
+                    self.base_checkpoint_state,
+                    self.shadow_flat_storage,
+                    step,
+                    step,
+                    tied_groups=getattr(self, "_tied_weight_groups", []),
+                )
+            elif self.shadow_replica_path:
+                save_state = OrderedDict(
+                    (key, value)
+                    for key, value in self.base_checkpoint_state.items()
+                    if key not in self._shadow_secondary_keys()
+                )
+                _atomic_save_state_dict_safetensors(
+                    save_state,
+                    self.shadow_replica_path,
+                    metadata={
+                        "base_step": step,
+                        "committed_step": step,
+                    },
+                )
+
+    def _seed_for_step(self, step, fallback=None):
+        default = self._base_pending_seed if fallback is None else fallback
+        if step <= 0:
+            return default
+        with self.update_lock:
+            for update in reversed(self.update_history):
+                if int(update.get("step", -1)) <= step:
+                    return int(update.get("seed", default))
+        return default
+
+    def _activate_base_state(self, state_dict, step):
+        if not isinstance(state_dict, OrderedDict):
+            state_dict = OrderedDict(state_dict.items())
+        if getattr(self, "_tied_weight_groups", None):
+            _tie_state_dict_inplace(state_dict, self._tied_weight_groups)
+        self.base_checkpoint_state = state_dict
+        self.active_base_step = int(step)
+        self._active_base_pending_seed = self._seed_for_step(self.active_base_step)
 
     def on_train_begin(self, args, state, control, model=None, **kwargs):
         """Called at training start"""
         self.output_dir = args.output_dir
         self.shadow_replica_path = self._shadow_replica_path() if self.enable_shadow else None
+        self.use_shadow_flat_commit = self.enable_shadow and os.environ.get("SHADOW_FLAT_COMMIT", "0") == "1"
+        self.shadow_flat_header_path = (
+            self._shadow_flat_header_storage_path() if self.use_shadow_flat_commit else None
+        )
+        self.shadow_flat_buffer_paths = (
+            self._shadow_flat_buffer_storage_paths() if self.use_shadow_flat_commit else ()
+        )
+        self.shadow_flat_storage = None
         self.anchor_latest_path = self._anchor_latest_path() if self.batch_size >= 1 else None
         self.shadow_commit_interval = self._shadow_commit_interval_value()
 
@@ -328,12 +410,14 @@ class LogBasedCheckpointCallback(TrainerCallback):
             f"  LOG_BASED_CKPT={self.batch_size}\n"
             f"  ENABLE_SHADOW={self.enable_shadow}\n"
             f"  INSTANT_RECOVER={self.instant_recover}\n"
+            f"  FAILURE_TYPE={os.environ.get('FAILURE_TYPE', 'soft')}\n"
             f"  GPU_FAIL_STEP={effective_gpu_fail_step}\n"
             f"  ASYNC_ANCHOR={effective_async_anchor}\n"
             f"  ZO_RNG_DEVICE={effective_rng_device}\n"
             f"  SHADOW_PIPELINE={os.environ.get('SHADOW_PIPELINE', '0')}\n"
             f"  SHADOW_PIPELINE_WORKERS={os.environ.get('SHADOW_PIPELINE_WORKERS', '2')}\n"
             f"  SHADOW_COMMIT_INTERVAL={self.shadow_commit_interval}\n"
+            f"  SHADOW_FLAT_COMMIT={self.use_shadow_flat_commit}\n"
             f"  SHADOW_RESERVE_THREADS={os.environ.get('SHADOW_RESERVE_THREADS', '1')}\n"
             f"  SHADOW_CONSUMER_THREADS={os.environ.get('SHADOW_CONSUMER_THREADS', 'auto')}\n"
             f"  LOG_BASED_SIMULATE_PERTURBATION={os.environ.get('LOG_BASED_SIMULATE_PERTURBATION', '1')}\n"
@@ -363,6 +447,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
             f" → zo_rng.get_num_threads()={_zo_actual}\n"
             f"  SHADOW_PIPELINE_WORKERS={os.environ.get('SHADOW_PIPELINE_WORKERS', '2')}\n"
             f"  SHADOW_COMMIT_INTERVAL={self.shadow_commit_interval}\n"
+            f"  SHADOW_FLAT_COMMIT={self.use_shadow_flat_commit}\n"
             f"  SHADOW_CONSUMER_THREADS={os.environ.get('SHADOW_CONSUMER_THREADS', 'auto')}\n"
             f"  SHADOW_RESERVE_THREADS={os.environ.get('SHADOW_RESERVE_THREADS', '1')}"
         )
@@ -397,8 +482,10 @@ class LogBasedCheckpointCallback(TrainerCallback):
         logger.info(f"[LogBased] Trainable params: {len(self._trainable_param_names)} / {total_params}")
 
         self.base_checkpoint_state = _clone_state_dict_to_cpu(model.state_dict())
+        self.active_base_step = 0
         self.base_checkpoint_step = 0
         self.base_checkpoint_path = "__initial__"  # Special marker for initial state
+        self._active_base_pending_seed = 0
         self.shadow_base_step = 0
         self.shadow_step = 0
 
@@ -542,13 +629,14 @@ class LogBasedCheckpointCallback(TrainerCallback):
             self.base_checkpoint_path = "__initial__"
             self.base_checkpoint_step = 0
 
-        self.base_checkpoint_state = _clone_state_dict_to_cpu(model.state_dict())
+        self._activate_base_state(_clone_state_dict_to_cpu(model.state_dict()), state.global_step)
         self.shadow_base_step = int(state.global_step)
         self.shadow_step = int(state.global_step)
         if self.enable_shadow:
             self._refresh_shadow_from_base(step=state.global_step, commit_now=True)
         if self.anchor_latest_path and self.batch_size >= 1:
             self._publish_anchor_latest(self.base_checkpoint_state, state.global_step)
+            self._last_shadow_rebased_anchor_step = int(state.global_step)
 
         self.is_first_save = False
         mem_mb = self._get_memory_size()
@@ -669,6 +757,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 P,
                 self.shadow_replica_path,
                 self.shadow_commit_interval,
+                self.shadow_flat_storage,
             ),
             daemon=True,
         )
@@ -793,11 +882,13 @@ class LogBasedCheckpointCallback(TrainerCallback):
         """Called at end of each step"""
         self.current_step = state.global_step
 
-        if self.enable_shadow:
-            async_anchor = getattr(self, "_async_anchor", None) or getattr(self.trainer, "_async_anchor", None)
-            if async_anchor is not None:
-                published_step = async_anchor.get_latest_published_anchor_step()
-                if published_step > self._last_shadow_rebased_anchor_step:
+        async_anchor = getattr(self, "_async_anchor", None) or getattr(self.trainer, "_async_anchor", None)
+        if async_anchor is not None:
+            published = async_anchor.consume_latest_published_snapshot(self.active_base_step)
+            if published is not None:
+                published_step, published_state = published
+                self._activate_base_state(published_state, published_step)
+                if self.enable_shadow and published_step > self._last_shadow_rebased_anchor_step:
                     self._queue_shadow_rebase(published_step, self.anchor_latest_path)
                     self._last_shadow_rebased_anchor_step = published_step
 
@@ -824,11 +915,17 @@ class LogBasedCheckpointCallback(TrainerCallback):
         """Recover from the latest committed shadow replica on /dev/shm."""
         t_start = time.time()
 
-        if self.enable_shadow and self.shadow_replica_path and os.path.exists(self.shadow_replica_path):
-            recovered, base_step, shadow_step = _load_shadow_replica(
-                self.shadow_replica_path,
-                tied_groups=getattr(self, "_tied_weight_groups", []),
-            )
+        if self.enable_shadow and self._shadow_storage_available():
+            if self.use_shadow_flat_commit and self.shadow_flat_storage is not None:
+                recovered, base_step, shadow_step = _load_shadow_flat_replica(
+                    self.shadow_flat_storage,
+                    tied_groups=getattr(self, "_tied_weight_groups", []),
+                )
+            else:
+                recovered, base_step, shadow_step = _load_shadow_replica(
+                    self.shadow_replica_path,
+                    tied_groups=getattr(self, "_tied_weight_groups", []),
+                )
             self.shadow_base_step = base_step
             self.shadow_step = shadow_step
 
@@ -858,11 +955,15 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         t_start = time.time()
 
+        base_step = int(self.active_base_step)
         with self.update_lock:
-            updates = self.update_history.copy()
+            updates = [u for u in self.update_history if int(u.get("step", -1)) > base_step]
 
         num_updates = len(updates)
-        logger.info(f"[Recovery] Reconstructing on-demand: replaying {num_updates} updates...")
+        logger.info(
+            f"[Recovery] Reconstructing on-demand from active_base_step={base_step}: "
+            f"replaying {num_updates} updates..."
+        )
 
         # Copy base checkpoint state
         reconstructed = OrderedDict()
@@ -875,14 +976,21 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         # Get zo_eps for old update records that don't include it
         fallback_zo_eps = 0.0
+        rng_device = "native"
+        zo2_mode = False
         if self.trainer and hasattr(self.trainer, 'model') and hasattr(self.trainer.model, 'opt'):
             fallback_zo_eps = getattr(self.trainer.model.opt, 'zo_eps', 0.0)
+            rng_device = getattr(self.trainer.model.opt, 'rng_device', 'native')
+            zo2_mode = hasattr(self.trainer.model.opt, 'rstate_queue')
 
         # Replay all updates using only trainable param names (matching zo_update iteration)
         _replay_updates_on_state(
             reconstructed, updates,
             trainable_param_names=self._trainable_param_names,
-            default_zo_eps=fallback_zo_eps
+            default_zo_eps=fallback_zo_eps,
+            rng_device=rng_device,
+            zo2_mode=zo2_mode,
+            initial_prev_seed=self._active_base_pending_seed,
         )
         if num_updates > 0:
             logger.info(f"[Recovery] Replayed {num_updates} updates")
@@ -901,7 +1009,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def get_recovery_status(self) -> dict:
         """Get current recovery status"""
         if self.enable_shadow:
-            shadow_available = bool(self.shadow_replica_path and os.path.exists(self.shadow_replica_path))
+            shadow_available = self._shadow_storage_available()
             shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
         else:
             shadow_step = -1
@@ -953,7 +1061,10 @@ class LogBasedCheckpointCallback(TrainerCallback):
         """Update base_checkpoint_state from current model (full step only for batch_size>=1).
         GPU → CPU clone, then publish anchor latest / notify shadow to rebase."""
         self.base_checkpoint_state = _clone_state_dict_to_cpu(model.state_dict())
+        self.active_base_step = int(step)
         self.base_checkpoint_step = int(step)
+        self._active_base_pending_seed = self._pending_seed
+        self._base_pending_seed = self._pending_seed
         if self.batch_size >= 1:
             anchor_path = self._publish_anchor_latest(self.base_checkpoint_state, step)
             if self.enable_shadow and anchor_path is not None:
@@ -969,9 +1080,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
                     self._base_pending_seed = u['seed']
                     break
             self.update_history = [u for u in self.update_history if u['step'] > step]
-        if self.enable_shadow and self.anchor_latest_path and os.path.exists(self.anchor_latest_path):
-            self._queue_shadow_rebase(step, self.anchor_latest_path)
-            self._last_shadow_rebased_anchor_step = max(self._last_shadow_rebased_anchor_step, int(step))
 
     def _get_memory_size(self):
         if self.base_checkpoint_state is None:
@@ -1051,7 +1159,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
             del self.base_checkpoint_state
             self.base_checkpoint_state = None
 
-        for path in [self.shadow_replica_path, self.anchor_latest_path]:
+        cleanup_paths = [self.shadow_replica_path, self.anchor_latest_path]
+        cleanup_paths.extend(self.shadow_flat_buffer_paths)
+        if self.shadow_flat_header_path:
+            cleanup_paths.append(self.shadow_flat_header_path)
+
+        for path in cleanup_paths:
             if path and os.path.exists(path):
                 try:
                     os.remove(path)

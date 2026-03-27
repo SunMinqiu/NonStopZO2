@@ -1,6 +1,9 @@
 import logging
+import json
+import mmap
 import os
 import queue as queue_module
+import tempfile
 import threading
 import time
 from collections import OrderedDict
@@ -26,7 +29,197 @@ def _secondary_tied_keys(tied_groups):
     return excluded
 
 
-def _commit_shadow_state(state_dict, replica_path, base_step, committed_step, tied_groups=None):
+def _build_shadow_flat_layout(state_dict, tied_groups=None):
+    excluded = _secondary_tied_keys(tied_groups)
+    entries = []
+    offset = 0
+    for name, tensor in state_dict.items():
+        if name in excluded:
+            continue
+        tensor = tensor.detach()
+        numel = int(tensor.numel())
+        nbytes = int(numel * tensor.element_size())
+        entries.append(
+            {
+                "name": name,
+                "offset": offset,
+                "numel": numel,
+                "shape": tuple(tensor.shape),
+                "dtype": tensor.dtype,
+            }
+        )
+        offset += nbytes
+    return {"entries": entries, "total_bytes": offset}
+
+
+def _write_shadow_flat_header(header_path, header):
+    os.makedirs(os.path.dirname(header_path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{os.path.basename(header_path)}.",
+        suffix=".tmp",
+        dir=os.path.dirname(header_path),
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(header, f)
+            f.flush()
+        os.replace(tmp_path, header_path)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _read_shadow_flat_header(header_path):
+    with open(header_path, "r") as f:
+        return json.load(f)
+
+
+def _ensure_shadow_flat_files(buffer_paths, total_bytes):
+    if total_bytes <= 0:
+        raise ValueError("shadow flat storage requires a positive total_bytes")
+    for path in buffer_paths:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.ftruncate(fd, total_bytes)
+        finally:
+            os.close(fd)
+
+
+def _open_shadow_flat_views(layout, buffer_path):
+    total_bytes = int(layout["total_bytes"])
+    fd = os.open(buffer_path, os.O_RDWR)
+    mm = mmap.mmap(fd, total_bytes, access=mmap.ACCESS_WRITE)
+    views = OrderedDict()
+    for entry in layout["entries"]:
+        tensor = torch.frombuffer(
+            mm,
+            dtype=entry["dtype"],
+            count=entry["numel"],
+            offset=entry["offset"],
+        ).view(entry["shape"])
+        views[entry["name"]] = tensor
+    return fd, mm, views
+
+
+def _close_shadow_flat_views(fd, mm, views=None):
+    if views is not None:
+        views.clear()
+    try:
+        mm.close()
+    finally:
+        os.close(fd)
+
+
+def _init_shadow_flat_storage(state_dict, flat_storage, base_step, committed_step, tied_groups=None):
+    layout = flat_storage["layout"]
+    header_path = flat_storage["header_path"]
+    buffer_paths = flat_storage["buffer_paths"]
+    _ensure_shadow_flat_files(buffer_paths, int(layout["total_bytes"]))
+    fd, mm, views = _open_shadow_flat_views(layout, buffer_paths[0])
+    try:
+        for name, target in views.items():
+            target.copy_(state_dict[name])
+        mm.flush()
+    finally:
+        _close_shadow_flat_views(fd, mm, views)
+    _write_shadow_flat_header(
+        header_path,
+        {
+            "active_buffer": 0,
+            "base_step": int(base_step),
+            "committed_step": int(committed_step),
+        },
+    )
+
+
+def _open_shadow_flat_writer(flat_storage):
+    layout = flat_storage["layout"]
+    header_path = flat_storage["header_path"]
+    buffer_paths = flat_storage["buffer_paths"]
+    _ensure_shadow_flat_files(buffer_paths, int(layout["total_bytes"]))
+    header = (
+        _read_shadow_flat_header(header_path)
+        if os.path.exists(header_path)
+        else {"active_buffer": 0, "base_step": 0, "committed_step": 0}
+    )
+    fds = []
+    mmaps = []
+    views = []
+    for path in buffer_paths:
+        fd, mm, tensor_views = _open_shadow_flat_views(layout, path)
+        fds.append(fd)
+        mmaps.append(mm)
+        views.append(tensor_views)
+    return {
+        "header_path": header_path,
+        "buffer_paths": tuple(buffer_paths),
+        "layout": layout,
+        "fds": fds,
+        "mmaps": mmaps,
+        "views": views,
+        "active_buffer": int(header.get("active_buffer", 0)),
+    }
+
+
+def _close_shadow_flat_writer(flat_writer):
+    for view_dict in flat_writer.get("views", []):
+        view_dict.clear()
+    for mm in flat_writer.get("mmaps", []):
+        mm.close()
+    for fd in flat_writer.get("fds", []):
+        os.close(fd)
+
+
+def _commit_shadow_state_flat(state_dict, flat_writer, base_step, committed_step):
+    target_idx = 1 - int(flat_writer["active_buffer"])
+    target_views = flat_writer["views"][target_idx]
+    for name, target in target_views.items():
+        target.copy_(state_dict[name])
+    flat_writer["mmaps"][target_idx].flush()
+    _write_shadow_flat_header(
+        flat_writer["header_path"],
+        {
+            "active_buffer": target_idx,
+            "base_step": int(base_step),
+            "committed_step": int(committed_step),
+        },
+    )
+    flat_writer["active_buffer"] = target_idx
+
+
+def _load_shadow_flat_replica(flat_storage, tied_groups=None):
+    header = _read_shadow_flat_header(flat_storage["header_path"])
+    active_buffer = int(header.get("active_buffer", 0))
+    fd, mm, views = _open_shadow_flat_views(flat_storage["layout"], flat_storage["buffer_paths"][active_buffer])
+    try:
+        state_dict = OrderedDict(
+            (name, tensor.clone()) for name, tensor in views.items()
+        )
+    finally:
+        _close_shadow_flat_views(fd, mm, views)
+    if tied_groups:
+        _tie_state_dict_inplace(state_dict, tied_groups)
+    base_step = int(header.get("base_step", "0"))
+    committed_step = int(header.get("committed_step", "0"))
+    logger.info(
+        f"[Shadow Recovery] Loaded {len(state_dict)} tensors from flat storage, "
+        f"base_step={base_step} committed_step={committed_step}"
+    )
+    return state_dict, base_step, committed_step
+
+
+def _commit_shadow_state(
+    state_dict,
+    replica_path,
+    base_step,
+    committed_step,
+    tied_groups=None,
+    flat_writer=None,
+):
+    if flat_writer is not None:
+        _commit_shadow_state_flat(state_dict, flat_writer, base_step, committed_step)
+        return
     save_state = OrderedDict(
         (key, value)
         for key, value in state_dict.items()
@@ -70,6 +263,52 @@ def _rebase_working_state(anchor_path, tied_groups, _logger):
     return rebased, base_step, committed_step
 
 
+def _trim_retained_updates(retained_updates, floor_step):
+    stale_steps = [step for step in retained_updates if step <= floor_step]
+    for step in stale_steps:
+        retained_updates.pop(step, None)
+
+
+def _replay_retained_suffix(
+    retained_updates,
+    rebase_step,
+    working_state,
+    param_names,
+    rng_device,
+    simulate_perturbation,
+    default_zo_eps,
+    adam_state,
+    _bdc,
+    _logger,
+):
+    replayed_steps = []
+    for step in sorted(retained_updates):
+        if step <= rebase_step:
+            continue
+        update = retained_updates[step]
+        z_dict = _bdc._generate_z_for_one_step(update["seed"], param_names, working_state, rng_device)
+        try:
+            _bdc._apply_single_update_with_pregenerated_z(
+                working_state,
+                update,
+                param_names,
+                z_dict,
+                default_zo_eps=default_zo_eps,
+                simulate_perturbation=simulate_perturbation,
+                adam_state=adam_state,
+            )
+        finally:
+            del z_dict
+        replayed_steps.append(step)
+    if replayed_steps:
+        _logger.info(
+            f"[Shadow] Replay-after-rebase: base={rebase_step} "
+            f"replayed={len(replayed_steps)} last={replayed_steps[-1]}"
+        )
+        return replayed_steps[-1]
+    return rebase_step
+
+
 def _shadow_process_main(
     update_queue,
     initial_state,
@@ -86,6 +325,7 @@ def _shadow_process_main(
     P,
     replica_path,
     commit_interval,
+    flat_storage,
 ):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     _logger = logging.getLogger(__name__ + ".shadow_process")
@@ -167,41 +407,54 @@ def _shadow_process_main(
         }
         _logger.info(f"[Shadow Process] Adam state initialized: betas={adam_config['betas']}")
 
-    if use_pipeline:
-        _shadow_process_pipelined(
-            update_queue,
-            initial_state,
-            initial_base_step,
-            initial_committed_step,
-            shadow_step_val,
-            param_names,
-            tied_groups,
-            rng_device,
-            simulate_perturbation,
-            default_zo_eps,
-            adam_state,
-            P,
-            replica_path,
-            commit_interval,
-            _logger,
+    flat_writer = None
+    if flat_storage and flat_storage.get("enabled"):
+        flat_writer = _open_shadow_flat_writer(flat_storage)
+        _logger.info(
+            f"[Shadow Flat] enabled total_bytes={flat_storage['layout']['total_bytes'] / 1e9:.2f}GB"
         )
-    else:
-        _shadow_process_serial(
-            update_queue,
-            initial_state,
-            initial_base_step,
-            initial_committed_step,
-            shadow_step_val,
-            param_names,
-            tied_groups,
-            rng_device,
-            simulate_perturbation,
-            default_zo_eps,
-            adam_state,
-            replica_path,
-            commit_interval,
-            _logger,
-        )
+
+    try:
+        if use_pipeline:
+            _shadow_process_pipelined(
+                update_queue,
+                initial_state,
+                initial_base_step,
+                initial_committed_step,
+                shadow_step_val,
+                param_names,
+                tied_groups,
+                rng_device,
+                simulate_perturbation,
+                default_zo_eps,
+                adam_state,
+                P,
+                replica_path,
+                commit_interval,
+                _logger,
+                flat_writer,
+            )
+        else:
+            _shadow_process_serial(
+                update_queue,
+                initial_state,
+                initial_base_step,
+                initial_committed_step,
+                shadow_step_val,
+                param_names,
+                tied_groups,
+                rng_device,
+                simulate_perturbation,
+                default_zo_eps,
+                adam_state,
+                replica_path,
+                commit_interval,
+                _logger,
+                flat_writer,
+            )
+    finally:
+        if flat_writer is not None:
+            _close_shadow_flat_writer(flat_writer)
 
 
 def _shadow_process_serial(
@@ -219,6 +472,7 @@ def _shadow_process_serial(
     replica_path,
     commit_interval,
     _logger,
+    flat_writer=None,
 ):
     from . import log_based_checkpoint as _bdc
 
@@ -229,6 +483,7 @@ def _shadow_process_serial(
     committed_step = int(initial_committed_step)
     last_applied_step = committed_step
     pending_since_commit = 0
+    retained_updates = {}
 
     while True:
         try:
@@ -243,13 +498,34 @@ def _shadow_process_serial(
             working_state, base_step, committed_step = _rebase_working_state(
                 cmd["path"], tied_groups, _logger
             )
-            last_applied_step = committed_step
-            pending_since_commit = 0
             if adam_state is not None:
+                # TODO: restore Adam shadow state from the rebased anchor instead of resetting.
                 adam_state["m"].clear()
                 adam_state["v"].clear()
                 adam_state["t"] = 0
-            _commit_shadow_state(working_state, replica_path, base_step, committed_step, tied_groups=tied_groups)
+            last_applied_step = _replay_retained_suffix(
+                retained_updates,
+                committed_step,
+                working_state,
+                param_names,
+                rng_device,
+                simulate_perturbation,
+                default_zo_eps,
+                adam_state,
+                _bdc,
+                _logger,
+            )
+            _trim_retained_updates(retained_updates, committed_step)
+            committed_step = last_applied_step
+            pending_since_commit = 0
+            _commit_shadow_state(
+                working_state,
+                replica_path,
+                base_step,
+                committed_step,
+                tied_groups=tied_groups,
+                flat_writer=flat_writer,
+            )
             shadow_step_val.value = committed_step
             continue
         if kind != "update":
@@ -257,6 +533,7 @@ def _shadow_process_serial(
 
         update = cmd["update"]
         step = int(update["step"])
+        retained_updates[step] = update
         if step <= last_applied_step:
             continue
 
@@ -284,7 +561,14 @@ def _shadow_process_serial(
         if pending_since_commit >= commit_interval:
             t0_commit = time.time()
             committed_step = last_applied_step
-            _commit_shadow_state(working_state, replica_path, base_step, committed_step, tied_groups=tied_groups)
+            _commit_shadow_state(
+                working_state,
+                replica_path,
+                base_step,
+                committed_step,
+                tied_groups=tied_groups,
+                flat_writer=flat_writer,
+            )
             shadow_step_val.value = committed_step
             pending_since_commit = 0
             t_commit = time.time() - t0_commit
@@ -298,7 +582,14 @@ def _shadow_process_serial(
         )
 
     if last_applied_step > committed_step:
-        _commit_shadow_state(working_state, replica_path, base_step, last_applied_step, tied_groups=tied_groups)
+        _commit_shadow_state(
+            working_state,
+            replica_path,
+            base_step,
+            last_applied_step,
+            tied_groups=tied_groups,
+            flat_writer=flat_writer,
+        )
         shadow_step_val.value = last_applied_step
     _logger.info("[Shadow Process] Stopped (serial)")
 
@@ -319,6 +610,7 @@ def _shadow_process_pipelined(
     replica_path,
     commit_interval,
     _logger,
+    flat_writer=None,
 ):
     from . import log_based_checkpoint as _bdc
 
@@ -342,9 +634,12 @@ def _shadow_process_pipelined(
     next_step_to_assign = [consumer_step]
 
     producer_timing = {"duration_ms": 0.0}
+    retained_updates = {}
+    generation = [0]
 
     def producer():
         try:
+            local_generation = generation[0]
             while not producer_stop.is_set():
                 with assign_lock:
                     step_idx = next_step_to_assign[0]
@@ -370,7 +665,7 @@ def _shadow_process_pipelined(
 
                 while not producer_stop.is_set():
                     try:
-                        result_queue.put((step_idx, z_dict, update), timeout=0.05)
+                        result_queue.put((local_generation, step_idx, z_dict, update), timeout=0.05)
                         break
                     except queue_module.Full:
                         continue
@@ -411,12 +706,14 @@ def _shadow_process_pipelined(
                             base_step,
                             last_applied_step,
                             tied_groups=tied_groups,
+                            flat_writer=flat_writer,
                         )
                         shadow_step_val.value = last_applied_step
                     _logger.info("[Shadow Pipeline] Stopped")
                     return
                 if kind == "rebase":
                     _stop_producers(threads)
+                    generation[0] += 1
                     with internal_lock:
                         internal_updates.clear()
                     pending_results.clear()
@@ -429,26 +726,42 @@ def _shadow_process_pipelined(
                     working_state, base_step, committed_step = _rebase_working_state(
                         cmd["path"], tied_groups, _logger
                     )
-                    last_applied_step = committed_step
-                    consumer_step = committed_step + 1
-                    next_step_to_assign[0] = consumer_step
-                    pending_since_commit = 0
                     if adam_state is not None:
+                        # TODO: restore Adam shadow state from the rebased anchor instead of resetting.
                         adam_state["m"].clear()
                         adam_state["v"].clear()
                         adam_state["t"] = 0
+                    last_applied_step = _replay_retained_suffix(
+                        retained_updates,
+                        committed_step,
+                        working_state,
+                        param_names,
+                        rng_device,
+                        simulate_perturbation,
+                        default_zo_eps,
+                        adam_state,
+                        _bdc,
+                        _logger,
+                    )
+                    _trim_retained_updates(retained_updates, committed_step)
+                    committed_step = last_applied_step
+                    consumer_step = committed_step + 1
+                    next_step_to_assign[0] = consumer_step
+                    pending_since_commit = 0
                     _commit_shadow_state(
                         working_state,
                         replica_path,
                         base_step,
                         committed_step,
                         tied_groups=tied_groups,
+                        flat_writer=flat_writer,
                     )
                     shadow_step_val.value = committed_step
                     threads = _restart_producers()
                     continue
                 if kind == "update":
                     update = cmd["update"]
+                    retained_updates[int(update["step"])] = update
                     with internal_lock:
                         internal_updates[int(update["step"])] = update
                     update_available_event.set()
@@ -459,10 +772,13 @@ def _shadow_process_pipelined(
             raise producer_error[0]
 
         try:
-            step_idx, z_dict, update = result_queue.get(timeout=0.05)
+            result_generation, step_idx, z_dict, update = result_queue.get(timeout=0.05)
         except queue_module.Empty:
             continue
 
+        if result_generation != generation[0]:
+            del z_dict
+            continue
         pending_results[step_idx] = (z_dict, update)
         while consumer_step in pending_results:
             z_dict, update = pending_results.pop(consumer_step)
@@ -494,6 +810,7 @@ def _shadow_process_pipelined(
                     base_step,
                     committed_step,
                     tied_groups=tied_groups,
+                    flat_writer=flat_writer,
                 )
                 shadow_step_val.value = committed_step
                 pending_since_commit = 0
