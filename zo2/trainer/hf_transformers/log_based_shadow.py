@@ -12,6 +12,10 @@ from collections import OrderedDict
 import psutil
 import torch
 
+from ...utils.logging_controls import (
+    resource_log_enabled,
+    time_log_enabled,
+)
 from .log_based_utils import (
     _DTYPE_MAP,
     _atomic_save_state_dict_safetensors,
@@ -1023,10 +1027,11 @@ def _shadow_process_main(
                     adam_state,
                     _logger=_logger,
                 )
-        _logger.info(
-            f"[Shadow BootTiming] load_flat={load_flat_s:.3f}s "
-            f"base_step={initial_base_step} committed_step={initial_committed_step}"
-        )
+        if time_log_enabled():
+            _logger.info(
+                f"[Shadow BootTiming] load_flat={load_flat_s:.3f}s "
+                f"base_step={initial_base_step} committed_step={initial_committed_step}"
+            )
     elif initial_state is None:
         raise RuntimeError("shadow process received no initial_state and no flat snapshot to load from")
     elif adam_config is not None:
@@ -1053,10 +1058,6 @@ def _shadow_process_main(
 
         _zo_rng.set_num_threads(c_prod)
         torch.set_num_threads(aten_threads)
-        _logger.info(
-            f"[Shadow] threads: zo_rng={c_prod} + ATen={aten_threads} "
-            f"= {c_prod + aten_threads} (n_cores={n_cores}, reserve={n_reserve})"
-        )
     elif use_pipeline:
         threads_per_op = max(1, n_cores // (P + 1))
         torch.set_num_threads(threads_per_op)
@@ -1067,10 +1068,6 @@ def _shadow_process_main(
             import zo_rng as _zo_rng
 
             _zo_rng.set_num_threads(serial_threads)
-        _logger.info(
-            f"[Shadow] serial zo_rng={serial_threads} ATen={serial_threads} "
-            f"(alternating, n_cores={n_cores}, reserve={n_reserve})"
-        )
 
     try:
         _os_threads = len(os.listdir(f"/proc/{os.getpid()}/task"))
@@ -1092,26 +1089,27 @@ def _shadow_process_main(
 
     _model_bytes = sum(initial_state[nm].numel() * initial_state[nm].element_size() for nm in param_names)
     _interop_thr = torch.get_num_interop_threads()
-    _logger.info(
-        f"[Shadow Boot] pid={os.getpid()}\n"
-        f"  affinity={{{','.join(str(c) for c in _affinity[:5])},...}} ({len(_affinity)} CPUs)\n"
-        f"  aten={torch.get_num_threads()}  zo_rng={_zo_thr}  interop={_interop_thr}  "
-        f"OS_threads={_os_threads}\n"
-        f"  model_bytes={_model_bytes / 1e9:.2f}GB\n"
-        f"  pipeline={use_pipeline}  P={P}  rng={rng_device}  "
-        f"  commit_interval={commit_interval}\n"
-        f"  load_flat={load_flat_s:.3f}s"
-    )
+    if resource_log_enabled():
+        _logger.info(
+            f"[Shadow Boot] pid={os.getpid()}\n"
+            f"  affinity={{{','.join(str(c) for c in _affinity[:5])},...}} ({len(_affinity)} CPUs)\n"
+            f"  aten={torch.get_num_threads()}  zo_rng={_zo_thr}  interop={_interop_thr}  "
+            f"OS_threads={_os_threads}\n"
+            f"  model_bytes={_model_bytes / 1e9:.2f}GB\n"
+            f"  pipeline={use_pipeline}  P={P}  rng={rng_device}  "
+            f"  commit_interval={commit_interval}"
+        )
     _thread_snapshot("Shadow BOOT", _logger, detail=True)
 
     if flat_storage and flat_storage.get("enabled"):
         total_bytes = int(flat_storage["layout"]["total_bytes"])
         if flat_storage.get("has_adam", False):
             total_bytes += int(flat_storage["adam_layout"]["total_bytes"]) * 2
-        _logger.info(
-            f"[Shadow Flat] single-buffer enabled total_bytes={total_bytes / 1e9:.2f}GB "
-            f"(non-atomic commit; incomplete snapshot is fatal)"
-        )
+        if resource_log_enabled():
+            _logger.info(
+                f"[Shadow Flat] single-buffer enabled total_bytes={total_bytes / 1e9:.2f}GB "
+                f"(non-atomic commit; incomplete snapshot is fatal)"
+            )
 
     try:
         if use_pipeline:
@@ -1181,13 +1179,12 @@ def _shadow_process_serial(
 ):
     from . import log_based_checkpoint as _bdc
 
-    _logger.info(f"[Shadow Process] Running in serial mode (params={len(param_names)}, rng={rng_device})")
-
     t0_clone = time.perf_counter()
     working_state = _clone_working_state(initial_state, tied_groups)
     clone_working_s = time.perf_counter() - t0_clone
-    _logger.info(f"[Shadow BootTiming] clone_working={clone_working_s:.3f}s mode=serial")
-    if boot_started_at is not None:
+    if time_log_enabled():
+        _logger.info(f"[Shadow BootTiming] clone_working={clone_working_s:.3f}s mode=serial")
+    if boot_started_at is not None and time_log_enabled():
         _logger.info(
             f"[Shadow BootTiming] ready_for_updates={time.perf_counter() - boot_started_at:.3f}s mode=serial"
         )
@@ -1317,13 +1314,18 @@ def _shadow_process_serial(
             desired_commit_step = int(last_applied_step)
             t_commit = _commit_if_needed(desired_commit_step, "Periodic")
 
-        _rss_gb = psutil.Process(os.getpid()).memory_info().rss / 1024**3
-        _logger.info(
-            f"[Shadow] step={step} grad={update['grad']:.6e} seed={step_seed} "
-            f"| apply={t_apply * 1000:.0f}ms zgen={t_zgen * 1000:.0f}ms "
-            f"commit={t_commit * 1000:.0f}ms pending={pending_since_commit} "
-            f"| applied={last_applied_step} desired={desired_commit_step} durable={durable_step} RSS={_rss_gb:.1f}GB"
-        )
+        if time_log_enabled():
+            _logger.info(
+                f"[Shadow Timing] step={step} grad={update['grad']:.6e} seed={step_seed} "
+                f"| apply={t_apply * 1000:.0f}ms zgen={t_zgen * 1000:.0f}ms "
+                f"commit={t_commit * 1000:.0f}ms pending={pending_since_commit} "
+                f"| applied={last_applied_step} desired={desired_commit_step} durable={durable_step}"
+            )
+        if resource_log_enabled():
+            _rss_gb = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+            _logger.info(
+                f"[Shadow Resource] step={step} durable={durable_step} RSS={_rss_gb:.1f}GB"
+            )
 
     if last_applied_step > durable_step:
         desired_commit_step = int(last_applied_step)
@@ -1354,13 +1356,12 @@ def _shadow_process_pipelined(
     from . import log_based_checkpoint as _bdc
 
     shadow_bytes = sum(initial_state[nm].numel() * initial_state[nm].element_size() for nm in param_names)
-    _logger.info(f"[Shadow Pipeline] P={P} producers, shadow_copy={shadow_bytes / 1e9:.2f}GB")
-
     t0_clone = time.perf_counter()
     working_state = _clone_working_state(initial_state, tied_groups)
     clone_working_s = time.perf_counter() - t0_clone
-    _logger.info(f"[Shadow BootTiming] clone_working={clone_working_s:.3f}s mode=pipeline")
-    if boot_started_at is not None:
+    if time_log_enabled():
+        _logger.info(f"[Shadow BootTiming] clone_working={clone_working_s:.3f}s mode=pipeline")
+    if boot_started_at is not None and time_log_enabled():
         _logger.info(
             f"[Shadow BootTiming] ready_for_updates={time.perf_counter() - boot_started_at:.3f}s mode=pipeline"
         )
@@ -1622,10 +1623,15 @@ def _shadow_process_pipelined(
                 desired_commit_step = int(last_applied_step)
                 commit_ms = _pause_and_commit(desired_commit_step, "Periodic")
 
-            _rss_gb = psutil.Process(os.getpid()).memory_info().rss / 1024**3
-            _logger.info(
-                f"[Shadow] step={last_applied_step} grad={update['grad']:.6e} seed={update['seed']} "
-                f"| apply={apply_ms:.0f}ms zgen={producer_timing['duration_ms']:.0f}ms "
-                f"commit={commit_ms:.0f}ms pending={pending_since_commit} "
-                f"| applied={last_applied_step} desired={desired_commit_step} durable={durable_step} RSS={_rss_gb:.1f}GB"
-            )
+            if time_log_enabled():
+                _logger.info(
+                    f"[Shadow Timing] step={last_applied_step} grad={update['grad']:.6e} seed={update['seed']} "
+                    f"| apply={apply_ms:.0f}ms zgen={producer_timing['duration_ms']:.0f}ms "
+                    f"commit={commit_ms:.0f}ms pending={pending_since_commit} "
+                    f"| applied={last_applied_step} desired={desired_commit_step} durable={durable_step}"
+                )
+            if resource_log_enabled():
+                _rss_gb = psutil.Process(os.getpid()).memory_info().rss / 1024**3
+                _logger.info(
+                    f"[Shadow Resource] step={last_applied_step} durable={durable_step} RSS={_rss_gb:.1f}GB"
+                )

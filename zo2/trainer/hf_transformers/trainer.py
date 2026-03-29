@@ -183,6 +183,12 @@ from transformers.utils import (
 from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.quantization_config import QuantizationMethod
 
+from ...utils.logging_controls import (
+    consistency_log_enabled,
+    resource_log_enabled,
+    time_log_enabled,
+)
+
 
 DEFAULT_CALLBACKS = [DefaultFlowCallback]
 DEFAULT_PROGRESS_CALLBACK = ProgressCallback
@@ -363,28 +369,19 @@ class ZOTrainer(Trainer):
         self._log_based_resume_state = None
         self._log_based_resume_checkpoint = None
         self._memory_debug_every = 0
-        self._memory_debug_sync = os.environ.get("ZO_MEMORY_DEBUG_SYNC", "1") != "0"
+        self._memory_debug_sync = True
         self._memory_debug_process = None
 
-        if self.zo and torch.cuda.is_available():
-            env_every = os.environ.get("ZO_MEMORY_DEBUG_EVERY")
-            if env_every is not None:
-                try:
-                    self._memory_debug_every = max(0, int(env_every))
-                except ValueError:
-                    logger.warning(f"[MemDebug] Invalid ZO_MEMORY_DEBUG_EVERY={env_every!r}, disabling memory debug")
-                    self._memory_debug_every = 0
-            elif os.environ.get("ZO_MEMORY_DEBUG", "0") == "1":
-                self._memory_debug_every = 1
-            elif isinstance(getattr(args, "logging_steps", 0), int) and args.logging_steps > 0:
+        if self.zo and torch.cuda.is_available() and resource_log_enabled():
+            if isinstance(getattr(args, "logging_steps", 0), int) and args.logging_steps > 0:
                 self._memory_debug_every = args.logging_steps
-
-            if self._memory_debug_every > 0:
-                self._memory_debug_process = psutil.Process(os.getpid())
-                logger.info(
-                    f"[MemDebug] Enabled: every={self._memory_debug_every} steps, "
-                    f"sync={self._memory_debug_sync}"
-                )
+            else:
+                self._memory_debug_every = 1
+            self._memory_debug_process = psutil.Process(os.getpid())
+            logger.info(
+                f"[MemDebug] Enabled: every={self._memory_debug_every} steps, "
+                f"sync={self._memory_debug_sync}"
+            )
 
     def set_log_based_resume_state(self, *, global_step: int, checkpoint_path: str | None = None):
         self._log_based_resume_state = {
@@ -398,29 +395,7 @@ class ZOTrainer(Trainer):
         return step <= 3 or step % self._memory_debug_every == 0
 
     def _should_log_batch_debug(self, step: int) -> bool:
-        if step <= 3:
-            return True
-        if os.environ.get("ZO_STEP_DIAG", "0") == "1":
-            return True
-        if os.environ.get("ZO_BATCH_DEBUG", "0") == "1":
-            return True
-        debug_start = int(os.environ.get("ZO_BATCH_DEBUG_STEP_START", "0"))
-        debug_end = int(os.environ.get("ZO_BATCH_DEBUG_STEP_END", "0"))
-        if debug_start > 0:
-            if debug_end > 0:
-                if debug_start <= step <= debug_end:
-                    return True
-            elif step >= debug_start:
-                return True
-        resume_steps = int(os.environ.get("ZO_BATCH_DEBUG_RESUME_STEPS", "12"))
-        if self._log_based_resume_state is not None:
-            resume_start = int(self._log_based_resume_state.get("global_step", 0))
-            if resume_start < step <= resume_start + resume_steps:
-                return True
-        batch_debug_every = int(os.environ.get("ZO_BATCH_DEBUG_EVERY", "0"))
-        if batch_debug_every > 0 and step % batch_debug_every == 0:
-            return True
-        return False
+        return consistency_log_enabled()
 
     def _batch_tensor_hash(self, tensor: torch.Tensor) -> str:
         cpu = tensor.detach().cpu().contiguous()
@@ -450,7 +425,7 @@ class ZOTrainer(Trainer):
         logger.info(f"[BATCH] step={step} " + " | ".join(parts))
 
     def _log_memory_debug(self, tag: str, step: int, *, reset_peak: bool = False) -> None:
-        if not torch.cuda.is_available():
+        if not resource_log_enabled() or not torch.cuda.is_available():
             return
         if reset_peak:
             torch.cuda.reset_peak_memory_stats()
@@ -509,7 +484,8 @@ class ZOTrainer(Trainer):
         t_start = time_module.time()
         result = super()._load_from_checkpoint(resume_from_checkpoint, model)
         t_elapsed = time_module.time() - t_start
-        logger.info(f"[Resume] Model loaded from checkpoint in {t_elapsed:.3f}s")
+        if time_log_enabled():
+            logger.info(f"[Resume] Model loaded from checkpoint in {t_elapsed:.3f}s")
         return result
 
     def _maybe_log_save_evaluate(
@@ -577,17 +553,18 @@ class ZOTrainer(Trainer):
                 self._log_memory_debug("after_save", step)
             if log_based_callback is not None and getattr(log_based_callback, "_last_save_is_full", False):
                 log_based_callback.timing_stats['checkpoint_total_times'].append(t_ckpt_elapsed)
-                logger.info(
-                    f"[ZOTrainer SavePath] step={self.state.global_step} "
-                    f"save_impl={t_save_impl_elapsed:.3f}s on_save={t_on_save_elapsed:.3f}s "
-                    f"total={t_ckpt_elapsed:.3f}s"
-                )
-                logger.info(
-                    f"[ZOTrainer] Full checkpoint at step {self.state.global_step} "
-                    f"took {t_ckpt_elapsed:.3f}s"
-                )
+                if time_log_enabled():
+                    logger.info(
+                        f"[ZOTrainer SavePath] step={self.state.global_step} "
+                        f"save_impl={t_save_impl_elapsed:.3f}s on_save={t_on_save_elapsed:.3f}s "
+                        f"total={t_ckpt_elapsed:.3f}s"
+                    )
             elif log_based_callback is None or not log_based_callback.enable_shadow:
-                logger.info(f"[ZOTrainer] Checkpoint at step {self.state.global_step} took {t_ckpt_elapsed:.3f}s")
+                if time_log_enabled():
+                    logger.info(
+                        f"[ZOTrainer] Checkpoint at step {self.state.global_step} "
+                        f"took {t_ckpt_elapsed:.3f}s"
+                    )
 
     def _save_checkpoint(self, model, trial, metrics=None):
         """
@@ -888,14 +865,15 @@ class ZOTrainer(Trainer):
                         )
                     t_post_full = time.time() - t0
                     logger.info(f"[ZOTrainer] Full checkpoint at step {self.state.global_step}, cleared update history")
-                logger.info(
-                    f"[ZOTrainer SaveBreakdown] step={self.state.global_step} "
-                    f"state_json={t_state_json:.3f}s scheduler={t_scheduler:.3f}s "
-                    f"rng={t_rng:.3f}s build_optimizer={t_opt_build:.3f}s "
-                    f"save_optimizer={t_opt_save:.3f}s save_meta={t_meta_save:.3f}s "
-                    f"super_full={t_super_full:.3f}s "
-                    f"post_full={t_post_full:.3f}s total_save_impl={time.time() - t_save_breakdown_start:.3f}s"
-                )
+                if time_log_enabled():
+                    logger.info(
+                        f"[ZOTrainer SaveBreakdown] step={self.state.global_step} "
+                        f"state_json={t_state_json:.3f}s scheduler={t_scheduler:.3f}s "
+                        f"rng={t_rng:.3f}s build_optimizer={t_opt_build:.3f}s "
+                        f"save_optimizer={t_opt_save:.3f}s save_meta={t_meta_save:.3f}s "
+                        f"super_full={t_super_full:.3f}s "
+                        f"post_full={t_post_full:.3f}s total_save_impl={time.time() - t_save_breakdown_start:.3f}s"
+                    )
             # Log checkpoint step: only optimizer.pt + metadata saved above, no model files created
             return
 
@@ -1307,16 +1285,21 @@ class ZOTrainer(Trainer):
                     if hasattr(self, '_t_full_resume_start'):
                         now = time.time()
                         t_full_resume = now - self._t_full_resume_start
-                        logger.info(f"[Full Resume] Total checkpoint resume time: {t_full_resume:.3f}s")
+                        if time_log_enabled():
+                            logger.info(f"[Full Resume] Total checkpoint resume time: {t_full_resume:.3f}s")
                         del self._t_full_resume_start
                         if hasattr(self, '_t_program_start'):
                             t_from_program = now - self._t_program_start
                             t_setup = self._t_program_start  # will be subtracted below
-                            logger.info(f"[Full Resume] Total time from program start to first step: {t_from_program:.3f}s")
+                            if time_log_enabled():
+                                logger.info(
+                                    f"[Full Resume] Total time from program start to first step: {t_from_program:.3f}s"
+                                )
                             del self._t_program_start
                     elif hasattr(self, '_t_program_start'):
                         t_from_program = time.time() - self._t_program_start
-                        logger.info(f"[No Resume] Total time from program start to first step: {t_from_program:.3f}s")
+                        if time_log_enabled():
+                            logger.info(f"[No Resume] Total time from program start to first step: {t_from_program:.3f}s")
                         del self._t_program_start
 
                     # ZO2 added -> estimate gradient and updates

@@ -7,6 +7,7 @@ import psutil
 import torch
 
 from ...optimizer.mezo_adam.shared import apply_mezo_adam_update
+from ...utils.logging_controls import resource_log_enabled, time_log_enabled
 from .log_based_utils import (
     _log_adam_checksums,
     _log_adam_exact_fingerprint,
@@ -420,8 +421,8 @@ def _replay_updates_on_state(
 
     param_names = trainable_param_names if trainable_param_names is not None else list(state.keys())
 
-    _seq_proc = psutil.Process(os.getpid())
-    _seq_cpu0, _seq_gpu0 = _log_memory("sequential start", _seq_proc, actual_device)
+    _seq_proc = psutil.Process(os.getpid()) if resource_log_enabled() else None
+    _seq_cpu0, _seq_gpu0 = _log_memory("sequential start", _seq_proc, actual_device) if _seq_proc is not None else (None, None)
     _seq_quarter = max(1, len(updates) // 4)
 
     timings = []
@@ -435,14 +436,15 @@ def _replay_updates_on_state(
         )
         timings.append(timing)
 
-        if i > 0 and i % _seq_quarter == 0:
+        if _seq_proc is not None and i > 0 and i % _seq_quarter == 0:
             _log_memory(f"sequential step {i}/{len(updates)}", _seq_proc, actual_device, _seq_cpu0, _seq_gpu0)
 
-        if _step_diag_enabled() or _step_exact_enabled():
+        if time_log_enabled():
             logger.info(f"[Replay] update {i}: step={update.get('step','?')}, seed={update['seed']}, "
                         f"grad={update['grad']:.6e}, lr={update['lr']}, wd={update.get('wd', 0.0)}, "
                         f"zo_eps={update.get('zo_eps', default_zo_eps)}, "
                         f"time={timing['total']:.4f}s (z_gen={timing['z_gen']:.4f}s, update={timing['update']:.4f}s)")
+        if _step_diag_enabled() or _step_exact_enabled():
             if _step_diag_enabled():
                 _log_state_checksums(f"replay_live step={update.get('step','?')}", state)
                 if adam_state is not None:
@@ -451,10 +453,8 @@ def _replay_updates_on_state(
                 _log_state_exact_fingerprint(f"replay_live step={update.get('step','?')}", state)
                 if adam_state is not None:
                     _log_adam_exact_fingerprint(f"replay_live step={update.get('step','?')}", adam_state)
-        elif _step_diag_enabled() and i == 3 and len(updates) > 4:
-            logger.info(f"[Replay] ... ({len(updates) - 4} more updates) ...")
 
-    if timings:
+    if timings and time_log_enabled():
         avg_total = sum(t['total'] for t in timings) / len(timings)
         avg_z = sum(t['z_gen'] for t in timings) / len(timings)
         avg_upd = sum(t['update'] for t in timings) / len(timings)

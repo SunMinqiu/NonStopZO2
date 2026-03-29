@@ -16,20 +16,21 @@ import numpy as np
 import logging
 
 from ...config.mezo_sgd import MeZOSGDConfig
+from ...utils.logging_controls import consistency_log_enabled
 
 logger = logging.getLogger(__name__)
 
 
 def _step_diag_enabled():
-    return os.environ.get("ZO_STEP_DIAG", "0") == "1"
+    return consistency_log_enabled()
 
 
 def _step_exact_enabled():
-    return os.environ.get("ZO_STEP_DIAG_EXACT", "0") == "1"
+    return consistency_log_enabled()
 
 
 def _rng_diag_enabled():
-    return os.environ.get("ZO_RNG_DIAG", "0") == "1" or _step_diag_enabled()
+    return consistency_log_enabled()
 
 
 class MeZOSGD(BaseOptimizer):

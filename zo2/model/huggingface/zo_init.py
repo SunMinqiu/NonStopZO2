@@ -2,7 +2,6 @@
 # Licensed under the Apache License, Version 2.0
 
 from contextlib import contextmanager
-import torch
 import transformers
 
 from . import (
@@ -33,11 +32,3 @@ def zo_hf_init(zo_config):
         yield
     finally:
         pass
-
-def main():
-    # user api:
-    with zo_hf_init(zo_config):
-        from transformers import OPTForCausalLM
-        model = OPTForCausalLM.from_pretrained(...)
-        model.zo_init(zo_config)
-    print(type(model))  # should be zo2.OPTForCausalLM

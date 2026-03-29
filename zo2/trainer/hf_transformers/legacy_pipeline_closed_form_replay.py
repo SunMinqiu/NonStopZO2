@@ -16,6 +16,7 @@ from collections import OrderedDict
 import psutil
 import torch
 
+from ...utils.logging_controls import resource_log_enabled, time_log_enabled
 from .log_based_utils import _log_memory
 
 logger = logging.getLogger(__name__)
@@ -80,11 +81,11 @@ def _pipelined_replay_cpu(state, updates, param_names, rng_device,
         buffer[slot] = None
         free[slot].set()
 
-        if step < 3 or step == n - 1:
+        if time_log_enabled() and (step < 3 or step == n - 1):
             logger.info(f"[PipelinedReplay] update {step}: step={updates[step].get('step','?')}, "
                         f"seed={updates[step]['seed']}, grad={updates[step]['grad']:.6e}, "
                         f"lr={updates[step]['lr']}, wd={updates[step].get('wd', 0.0)}")
-        elif step == 3:
+        elif time_log_enabled() and step == 3:
             logger.info(f"[PipelinedReplay] ... ({n - 4} more updates) ...")
 
     for t in threads:
@@ -148,11 +149,11 @@ def _pipelined_replay_gpu(state, updates, param_names, rng_device,
         else:
             buffer[slot] = None
 
-        if step < 3 or step == n - 1:
+        if time_log_enabled() and (step < 3 or step == n - 1):
             logger.info(f"[PipelinedReplay] update {step}: step={updates[step].get('step','?')}, "
                         f"seed={updates[step]['seed']}, grad={updates[step]['grad']:.6e}, "
                         f"lr={updates[step]['lr']}, wd={updates[step].get('wd', 0.0)}")
-        elif step == 3:
+        elif time_log_enabled() and step == 3:
             logger.info(f"[PipelinedReplay] ... ({n - 4} more updates) ...")
 
     torch.cuda.synchronize()
@@ -181,9 +182,10 @@ def _parallel_replay_updates_on_state(
     if env_workers is not None:
         P = max(1, int(env_workers))
 
-    logger.info(f"[PipelinedReplay] {len(updates)} updates, P={P}, "
-                f"rng_device={rng_device}, zo2_mode={zo2_mode}, "
-                f"simulate_perturbation={simulate_perturbation}")
+    if time_log_enabled():
+        logger.info(f"[PipelinedReplay] {len(updates)} updates, P={P}, "
+                    f"rng_device={rng_device}, zo2_mode={zo2_mode}, "
+                    f"simulate_perturbation={simulate_perturbation}")
 
     actual_device = 'cpu'
     if move_to_device and device == 'cuda' and torch.cuda.is_available():
@@ -203,7 +205,8 @@ def _parallel_replay_updates_on_state(
             replay_dtype = torch.float32
             for key in state:
                 state[key] = state[key].float()
-            logger.info(f"[PipelinedReplay] Upcast {original_dtype} -> fp32 for CPU replay")
+            if time_log_enabled():
+                logger.info(f"[PipelinedReplay] Upcast {original_dtype} -> fp32 for CPU replay")
 
     if actual_device == 'cpu' and torch.cuda.is_available() and rng_device != "zo_rng":
         logger.warning("[PipelinedReplay] WARNING: Replaying on CPU but CUDA is available. "
@@ -214,7 +217,7 @@ def _parallel_replay_updates_on_state(
     z_sets_per_step = 2 if zo2_mode else 1
     buffer_bytes = model_bytes * P * z_sets_per_step
     available_bytes = psutil.virtual_memory().available
-    if buffer_bytes > available_bytes * 0.5:
+    if resource_log_enabled() and buffer_bytes > available_bytes * 0.5:
         logger.warning(f"[PipelinedReplay] Ring buffer ~{buffer_bytes / 1e9:.1f} GB "
                        f"but only {available_bytes / 1e9:.1f} GB available. "
                        f"Consider reducing PARALLEL_RECOVERY_WORKERS.")
@@ -231,12 +234,13 @@ def _parallel_replay_updates_on_state(
             seeds_info.append((update['seed'], update['seed']))
 
     t_start = time.time()
-    _pip_proc = psutil.Process(os.getpid())
-    _pip_cpu0, _pip_gpu0 = _log_memory("pipelined start", _pip_proc, actual_device)
+    _pip_proc = psutil.Process(os.getpid()) if resource_log_enabled() else None
+    _pip_cpu0, _pip_gpu0 = _log_memory("pipelined start", _pip_proc, actual_device) if _pip_proc is not None else (None, None)
 
     use_gpu_pipeline = (actual_device == 'cuda' and rng_device == 'native')
     if use_gpu_pipeline:
-        logger.info(f"[PipelinedReplay] Using GPU mode (CUDA streams)")
+        if time_log_enabled():
+            logger.info(f"[PipelinedReplay] Using GPU mode (CUDA streams)")
         _pipelined_replay_gpu(
             state, updates, param_names, rng_device,
             num_producers=P, default_zo_eps=default_zo_eps,
@@ -245,7 +249,8 @@ def _parallel_replay_updates_on_state(
             replay_dtype=replay_dtype,
         )
     else:
-        logger.info(f"[PipelinedReplay] Using CPU mode (threads)")
+        if time_log_enabled():
+            logger.info(f"[PipelinedReplay] Using CPU mode (threads)")
         _pipelined_replay_cpu(
             state, updates, param_names, rng_device,
             num_producers=P, default_zo_eps=default_zo_eps,
@@ -254,17 +259,20 @@ def _parallel_replay_updates_on_state(
             replay_dtype=replay_dtype,
         )
 
-    _log_memory("pipelined done", _pip_proc, actual_device, _pip_cpu0, _pip_gpu0)
+    if _pip_proc is not None:
+        _log_memory("pipelined done", _pip_proc, actual_device, _pip_cpu0, _pip_gpu0)
 
     if original_dtype is not None:
         for key in state:
             state[key] = state[key].to(original_dtype)
-        logger.info(f"[PipelinedReplay] Downcast fp32 -> {original_dtype}")
+        if time_log_enabled():
+            logger.info(f"[PipelinedReplay] Downcast fp32 -> {original_dtype}")
 
     t_elapsed = time.time() - t_start
     mode_str = "GPU/CUDA-streams" if use_gpu_pipeline else "CPU/threads"
-    logger.info(f"[PipelinedReplay] Completed: {len(updates)} updates in {t_elapsed:.3f}s "
-                f"(P={P}, mode={mode_str}, device={actual_device})")
+    if time_log_enabled():
+        logger.info(f"[PipelinedReplay] Completed: {len(updates)} updates in {t_elapsed:.3f}s "
+                    f"(P={P}, mode={mode_str}, device={actual_device})")
     return state
 
 
@@ -382,8 +390,9 @@ def _closedform_replay_on_state(
 
     n = len(updates)
     W = num_workers
-    logger.info(f"[ClosedForm] {n} updates, W={W}, precision={precision}, "
-                f"rng_device={rng_device}, zo2_mode={zo2_mode}")
+    if time_log_enabled():
+        logger.info(f"[ClosedForm] {n} updates, W={W}, precision={precision}, "
+                    f"rng_device={rng_device}, zo2_mode={zo2_mode}")
 
     actual_device = 'cpu'
     if move_to_device and device == 'cuda' and torch.cuda.is_available():
@@ -404,7 +413,8 @@ def _closedform_replay_on_state(
         if original_dtype != torch.float32:
             for key in state:
                 state[key] = state[key].float()
-            logger.info(f"[ClosedForm] Upcast {original_dtype} -> fp32")
+            if time_log_enabled():
+                logger.info(f"[ClosedForm] Upcast {original_dtype} -> fp32")
     elif precision == "fp16":
         accum_dtype = original_dtype
         target_dtype = original_dtype
@@ -426,7 +436,7 @@ def _closedform_replay_on_state(
     replay_es = torch.tensor([], dtype=replay_dtype if replay_dtype is not None else original_dtype).element_size()
     total_buffer = total_numel * accum_elem_size + total_numel * replay_es * W
     available_bytes = psutil.virtual_memory().available
-    if total_buffer > available_bytes * 0.5:
+    if resource_log_enabled() and total_buffer > available_bytes * 0.5:
         logger.warning(f"[ClosedForm] Worker buffers ~{total_buffer / 1e9:.1f} GB "
                        f"but only {available_bytes / 1e9:.1f} GB available.")
 
@@ -458,24 +468,28 @@ def _closedform_replay_on_state(
         coeff_nowd = lr * grad
         terms.append((t, coeff_wd, coeff_nowd, seeds_info[t][0]))
 
-    logger.info(f"[ClosedForm] {len(terms)} non-zero terms out of {n} updates"
-                f" (sp[0]={sp_0:.10f})")
+    if time_log_enabled():
+        logger.info(f"[ClosedForm] {len(terms)} non-zero terms out of {n} updates"
+                    f" (sp[0]={sp_0:.10f})")
 
     t_start = time.time()
-    _cf_proc = psutil.Process(os.getpid())
-    _cf_cpu0, _cf_gpu0 = _log_memory("closedform start", _cf_proc, actual_device)
+    _cf_proc = psutil.Process(os.getpid()) if resource_log_enabled() else None
+    _cf_cpu0, _cf_gpu0 = _log_memory("closedform start", _cf_proc, actual_device) if _cf_proc is not None else (None, None)
 
     use_gpu = (actual_device == 'cuda' and rng_device == 'native')
     if len(terms) == 0:
         total_sum = {}
     elif use_gpu:
-        logger.info(f"[ClosedForm] Using GPU mode (CUDA streams)")
+        if time_log_enabled():
+            logger.info(f"[ClosedForm] Using GPU mode (CUDA streams)")
         total_sum = _closedform_gpu(state, param_names, terms, rng_device, W, accum_dtype, replay_dtype)
     else:
-        logger.info(f"[ClosedForm] Using CPU mode (threads)")
+        if time_log_enabled():
+            logger.info(f"[ClosedForm] Using CPU mode (threads)")
         total_sum = _closedform_cpu(state, param_names, terms, rng_device, W, accum_dtype, replay_dtype)
 
-    _log_memory("closedform after accumulation", _cf_proc, actual_device, _cf_cpu0, _cf_gpu0)
+    if _cf_proc is not None:
+        _log_memory("closedform after accumulation", _cf_proc, actual_device, _cf_cpu0, _cf_gpu0)
 
     if not total_sum:
         total_sum = {
@@ -494,9 +508,11 @@ def _closedform_replay_on_state(
 
     t_elapsed = time.time() - t_start
     mode_str = "GPU/CUDA-streams" if use_gpu else "CPU/threads"
-    logger.info(f"[ClosedForm] Completed: {n} updates in {t_elapsed:.3f}s "
-                f"(W={W}, precision={precision}, mode={mode_str}, device={actual_device})")
-    _log_memory("closedform done", _cf_proc, actual_device, _cf_cpu0, _cf_gpu0)
+    if time_log_enabled():
+        logger.info(f"[ClosedForm] Completed: {n} updates in {t_elapsed:.3f}s "
+                    f"(W={W}, precision={precision}, mode={mode_str}, device={actual_device})")
+    if _cf_proc is not None:
+        _log_memory("closedform done", _cf_proc, actual_device, _cf_cpu0, _cf_gpu0)
     return state
 
 

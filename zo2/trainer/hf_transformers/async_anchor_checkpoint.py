@@ -30,6 +30,7 @@ from collections import OrderedDict
 import torch
 
 from .log_based_utils import _atomic_save_state_dict_safetensors, _ensure_zo_shm_dir
+from ...utils.logging_controls import resource_log_enabled, time_log_enabled
 
 logger = logging.getLogger(__name__)
 ADAM_STATE_NAME = "adam_state.pt"
@@ -120,7 +121,8 @@ class AsyncAnchorCheckpointer:
             for group in tied_groups:
                 for name in group[1:]:
                     self._excluded_keys.add(name)
-            logger.info(f"[AsyncAnchor] Excluding tied keys from checkpoint: {self._excluded_keys}")
+            if resource_log_enabled():
+                logger.info(f"[AsyncAnchor] Excluding tied keys from checkpoint: {self._excluded_keys}")
 
         # CUDA stream dedicated to checkpoint copies
         self._ckpt_stream = torch.cuda.Stream()
@@ -169,9 +171,10 @@ class AsyncAnchorCheckpointer:
         total_bytes = sum(
             t.numel() * t.element_size() for t in self._pinned_buffer.values()
         )
-        logger.info(
-            f"[AsyncAnchor] Init: {total_bytes / 1e9:.2f} GB pinned buffer"
-        )
+        if resource_log_enabled():
+            logger.info(
+                f"[AsyncAnchor] Init: {total_bytes / 1e9:.2f} GB pinned buffer"
+            )
 
     # ------------------------------------------------------------------
     # Public API
@@ -188,9 +191,10 @@ class AsyncAnchorCheckpointer:
         self._persist_done.wait()
         with self._buffer_cond:
             while not self._buffer_free:
-                logger.info(
-                    f"[AsyncAnchor] Waiting for buffer at step {step}..."
-                )
+                if time_log_enabled():
+                    logger.info(
+                        f"[AsyncAnchor] Waiting for buffer at step {step}..."
+                    )
                 self._buffer_cond.wait()
             self._buffer_free = False
         t_lock = time.time() - t_lock_start
@@ -259,10 +263,11 @@ class AsyncAnchorCheckpointer:
         t_total = time.time() - t_lock_start
         self._enqueue_times.append(t_total)
 
-        logger.info(
-            f"[AsyncAnchor] Queued anchor step {step} "
-            f"(enqueue_cpu={t_total:.3f}s, wait={t_lock:.3f}s, state_dict={t_sd:.3f}s, launch={t_copy:.3f}s)"
-        )
+        if time_log_enabled():
+            logger.info(
+                f"[AsyncAnchor] Queued anchor step {step} "
+                f"(enqueue_cpu={t_total:.3f}s, wait={t_lock:.3f}s, state_dict={t_sd:.3f}s, launch={t_copy:.3f}s)"
+            )
         return True
 
     def get_latest_completed_anchor_step(self) -> int:
@@ -304,7 +309,8 @@ class AsyncAnchorCheckpointer:
         self.wait_for_completion()
         self._persist_queue.put(None)  # sentinel to exit worker loop
         self._persist_thread.join(timeout=60)
-        logger.info(f"[AsyncAnchor] Shutdown complete. Stats: {self.stats}")
+        if time_log_enabled():
+            logger.info(f"[AsyncAnchor] Shutdown complete. Stats: {self.stats}")
 
     @property
     def stats(self) -> dict:
@@ -419,13 +425,14 @@ class AsyncAnchorCheckpointer:
                     if job.step > self._latest_completed_step:
                         self._latest_completed_step = job.step
                         self._latest_completed_path = job.output_dir
-                logger.info(
-                    f"[AsyncAnchor] Persisted step {job.step} "
-                    f"(d2h={d2h_s:.3f}s, cpu_total={cpu_total_s:.3f}s, "
-                    f"has_adam={job.adam_state is not None}, "
-                    f"adam_t={int(job.adam_state.get('t', 0)) if job.adam_state is not None else 0}) "
-                    f"→ {save_path}"
-                )
+                if time_log_enabled():
+                    logger.info(
+                        f"[AsyncAnchor] Persisted step {job.step} "
+                        f"(d2h={d2h_s:.3f}s, cpu_total={cpu_total_s:.3f}s, "
+                        f"has_adam={job.adam_state is not None}, "
+                        f"adam_t={int(job.adam_state.get('t', 0)) if job.adam_state is not None else 0}) "
+                        f"→ {save_path}"
+                    )
             else:
                 if os.WIFSIGNALED(status):
                     logger.error(

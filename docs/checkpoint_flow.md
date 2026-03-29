@@ -3,6 +3,53 @@
 本文档只覆盖和 checkpoint / replay / RNG / shadow / failure injection / async anchor 直接相关的逻辑。
 不展开训练算法本身，也不展开 `zo` / `zo2` 的推导细节。
 
+## 参数与开关速查
+
+### checkpoint / shadow / resume
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `LOG_BASED_CKPT` | `-1` | `-1`=L0；`0`=Log-based；`N>=1`=Full+Log |
+| `ENABLE_SHADOW` | `0` | `LOG_BASED_CKPT>=0` 时可启用 shadow |
+| `INSTANT_RECOVER` | `0` | 开启即时恢复流程 |
+| `GPU_FAIL_STEP` | `-1` | 在给定步数触发故障注入 |
+| `LOG_BASED_RESUME` | `""` | 明确指定 replay 恢复入口 |
+| `LOG_BASED_REPLAY_DEVICE` | `cuda` | replay 的执行设备 |
+| `LOG_BASED_SIMULATE_PERTURBATION` | `1` | 是否模拟 perturbation-restore 轮次 |
+| `LOG_BASED_REPLAY_FP32` | `0` | CPU replay 时临时 upcast 到 fp32 |
+| `SHADOW_PIPELINE` | `0` | 是否启用 pipelined shadow |
+| `SHADOW_PIPELINE_WORKERS` | `2` | shadow pipeline producer 数 |
+| `SHADOW_COMMIT_INTERVAL` | `1` | shadow durable commit 的步数间隔 |
+| `SHADOW_FLAT_COMMIT` | `0` | 是否使用 `/dev/shm/zo_ckpt/*.flat*` 单 buffer shadow |
+| `SHADOW_RESERVE_THREADS` | `1` | shadow 为训练预留的核数 |
+| `SHADOW_CONSUMER_THREADS` | `auto` | shadow consumer 的 ATen 线程数 |
+| `ASYNC_ANCHOR` | `0` | 启用 async anchor |
+| `OUTPUT_LOG` | `""` | log checkpoint 的独立输出目录 |
+
+### RNG / persistence
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `ZO_RNG_DEVICE` | `native` | `native` / `cpu` / `zo_rng` |
+| `ZO_RNG_TRAIN_THREADS` | unset | 训练进程 zo_rng 线程数 |
+| `ZO_RNG_NUM_THREADS` | 环境决定 | zo_rng 线程池初始大小 |
+| `FORCE_FSYNC` | `0` | 对 initial model、optimizer.pt、full checkpoint 启用 fsync |
+| `PARALLEL_RECOVERY` | `0` | legacy pipelined replay 开关 |
+| `PARALLEL_RECOVERY_WORKERS` | `1` | legacy pipelined replay worker 数 |
+| `CLOSEDFORM_RECOVERY` | `0` | legacy closed-form replay 开关 |
+| `CLOSEDFORM_WORKERS` | `1` | legacy closed-form worker 数 |
+| `CLOSEDFORM_PRECISION` | `mixed` | legacy closed-form 精度模式 |
+
+### 日志开关
+
+现在运行时只保留 3 个统一日志开关，默认都关闭：
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `ZO_LOG_TIME` | `0` | 时间类日志；包含 checkpoint / replay / shadow / async anchor 的耗时与分步 timing |
+| `ZO_LOG_RESOURCE` | `0` | 系统资源类日志；包含 CPU / GPU / RSS / pinned buffer / thread snapshot / thread env |
+| `ZO_LOG_CONSISTENCY` | `0` | 一致性校验类日志；包含 checksum / exact hash / Adam state / RNG / batch 摘要 |
+
 ## 0. 当前实现说明
 
 当前实现已经切到 `flat single-buffer shadow + async anchor disk checkpoint`：
@@ -824,56 +871,97 @@ resume 现在固定打印：
 - layout mismatch 也是实打实的风险点，现已通过“writer 持久化 layout，loader 按 header layout 读取”修掉
 - 如果后面再出现 `model / adam / metadata / log` 错版，优先会在 `_load_shadow_bundle_flat()` 的内容校验里直接报错，而不是静默继续恢复
 
-## 19. 参数速查
+## 19. 日志与诊断
 
-### checkpoint / shadow / resume
+### 日志分层
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `LOG_BASED_CKPT` | `-1` | `-1`=L0；`0`=Log-based；`N>=1`=Full+Log |
-| `ENABLE_SHADOW` | `0` | `LOG_BASED_CKPT>=0` 时可启用 shadow |
-| `INSTANT_RECOVER` | `0` | 开启即时恢复流程 |
-| `GPU_FAIL_STEP` | `-1` | 在给定步数触发故障注入 |
-| `LOG_BASED_RESUME` | `""` | 明确指定 replay 恢复入口 |
-| `LOG_BASED_REPLAY_DEVICE` | `cuda` | replay 的执行设备 |
-| `LOG_BASED_SIMULATE_PERTURBATION` | `1` | 是否模拟 perturbation-restore 轮次 |
-| `LOG_BASED_REPLAY_FP32` | `0` | CPU replay 时临时 upcast 到 fp32 |
-| `SHADOW_PIPELINE` | `0` | 是否启用 pipelined shadow |
-| `SHADOW_PIPELINE_WORKERS` | `2` | shadow pipeline producer 数 |
-| `SHADOW_COMMIT_INTERVAL` | `1` | shadow durable commit 的步数间隔 |
-| `SHADOW_FLAT_COMMIT` | `0` | 是否使用 `/dev/shm/zo_ckpt/*.flat*` 单 buffer shadow |
-| `SHADOW_RESERVE_THREADS` | `1` | shadow 为训练预留的核数 |
-| `SHADOW_CONSUMER_THREADS` | `auto` | shadow consumer 的 ATen 线程数 |
-| `ASYNC_ANCHOR` | `0` | 启用 async anchor |
-| `OUTPUT_LOG` | `""` | log checkpoint 的独立输出目录 |
+#### optimizer 层
 
-### RNG / persistence
+- 时间类：
+  - 无常驻时间日志。
+- 系统资源类：
+  - 无。
+- 一致性校验类：
+  - `[OPT]`
+  - `[OPT-DIAG]`
+  - `[RNG-DIAG]`
+  - `[Z-CKSUM]` / `[Z-EXACT]`
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `ZO_RNG_DEVICE` | `native` | `native` / `cpu` / `zo_rng` |
-| `ZO_RNG_TRAIN_THREADS` | unset | 训练进程 zo_rng 线程数 |
-| `ZO_RNG_NUM_THREADS` | 环境决定 | zo_rng 线程池初始大小 |
-| `FORCE_FSYNC` | `0` | 对 initial model、optimizer.pt、full checkpoint 启用 fsync |
-| `PARALLEL_RECOVERY` | `0` | legacy pipelined replay 开关 |
-| `PARALLEL_RECOVERY_WORKERS` | `1` | legacy pipelined replay worker 数 |
-| `CLOSEDFORM_RECOVERY` | `0` | legacy closed-form replay 开关 |
-| `CLOSEDFORM_WORKERS` | `1` | legacy closed-form worker 数 |
-| `CLOSEDFORM_PRECISION` | `mixed` | legacy closed-form 精度模式 |
+#### trainer / checkpoint orchestration 层
 
-### debug / 诊断
+- 时间类：
+  - `[ZOTrainer SavePath]`
+  - `[ZOTrainer SaveBreakdown]`
+  - `[LogBased InitBaseTiming]`
+  - `[LogBased FullCkpt]`
+  - `[ShadowSend]`
+  - `[Full Resume]` / `[No Resume]`
+- 系统资源类：
+  - `[MemDebug]`
+  - `[LogBased] Memory: ...`
+  - `[Thread Env — Training Process]`
+  - `[ThreadSnap]`
+  - 每 10 步一次的 `[LogBased] step=... | CPU=... | GPU alloc=...`
+- 一致性校验类：
+  - `[CKSUM]`
+  - `[HOOK]`
+  - `[VERIFY]`
+  - `train_live / train_durable_ref / train_snapshot / shadow_snapshot` 对应的 `STATE-* / ADAM-*`
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `ZO_STEP_DIAG` | `0` | 打开按步 checksum / brief 诊断 |
-| `ZO_STEP_DIAG_EXACT` | `0` | 打开按步 exact hash 诊断 |
-| `ZO_RNG_DIAG` | `0` | 打印 `before_loss1 / before_loss2 / before_update` RNG 状态 |
-| `ZO_Z_DIAG` | `1` | 在 `ZO_STEP_DIAG` 或 `ZO_STEP_DIAG_EXACT` 打开时，额外打印 z checksum / hash |
-| `ZO_BATCH_DEBUG` | unset | 打印 batch 内容摘要 |
-| `ZO_BATCH_DEBUG_STEP_START` | unset | 只从某个 step 开始打印 batch |
-| `ZO_BATCH_DEBUG_STEP_END` | unset | 只打印到某个 step 为止 |
-| `ZO_BATCH_DEBUG_RESUME_STEPS` | unset | resume 后额外打印若干步 batch |
-| `ZO_BATCH_DEBUG_EVERY` | unset | 每隔多少步打印一次 batch |
+#### resume / replay 层
+
+- 时间类：
+  - `[Replay] update ... time=...`
+  - `[Replay Timing]`
+  - `[Resume] Target checkpoint`
+  - `[Resume] Replay device`
+  - `[Resume] Replaying ... updates`
+  - `[Resume] Completed!`
+  - legacy 路径的 `[PipelinedReplay] ... in ...` / `[ClosedForm] ... in ...`
+- 系统资源类：
+  - `[Memory] before replay / after replay`
+  - legacy 路径的 `pipelined start/done`、`closedform start/after accumulation/done`
+- 一致性校验类：
+  - `[Resume Sources]`
+  - `[VERIFY-RESUME]`
+  - `[Resume] Shadow-vs-base comparison`
+  - `base_ready / shadow_loaded / after_tie_before_replay / after_replay` 对应的 `DIAG-* / STATE-* / ADAM-*`
+
+#### shadow 层
+
+- 时间类：
+  - `[Shadow BootTiming]`
+  - `[Shadow Timing]`
+- 系统资源类：
+  - `[Shadow Boot]`
+  - `[Shadow Flat]`
+  - `[Shadow Resource]`
+  - `[ThreadSnap] Shadow ...`
+- 一致性校验类：
+  - `shadow_boot / shadow_live / shadow_durable` 对应的 `STATE-* / ADAM-*`
+
+#### async anchor 层
+
+- 时间类：
+  - `[AsyncAnchor] Waiting for buffer ...`
+  - `[AsyncAnchor] Queued anchor step ...`
+  - `[AsyncAnchor] Persisted step ...`
+  - `[AsyncAnchor] Shutdown complete. Stats: ...`
+  - `[AsyncAnchor] Summary: ...`
+- 系统资源类：
+  - `[AsyncAnchor] Init: ... pinned buffer`
+  - `[AsyncAnchor] Excluding tied keys from checkpoint: ...`
+- 一致性校验类：
+  - 无独立校验日志，沿用 checkpoint / replay 的状态校验日志。
+
+### 重复日志清理结果
+
+- 已删除重复的 full checkpoint 总耗时日志，只保留 `[ZOTrainer SavePath]`。
+- 已删除 resume 阶段重复的 replay 完成耗时日志，只保留 replay 层 timing 摘要。
+- 已删除 shadow 子进程重复的线程 / 模式启动日志。
+- shadow 每步混合日志已拆成：
+  - `[Shadow Timing]`
+  - `[Shadow Resource]`
 
 ### 关键日志标签
 
@@ -885,7 +973,8 @@ resume 现在固定打印：
 | `[STATE-EXACT] shadow_durable step=N` | shadow 刚发布 durable snapshot 时的完整 state hash |
 | `[DIAG-EXACT] shadow_loaded step=N` | resume 从 shadow flat 读出来后的完整 state hash |
 | `[ADAM-EXACT] ...` | 对应时刻的完整 `m/v/t` hash |
-| `[Shadow] ... applied=... desired=... durable=...` | shadow 内存进度、目标 commit 步数、实际 durable 步数 |
+| `[Shadow Timing] ... applied=... desired=... durable=...` | shadow 每步 apply / zgen / commit timing 与 durable 进度 |
+| `[Shadow Resource] ... durable=... RSS=...` | shadow 每步 RSS 资源占用 |
 | `[Replay] Replaying ...` | replay 的设备、扰动模式、rng 设备 |
 | `[VERIFY-RESUME]` | 最后一条 replayed update 和 `pending_grad` 的恢复提示 |
 

@@ -1,9 +1,9 @@
 import hashlib
 import logging
-import os
 
 import torch
 
+from ...utils.logging_controls import consistency_log_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -23,14 +23,11 @@ def _uses_weight_decay(name):
 
 
 def _z_diag_enabled():
-    return os.environ.get("ZO_Z_DIAG", "1") == "1" and (
-        os.environ.get("ZO_STEP_DIAG", "0") == "1"
-        or os.environ.get("ZO_STEP_DIAG_EXACT", "0") == "1"
-    )
+    return consistency_log_enabled()
 
 
 def _z_exact_enabled():
-    return os.environ.get("ZO_STEP_DIAG_EXACT", "0") == "1"
+    return consistency_log_enabled()
 
 
 def _log_z_stats(label, z_tensors, _logger=None):

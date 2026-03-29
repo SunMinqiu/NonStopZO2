@@ -9,8 +9,8 @@ from dataclasses import dataclass
 import psutil
 import torch
 
+from ...utils.logging_controls import consistency_log_enabled, resource_log_enabled, time_log_enabled
 from .log_based_replay import (
-    _get_and_clear_replay_adam_state,
     _load_adam_state_from_base,
     _replay_updates_on_state,
     _set_replay_adam_state,
@@ -60,11 +60,15 @@ def _state_exact_fingerprint(state_dict, trainable_param_names=None):
 
 
 def _log_state_exact_fingerprint(label, state_dict, trainable_param_names=None):
+    if not consistency_log_enabled():
+        return
     fp, tensor_count = _state_exact_fingerprint(state_dict, trainable_param_names=trainable_param_names)
     logger.info(f"[DIAG-EXACT] {label}: sha256={fp} tensors={tensor_count}")
 
 
 def _log_state_exact_compare(label, lhs, rhs, trainable_param_names=None):
+    if not consistency_log_enabled():
+        return
     names = list(trainable_param_names) if trainable_param_names is not None else list(lhs.keys())
     missing_lhs = [name for name in names if name in rhs and name not in lhs]
     missing_rhs = [name for name in names if name in lhs and name not in rhs]
@@ -144,6 +148,8 @@ def _state_checksums(state_dict, trainable_param_names=None):
 
 
 def _log_state_checksums(label, state_dict, trainable_param_names=None, tied_groups=None):
+    if not consistency_log_enabled():
+        return
     """Emit consistent checksum diagnostics for resume/replay debugging."""
     stats = _state_checksums(state_dict, trainable_param_names)
     logger.info(
@@ -289,8 +295,9 @@ def resume_from_log_based_bundle(
         raise ValueError(f"Cannot extract step from checkpoint path: {ckpt_dir}")
     target_step = int(match.group(1))
 
-    logger.info(f"[Resume] Target checkpoint: {ckpt_dir} (step {target_step})")
-    logger.info(f"[Resume] Replay device: {device}")
+    if time_log_enabled():
+        logger.info(f"[Resume] Target checkpoint: {ckpt_dir} (step {target_step})")
+        logger.info(f"[Resume] Replay device: {device}")
 
     optimizer_path = os.path.join(ckpt_dir, "optimizer.pt")
     metadata_path = os.path.join(ckpt_dir, LOG_METADATA_NAME)
@@ -396,21 +403,25 @@ def resume_from_log_based_bundle(
     ckpt_rng_device = optimizer_state.get('rng_device', 'native')
     if rng_device == "native" and ckpt_rng_device != "native":
         rng_device = ckpt_rng_device
-        logger.info(f"[Resume] Auto-detected rng_device={rng_device} from checkpoint")
+        if consistency_log_enabled():
+            logger.info(f"[Resume] Auto-detected rng_device={rng_device} from checkpoint")
 
     if not zo2_mode and optimizer_state.get('zo2', False):
         zo2_mode = True
-        logger.info("[Resume] Auto-detected zo2_mode=True from checkpoint")
+        if consistency_log_enabled():
+            logger.info("[Resume] Auto-detected zo2_mode=True from checkpoint")
     if zo2_mode:
-        logger.info("[Resume] ZO2 mode: will use prev-step seed for gradient, current seed for perturbation")
+        if consistency_log_enabled():
+            logger.info("[Resume] ZO2 mode: will use prev-step seed for gradient, current seed for perturbation")
 
     model_dtype = _DTYPE_MAP.get(model_dtype_str, None)
 
-    logger.info(f"[Resume] Checkpoint mode: batch_size={batch_size}, base_checkpoint={base_checkpoint_ref}")
-    if model_dtype is not None:
-        logger.info(f"[Resume] Model dtype from checkpoint: {model_dtype}")
-    if tied_groups:
-        logger.info(f"[Resume] Tied weight groups from checkpoint: {tied_groups}")
+    if consistency_log_enabled():
+        logger.info(f"[Resume] Checkpoint mode: batch_size={batch_size}, base_checkpoint={base_checkpoint_ref}")
+        if model_dtype is not None:
+            logger.info(f"[Resume] Model dtype from checkpoint: {model_dtype}")
+        if tied_groups:
+            logger.info(f"[Resume] Tied weight groups from checkpoint: {tied_groups}")
 
     if batch_size == 0 and base_checkpoint_ref != "__initial__":
         logger.warning(
@@ -442,8 +453,9 @@ def resume_from_log_based_bundle(
     if is_adam:
         adam_state = _load_adam_state_from_base(base_checkpoint_ref, optimizer_state)
         base_adam_state = adam_state
-        logger.info(f"[Resume] Adam mode: loaded base adam state (t={adam_state.get('t', 0)}, "
-                    f"betas={adam_state.get('betas')}, {len(adam_state.get('m', {}))} m/v entries)")
+        if consistency_log_enabled():
+            logger.info(f"[Resume] Adam mode: loaded base adam state (t={adam_state.get('t', 0)}, "
+                        f"betas={adam_state.get('betas')}, {len(adam_state.get('m', {}))} m/v entries)")
         _log_adam_checksums(f"base_adam source={base_checkpoint_ref}", adam_state)
         _log_adam_exact_fingerprint(f"base_adam source={base_checkpoint_ref}", adam_state)
 
@@ -535,11 +547,12 @@ def resume_from_log_based_bundle(
                     base_template_state,
                     trainable_param_names=trainable_param_names,
                 )
-                logger.info(
-                    "[Resume] Shadow-vs-base comparison: "
-                    f"shadow_step={shadow_step}, base_step={base_ref_step}, "
-                    f"exact_match={bool(shadow_matches_base)}"
-                )
+                if consistency_log_enabled():
+                    logger.info(
+                        "[Resume] Shadow-vs-base comparison: "
+                        f"shadow_step={shadow_step}, base_step={base_ref_step}, "
+                        f"exact_match={bool(shadow_matches_base)}"
+                    )
 
             if base_ref_step > 0 and (shadow_step is None or int(shadow_step) < base_ref_step):
                 details = [
@@ -578,7 +591,8 @@ def resume_from_log_based_bundle(
                 logger.info(f"[Resume] Soft recovery: shadow at step {shadow_step}, replaying {len(updates)} lag updates")
                 shadow_used = True
     if reconstructed is None and base_state_dict is not None and base_checkpoint_ref == "__initial__":
-        logger.info("[Resume] Using pre-loaded base state dict in-place (no clone)")
+        if consistency_log_enabled():
+            logger.info("[Resume] Using pre-loaded base state dict in-place (no clone)")
         reconstructed = base_state_dict
         model_source = "base:__initial__"
         model_source_step = 0
@@ -610,21 +624,23 @@ def resume_from_log_based_bundle(
             trainable_param_names=trainable_param_names,
         )
 
-    logger.info(
-        f"[Resume] Replaying {len(updates)} updates "
-        f"(redo_source={redo_source}, default_zo_eps={default_zo_eps})"
-    )
+    if time_log_enabled():
+        logger.info(
+            f"[Resume] Replaying {len(updates)} updates "
+            f"(redo_source={redo_source}, default_zo_eps={default_zo_eps})"
+        )
     log_start_step = int(updates[0]["step"]) if updates else None
     log_end_step = int(updates[-1]["step"]) if updates else None
-    logger.info(
-        "[Resume Sources] "
-        f"model_source={model_source} model_step={model_source_step} | "
-        f"adam_source={adam_source} adam_step={adam_source_step} | "
-        f"log_source={redo_source} log_start_step={log_start_step} log_end_step={log_end_step} "
-        f"log_updates={len(updates)} target_step={target_step}"
-    )
-    if pending_grad is not None:
-        logger.info(f"[Resume] pending_grad={pending_grad} (will be restored to opt.projected_grad)")
+    if consistency_log_enabled():
+        logger.info(
+            "[Resume Sources] "
+            f"model_source={model_source} model_step={model_source_step} | "
+            f"adam_source={adam_source} adam_step={adam_source_step} | "
+            f"log_source={redo_source} log_start_step={log_start_step} log_end_step={log_end_step} "
+            f"log_updates={len(updates)} target_step={target_step}"
+        )
+        if pending_grad is not None:
+            logger.info(f"[Resume] pending_grad={pending_grad} (will be restored to opt.projected_grad)")
 
     if device == 'cuda' and torch.cuda.is_available():
         for key in reconstructed:
@@ -646,10 +662,10 @@ def resume_from_log_based_bundle(
             trainable_param_names=trainable_param_names,
         )
 
-    _mem_proc = psutil.Process(os.getpid())
+    _mem_proc = psutil.Process(os.getpid()) if resource_log_enabled() else None
     if device == 'cuda' and torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
-    _mem_cpu0, _mem_gpu0 = _log_memory("before replay", _mem_proc, device)
+    _mem_cpu0, _mem_gpu0 = _log_memory("before replay", _mem_proc, device) if _mem_proc is not None else (None, None)
 
     t_replay_start = time.time()
     _replay_updates_on_state(
@@ -665,7 +681,6 @@ def resume_from_log_based_bundle(
     )
     if device == 'cuda' and torch.cuda.is_available():
         torch.cuda.synchronize()
-    logger.info(f"[Resume Replay] {len(updates)} updates replayed in {time.time() - t_replay_start:.3f}s (device={device})")
     _log_state_checksums(
         "after_replay",
         reconstructed,
@@ -682,18 +697,23 @@ def resume_from_log_based_bundle(
         _log_adam_checksums("after_replay", adam_state)
         _log_adam_exact_fingerprint("after_replay", adam_state)
         _set_replay_adam_state(adam_state)
-        logger.info(f"[Resume] Cached replayed Adam state: t={adam_state.get('t', 0)}")
+        if consistency_log_enabled():
+            logger.info(f"[Resume] Cached replayed Adam state: t={adam_state.get('t', 0)}")
 
-    _log_memory("after replay", _mem_proc, device, _mem_cpu0, _mem_gpu0)
+    if _mem_proc is not None:
+        _log_memory("after replay", _mem_proc, device, _mem_cpu0, _mem_gpu0)
 
     if updates:
         last = updates[-1]
-        logger.info(f"[VERIFY-RESUME] Last replayed update: step={last.get('step','?')}, "
-                    f"seed={last['seed']}, grad={last['grad']:.6e}")
+        if consistency_log_enabled():
+            logger.info(f"[VERIFY-RESUME] Last replayed update: step={last.get('step','?')}, "
+                        f"seed={last['seed']}, grad={last['grad']:.6e}")
     if pending_grad is not None:
-        logger.info(f"[VERIFY-RESUME] pending_grad={pending_grad} => first resumed step should apply this grad")
+        if consistency_log_enabled():
+            logger.info(f"[VERIFY-RESUME] pending_grad={pending_grad} => first resumed step should apply this grad")
 
-    logger.info(f"[Resume] Completed! Recovered to step {target_step}")
+    if time_log_enabled():
+        logger.info(f"[Resume] Completed! Recovered to step {target_step}")
     recovered_base_step = 0
     if shadow_used and shadow_base_step is not None:
         recovered_base_step = int(shadow_base_step)

@@ -41,7 +41,6 @@ Environment variables:
 import glob
 import hashlib
 import logging
-import math
 import multiprocessing as mp
 import os
 import re
@@ -54,22 +53,15 @@ import psutil
 import torch
 from transformers import TrainerCallback
 
-from .log_based_failure_injection import GPUFailureSimulator, format_gpu_fail_steps
-from .log_based_resume import load_log_based_checkpoint, resume_from_log_based
-from .log_based_tuning import (
-    _benchmark_curves_worker,
-    _interp_curve,
-    calibrate_producer_consumer,
-    optimize_thread_allocation,
+from ...utils.logging_controls import (
+    resource_log_enabled,
+    time_log_enabled,
 )
+from .log_based_failure_injection import GPUFailureSimulator, format_gpu_fail_steps
+from .log_based_resume import load_log_based_checkpoint
 from .log_based_replay import (
-    _apply_single_update_with_pregenerated_z,
-    _apply_single_update,
-    _generate_z_for_one_step,
     _get_and_clear_replay_adam_state,
-    _load_adam_state_from_base,
     _replay_updates_on_state,
-    _set_replay_adam_state,
 )
 from .log_based_shadow import (
     _build_adam_flat_layout,
@@ -78,13 +70,11 @@ from .log_based_shadow import (
     _cleanup_rebase_payload_flat,
     _init_shadow_bundle_flat_storage,
     _load_shadow_bundle_flat,
-    _load_shadow_flat_replica,
     _load_shadow_replica,
     _shadow_process_main,
     _write_rebase_payload_flat,
 )
 from .log_based_utils import (
-    _DTYPE_MAP,
     _atomic_save_state_dict_safetensors,
     _clone_state_dict_to_cpu,
     _log_adam_brief,
@@ -95,11 +85,8 @@ from .log_based_utils import (
     _log_state_exact_compare,
     _log_state_exact_fingerprint,
     _detect_tied_weights,
-    _fsync_directory,
     _fsync_file,
     _ensure_zo_shm_dir,
-    _log_memory,
-    _restore_tied_weights,
     _step_diag_enabled,
     _step_exact_enabled,
     _system_stats,
@@ -889,13 +876,14 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         mem_mb = self._get_memory_size()
         logger.info(f"[LogBased] Initial model base activated from {source} ({mem_mb:.1f} MB)")
-        logger.info(
-            f"[LogBased InitBaseTiming] source={source} "
-            f"refresh_shadow={t_refresh_shadow:.3f}s "
-            f"publish_anchor={t_publish_anchor:.3f}s "
-            f"save_initial_model={t_save_initial_model:.3f}s "
-            f"total={time.time() - t_finalize_start:.3f}s"
-        )
+        if time_log_enabled():
+            logger.info(
+                f"[LogBased InitBaseTiming] source={source} "
+                f"refresh_shadow={t_refresh_shadow:.3f}s "
+                f"publish_anchor={t_publish_anchor:.3f}s "
+                f"save_initial_model={t_save_initial_model:.3f}s "
+                f"total={time.time() - t_finalize_start:.3f}s"
+            )
         self._log_memory_status()
 
     def _cache_initial_model(self, model):
@@ -909,7 +897,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         mem_mb = self._get_memory_size()
         t_elapsed = time.time() - t_start
-        logger.info(f"[LogBased] Initial model cached ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
+        if time_log_enabled():
+            logger.info(f"[LogBased] Initial model cached ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
         self._log_memory_status()
 
     def _init_for_resume(self, model, state, log_based_resume):
@@ -1061,7 +1050,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self.is_first_save = False
         mem_mb = self._get_memory_size()
         t_elapsed = time.time() - t_start
-        logger.info(f"[LogBased Resume] Initialized ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
+        if time_log_enabled():
+            logger.info(f"[LogBased Resume] Initialized ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
 
     def _init_shadow_adam_state(self, model):
         """Initialize shadow_adam_state if the optimizer is MeZO-Adam.
@@ -1136,9 +1126,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
             aten_threads = max(1, total_cores - n_reserve)
             n_cons = aten_threads
             c_prod = aten_threads  # serial: same pool, alternating
-        logger.info(f"[Shadow Thread Config] total_cores={total_cores} "
-                    f"reserve={n_reserve} consumer(ATen)={aten_threads} "
-                    f"producer(zo_rng)={c_prod}")
         _thread_env = {
             'OMP_NUM_THREADS': str(aten_threads),
             'OMP_WAIT_POLICY': 'passive',
@@ -1217,10 +1204,11 @@ class LogBasedCheckpointCallback(TrainerCallback):
                     f"shadow process did not become ready within {ready_timeout_s:.1f}s "
                     f"(alive={alive}, waited={wait_ready_elapsed_s:.3f}s)"
                 )
-            logger.info(
-                f"[LogBased] Shadow reported ready_for_updates in {wait_ready_elapsed_s:.3f}s "
-                f"(timeout={ready_timeout_s:.1f}s)"
-            )
+            if time_log_enabled():
+                logger.info(
+                    f"[LogBased] Shadow reported ready_for_updates in {wait_ready_elapsed_s:.3f}s "
+                    f"(timeout={ready_timeout_s:.1f}s)"
+                )
         _thread_snapshot("Train AFTER_SHADOW_SPAWN")
 
     def _zo_update_hook(self, model, inputs, loss):
@@ -1272,7 +1260,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
                         self.update_queue.put_nowait({"cmd": "update", "update": update})
                         shadow_send_s = time.perf_counter() - t_shadow_send_start
                         self.timing_stats['shadow_send_times'].append(shadow_send_s)
-                        if _step_diag_enabled():
+                        if time_log_enabled():
                             logger.info(
                                 f"[ShadowSend] step={actual_step} enqueue={shadow_send_s * 1000.0:.3f}ms"
                             )
@@ -1383,22 +1371,23 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         if self.current_step % 10 == 0:
             num_updates = len(self.update_history)
-            cpu_pct, mem_gb, mem_total, gpu_alloc, gpu_rsv = _system_stats()
-            if self.enable_shadow:
-                shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
-                # Health check: detect dead shadow process (log once)
-                if self.shadow_process is not None and not self.shadow_process.is_alive():
-                    if not getattr(self, '_shadow_death_logged', False):
-                        logger.error(f"[LogBased] Shadow process DEAD (exitcode={self.shadow_process.exitcode})")
-                        self._shadow_death_logged = True
-                logger.info(f"[LogBased] step={self.current_step} shadow={shadow_step} "
-                           f"updates={num_updates} "
-                           f"| CPU={cpu_pct:.0f}% MEM={mem_gb:.0f}/{mem_total:.0f}GB "
-                           f"| GPU alloc={gpu_alloc:.0f}MB rsv={gpu_rsv:.0f}MB")
-            else:
-                logger.info(f"[LogBased] step={self.current_step} updates={num_updates} "
-                           f"| CPU={cpu_pct:.0f}% MEM={mem_gb:.0f}/{mem_total:.0f}GB "
-                           f"| GPU alloc={gpu_alloc:.0f}MB rsv={gpu_rsv:.0f}MB")
+            if resource_log_enabled():
+                cpu_pct, mem_gb, mem_total, gpu_alloc, gpu_rsv = _system_stats()
+                if self.enable_shadow:
+                    shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
+                    # Health check: detect dead shadow process (log once)
+                    if self.shadow_process is not None and not self.shadow_process.is_alive():
+                        if not getattr(self, '_shadow_death_logged', False):
+                            logger.error(f"[LogBased] Shadow process DEAD (exitcode={self.shadow_process.exitcode})")
+                            self._shadow_death_logged = True
+                    logger.info(f"[LogBased] step={self.current_step} shadow={shadow_step} "
+                               f"updates={num_updates} "
+                               f"| CPU={cpu_pct:.0f}% MEM={mem_gb:.0f}/{mem_total:.0f}GB "
+                               f"| GPU alloc={gpu_alloc:.0f}MB rsv={gpu_rsv:.0f}MB")
+                else:
+                    logger.info(f"[LogBased] step={self.current_step} updates={num_updates} "
+                               f"| CPU={cpu_pct:.0f}% MEM={mem_gb:.0f}/{mem_total:.0f}GB "
+                               f"| GPU alloc={gpu_alloc:.0f}MB rsv={gpu_rsv:.0f}MB")
 
     def recover_from_shadow(self) -> OrderedDict:
         """Recover from the latest committed shadow replica in the configured tmpfs directory."""
@@ -1430,7 +1419,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
             self.shadow_step = shadow_step
 
             t_elapsed = time.time() - t_start
-            logger.info(f"[Recovery] Recovered from shadow model at step {shadow_step} in {t_elapsed:.3f}s")
+            if time_log_enabled():
+                logger.info(f"[Recovery] Recovered from shadow model at step {shadow_step} in {t_elapsed:.3f}s")
             logger.info(f"[Recovery] GPU was at step {self.current_step}, shadow was at step {shadow_step}")
             logger.info(f"[Recovery] Lost {self.current_step - shadow_step} steps (will be replayed)")
 
@@ -1460,10 +1450,11 @@ class LogBasedCheckpointCallback(TrainerCallback):
             updates = [u for u in self.update_history if int(u.get("step", -1)) > base_step]
 
         num_updates = len(updates)
-        logger.info(
-            f"[Recovery] Reconstructing on-demand from active_base_step={base_step}: "
-            f"replaying {num_updates} updates..."
-        )
+        if time_log_enabled():
+            logger.info(
+                f"[Recovery] Reconstructing on-demand from active_base_step={base_step}: "
+                f"replaying {num_updates} updates..."
+            )
 
         # Copy base checkpoint state
         reconstructed = OrderedDict()
@@ -1492,11 +1483,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
             zo2_mode=zo2_mode,
             initial_prev_seed=self._active_base_pending_seed,
         )
-        if num_updates > 0:
+        if num_updates > 0 and time_log_enabled():
             logger.info(f"[Recovery] Replayed {num_updates} updates")
 
         t_elapsed = time.time() - t_start
-        logger.info(f"[Recovery] Reconstruction completed in {t_elapsed:.3f}s ({num_updates} updates)")
+        if time_log_enabled():
+            logger.info(f"[Recovery] Reconstruction completed in {t_elapsed:.3f}s ({num_updates} updates)")
 
         self.timing_stats['recoveries'].append({
             'type': 'on_demand',
@@ -1609,13 +1601,14 @@ class LogBasedCheckpointCallback(TrainerCallback):
                     queue_rebase_s = time.time() - t0
                     self._last_shadow_rebased_anchor_step = int(step)
 
-        logger.info(
-            f"[LogBased FullCkpt] step={step} "
-            f"clone_model={clone_model_s:.3f}s clone_adam={clone_adam_s:.3f}s "
-            f"submit_anchor={submit_anchor_s:.3f}s "
-            f"publish_anchor={publish_anchor_s:.3f}s queue_rebase={queue_rebase_s:.3f}s "
-            f"total={time.time() - t0_total:.3f}s"
-        )
+        if time_log_enabled():
+            logger.info(
+                f"[LogBased FullCkpt] step={step} "
+                f"clone_model={clone_model_s:.3f}s clone_adam={clone_adam_s:.3f}s "
+                f"submit_anchor={submit_anchor_s:.3f}s "
+                f"publish_anchor={publish_anchor_s:.3f}s queue_rebase={queue_rebase_s:.3f}s "
+                f"total={time.time() - t0_total:.3f}s"
+            )
         if _step_diag_enabled() or _step_exact_enabled():
             if live_adam_state is not None:
                 _log_adam_checksums(f"train_snapshot step={step}", live_adam_state)
@@ -1654,6 +1647,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
         return total / (1024 * 1024)
 
     def _log_memory_status(self):
+        if not resource_log_enabled():
+            return
         cache_mb = self._get_memory_size()
         mem = psutil.virtual_memory()
         used_gb = mem.used / (1024 ** 3)
@@ -1684,13 +1679,14 @@ class LogBasedCheckpointCallback(TrainerCallback):
                     async_anchor.get_latest_completed_anchor_path(),
                 )
             async_stats = async_anchor.stats
-            logger.info(
-                "[AsyncAnchor] Summary: "
-                f"enqueue_cpu count={async_stats['enqueue_cpu_count']} avg={async_stats['avg_enqueue_cpu_time']:.3f}s | "
-                f"d2h count={async_stats['d2h_count']} avg={async_stats['avg_d2h_time']:.3f}s | "
-                f"cpu_total count={async_stats['cpu_persist_total_count']} "
-                f"avg={async_stats['avg_cpu_persist_total_time']:.3f}s"
-            )
+            if time_log_enabled():
+                logger.info(
+                    "[AsyncAnchor] Summary: "
+                    f"enqueue_cpu count={async_stats['enqueue_cpu_count']} avg={async_stats['avg_enqueue_cpu_time']:.3f}s | "
+                    f"d2h count={async_stats['d2h_count']} avg={async_stats['avg_d2h_time']:.3f}s | "
+                    f"cpu_total count={async_stats['cpu_persist_total_count']} "
+                    f"avg={async_stats['avg_cpu_persist_total_time']:.3f}s"
+                )
 
         self._stop_anchor_publisher()
 
@@ -1709,16 +1705,18 @@ class LogBasedCheckpointCallback(TrainerCallback):
         shadow_send_times = self.timing_stats.get('shadow_send_times', [])
         if shadow_send_times:
             avg_shadow_send_ms = (sum(shadow_send_times) / len(shadow_send_times)) * 1000.0
-            logger.info(
-                f"[ShadowSend] Summary: count={len(shadow_send_times)} avg={avg_shadow_send_ms:.3f}ms"
-            )
+            if time_log_enabled():
+                logger.info(
+                    f"[ShadowSend] Summary: count={len(shadow_send_times)} avg={avg_shadow_send_ms:.3f}ms"
+                )
 
         checkpoint_total_times = self.timing_stats.get('checkpoint_total_times', [])
         if checkpoint_total_times:
             avg_checkpoint_s = sum(checkpoint_total_times) / len(checkpoint_total_times)
-            logger.info(
-                f"[ZOTrainer] Full checkpoint summary: count={len(checkpoint_total_times)} avg={avg_checkpoint_s:.3f}s"
-            )
+            if time_log_enabled():
+                logger.info(
+                    f"[ZOTrainer] Full checkpoint summary: count={len(checkpoint_total_times)} avg={avg_checkpoint_s:.3f}s"
+                )
 
         status = self.get_recovery_status()
         logger.info(f"[LogBased] Final status: {status}")
