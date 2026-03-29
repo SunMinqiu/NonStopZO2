@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import os
 import tempfile
@@ -10,12 +11,40 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 logger = logging.getLogger(__name__)
+_DEFAULT_ADAM_TRACKED_NAMES = ("model.embed_tokens.weight", "lm_head.weight")
+_DEFAULT_STATE_TRACKED_NAMES = ("model.embed_tokens.weight", "lm_head.weight")
+
+DEFAULT_ZO_SHM_DIR = "/dev/shm/zo_ckpt"
 
 _DTYPE_MAP = {
     'torch.float16': torch.float16,
     'torch.bfloat16': torch.bfloat16,
     'torch.float32': torch.float32,
 }
+
+
+def _get_zo_shm_dir():
+    """Return the directory used for ZO tmpfs checkpoint artifacts."""
+    return os.environ.get("ZO_SHM_DIR", DEFAULT_ZO_SHM_DIR)
+
+
+def _ensure_zo_shm_dir():
+    """Create and return the directory used for ZO tmpfs checkpoint artifacts."""
+    shm_dir = _get_zo_shm_dir()
+    os.makedirs(shm_dir, exist_ok=True)
+    return shm_dir
+
+
+def _thread_debug_enabled():
+    return os.environ.get("LOG_BASED_THREAD_DEBUG", "0") == "1"
+
+
+def _step_diag_enabled():
+    return os.environ.get("ZO_STEP_DIAG", "0") == "1"
+
+
+def _step_exact_enabled():
+    return os.environ.get("ZO_STEP_DIAG_EXACT", "0") == "1"
 
 def _clone_state_dict_to_cpu(state_dict, *, exclude_keys=None):
     """Clone a state dict to regular CPU tensors."""
@@ -67,6 +96,8 @@ def _load_state_dict_safetensors_with_metadata(path):
 
 def _thread_snapshot(label, _logger=None, detail=False):
     """Print a snapshot of all thread pools in the current process."""
+    if not _thread_debug_enabled():
+        return -1
     pid = os.getpid()
     try:
         os_thr = len(os.listdir(f'/proc/{pid}/task'))
@@ -203,3 +234,251 @@ def _restore_tied_weights(state_dict, checkpoint_dir):
     if config.get('tie_word_embeddings', False):
         if 'model.embed_tokens.weight' in state_dict and 'lm_head.weight' not in state_dict:
             state_dict['lm_head.weight'] = state_dict['model.embed_tokens.weight']
+
+
+def _restore_tied_weights_for_model(state_dict, model):
+    """Restore tied-weight secondary keys using the live model/config as source of truth."""
+    tied_groups = _detect_tied_weights(model)
+    if tied_groups:
+        _tie_state_dict_inplace(state_dict, tied_groups)
+    config = getattr(model, "config", None)
+    if config is not None and getattr(config, "tie_word_embeddings", False):
+        if 'model.embed_tokens.weight' in state_dict and 'lm_head.weight' not in state_dict:
+            state_dict['lm_head.weight'] = state_dict['model.embed_tokens.weight']
+
+
+def _state_checksums(state_dict, tracked_names=None):
+    if state_dict is None:
+        return {"sum": 0.0, "tensors": 0, "tracked": {}}
+    total = 0.0
+    count = 0
+    for tensor in state_dict.values():
+        if torch.is_tensor(tensor):
+            total += tensor.float().sum().item()
+            count += 1
+    tracked = {}
+    for name in tracked_names or _DEFAULT_STATE_TRACKED_NAMES:
+        tensor = state_dict.get(name)
+        if torch.is_tensor(tensor):
+            tracked[name] = tensor.float().sum().item()
+    return {"sum": total, "tensors": count, "tracked": tracked}
+
+
+def _state_exact_fingerprint(state_dict):
+    if state_dict is None:
+        return "", 0
+    digest = hashlib.sha256()
+    count = 0
+    for name in sorted(state_dict.keys()):
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor):
+            continue
+        cpu = tensor.detach().cpu().contiguous()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(cpu.dtype).encode("utf-8"))
+        digest.update(str(tuple(cpu.shape)).encode("utf-8"))
+        digest.update(memoryview(cpu.numpy()).tobytes())
+        count += 1
+    return digest.hexdigest(), count
+
+
+def _log_state_checksums(label, state_dict, tracked_names=None, _logger=None):
+    _log = _logger or logger
+    if state_dict is None:
+        _log.info(f"[STATE-CKSUM] {label}: no_state")
+        return
+    stats = _state_checksums(state_dict, tracked_names=tracked_names)
+    _log.info(
+        f"[STATE-CKSUM] {label}: "
+        f"sum={stats['sum']:.10e} tensors={stats['tensors']}"
+    )
+    for name, value in stats["tracked"].items():
+        _log.info(f"[STATE-CKSUM] {label}: {name}={value:.10e}")
+
+
+def _log_state_exact_fingerprint(label, state_dict, _logger=None):
+    _log = _logger or logger
+    if state_dict is None:
+        _log.info(f"[STATE-EXACT] {label}: no_state")
+        return
+    fp, tensor_count = _state_exact_fingerprint(state_dict)
+    _log.info(f"[STATE-EXACT] {label}: sha256={fp} tensors={tensor_count}")
+
+
+def _log_state_exact_compare(label, lhs, rhs, _logger=None):
+    _log = _logger or logger
+    if lhs is None or rhs is None:
+        _log.info(
+            f"[STATE-EXACT] {label}: exact_match=False "
+            f"lhs_is_none={lhs is None} rhs_is_none={rhs is None}"
+        )
+        return
+
+    lhs_names = {name for name, tensor in lhs.items() if torch.is_tensor(tensor)}
+    rhs_names = {name for name, tensor in rhs.items() if torch.is_tensor(tensor)}
+    if lhs_names != rhs_names:
+        _log.info(
+            f"[STATE-EXACT] {label}: exact_match=False name_mismatch "
+            f"lhs_only={sorted(lhs_names - rhs_names)[:3]} rhs_only={sorted(rhs_names - lhs_names)[:3]}"
+        )
+        return
+
+    for name in sorted(lhs_names):
+        a = lhs[name].detach().cpu()
+        b = rhs[name].detach().cpu()
+        if a.dtype != b.dtype or tuple(a.shape) != tuple(b.shape):
+            _log.info(
+                f"[STATE-EXACT] {label}: exact_match=False meta_mismatch "
+                f"name={name} lhs_dtype={a.dtype} rhs_dtype={b.dtype} "
+                f"lhs_shape={tuple(a.shape)} rhs_shape={tuple(b.shape)}"
+            )
+            return
+        if not torch.equal(a, b):
+            diff = (a.float() - b.float()).abs().max().item()
+            _log.info(
+                f"[STATE-EXACT] {label}: exact_match=False first_diff={name} "
+                f"max_abs_diff={diff:.10e}"
+            )
+            return
+    _log.info(f"[STATE-EXACT] {label}: exact_match=True")
+
+
+def _adam_maps(adam_state):
+    if not isinstance(adam_state, dict):
+        return OrderedDict(), OrderedDict()
+    return adam_state.get("m", {}) or OrderedDict(), adam_state.get("v", {}) or OrderedDict()
+
+
+def _adam_state_checksums(adam_state):
+    m_map, v_map = _adam_maps(adam_state)
+    m_sum = 0.0
+    v_sum = 0.0
+    for tensor in m_map.values():
+        m_sum += tensor.float().sum().item()
+    for tensor in v_map.values():
+        v_sum += tensor.float().sum().item()
+    return {
+        "m_sum": m_sum,
+        "v_sum": v_sum,
+        "m_tensors": len(m_map),
+        "v_tensors": len(v_map),
+        "t": int((adam_state or {}).get("t", 0)),
+        "betas": tuple((adam_state or {}).get("betas", (0.0, 0.0))),
+        "adam_eps": float((adam_state or {}).get("adam_eps", 0.0)),
+    }
+
+
+def _adam_exact_fingerprint(adam_state):
+    m_map, v_map = _adam_maps(adam_state)
+    digest = hashlib.sha256()
+    digest.update(str(int((adam_state or {}).get("t", 0))).encode("utf-8"))
+    digest.update(str(tuple((adam_state or {}).get("betas", (0.0, 0.0)))).encode("utf-8"))
+    digest.update(str(float((adam_state or {}).get("adam_eps", 0.0))).encode("utf-8"))
+    count = 0
+    for mv_key, mapping in (("m", m_map), ("v", v_map)):
+        for name in sorted(mapping.keys()):
+            tensor = mapping[name].detach().cpu().contiguous()
+            digest.update(mv_key.encode("utf-8"))
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tensor.dtype).encode("utf-8"))
+            digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+            digest.update(memoryview(tensor.numpy()).tobytes())
+            count += 1
+    return digest.hexdigest(), count
+
+
+def _log_adam_brief(label, adam_state, tracked_names=None, _logger=None):
+    _log = _logger or logger
+    if adam_state is None:
+        _log.info(f"[ADAM-BRIEF] {label}: no_state")
+        return
+    m_map, v_map = _adam_maps(adam_state)
+    stats = _adam_state_checksums(adam_state)
+    _log.info(
+        f"[ADAM-BRIEF] {label}: "
+        f"t={stats['t']} betas={stats['betas']} eps={stats['adam_eps']} "
+        f"m_tensors={stats['m_tensors']} v_tensors={stats['v_tensors']}"
+    )
+    names = []
+    for name in (tracked_names or _DEFAULT_ADAM_TRACKED_NAMES):
+        if name in m_map or name in v_map:
+            names.append(name)
+    if not names:
+        first_name = next(iter(m_map.keys()), None) or next(iter(v_map.keys()), None)
+        if first_name is not None:
+            names.append(first_name)
+    for name in names:
+        if name in m_map:
+            _log.info(f"[ADAM-BRIEF] {label}: m[{name}]={m_map[name].float().sum().item():.10e}")
+        if name in v_map:
+            _log.info(f"[ADAM-BRIEF] {label}: v[{name}]={v_map[name].float().sum().item():.10e}")
+
+
+def _log_adam_checksums(label, adam_state, tracked_names=None, _logger=None):
+    _log = _logger or logger
+    if adam_state is None:
+        _log.info(f"[ADAM-CKSUM] {label}: no_state")
+        return
+    m_map, v_map = _adam_maps(adam_state)
+    stats = _adam_state_checksums(adam_state)
+    _log.info(
+        f"[ADAM-CKSUM] {label}: "
+        f"t={stats['t']} betas={stats['betas']} eps={stats['adam_eps']} "
+        f"m_sum={stats['m_sum']:.10e} v_sum={stats['v_sum']:.10e} "
+        f"m_tensors={stats['m_tensors']} v_tensors={stats['v_tensors']}"
+    )
+    for name in tracked_names or _DEFAULT_ADAM_TRACKED_NAMES:
+        if name in m_map:
+            _log.info(f"[ADAM-CKSUM] {label}: m[{name}]={m_map[name].float().sum().item():.10e}")
+        if name in v_map:
+            _log.info(f"[ADAM-CKSUM] {label}: v[{name}]={v_map[name].float().sum().item():.10e}")
+
+
+def _log_adam_exact_fingerprint(label, adam_state, _logger=None):
+    _log = _logger or logger
+    if adam_state is None:
+        _log.info(f"[ADAM-EXACT] {label}: no_state")
+        return
+    fp, tensor_count = _adam_exact_fingerprint(adam_state)
+    _log.info(f"[ADAM-EXACT] {label}: sha256={fp} tensors={tensor_count}")
+
+
+def _log_adam_exact_compare(label, lhs, rhs, _logger=None):
+    _log = _logger or logger
+    if lhs is None or rhs is None:
+        _log.info(
+            f"[ADAM-EXACT] {label}: exact_match=False "
+            f"lhs_is_none={lhs is None} rhs_is_none={rhs is None}"
+        )
+        return
+    lhs_m, lhs_v = _adam_maps(lhs)
+    rhs_m, rhs_v = _adam_maps(rhs)
+    meta_keys = ("t", "betas", "adam_eps")
+    meta_mismatch = {
+        key: ((lhs or {}).get(key), (rhs or {}).get(key))
+        for key in meta_keys
+        if (lhs or {}).get(key) != (rhs or {}).get(key)
+    }
+    if meta_mismatch:
+        _log.info(f"[ADAM-EXACT] {label}: exact_match=False meta_mismatch={meta_mismatch}")
+        return
+    for mv_key, lhs_map, rhs_map in (("m", lhs_m, rhs_m), ("v", lhs_v, rhs_v)):
+        lhs_names = set(lhs_map.keys())
+        rhs_names = set(rhs_map.keys())
+        if lhs_names != rhs_names:
+            _log.info(
+                f"[ADAM-EXACT] {label}: exact_match=False {mv_key}_name_mismatch "
+                f"lhs_only={sorted(lhs_names - rhs_names)[:3]} rhs_only={sorted(rhs_names - lhs_names)[:3]}"
+            )
+            return
+        for name in sorted(lhs_names):
+            a = lhs_map[name].detach().cpu()
+            b = rhs_map[name].detach().cpu()
+            if not torch.equal(a, b):
+                diff = (a.float() - b.float()).abs().max().item()
+                _log.info(
+                    f"[ADAM-EXACT] {label}: exact_match=False first_diff={mv_key}[{name}] "
+                    f"max_abs_diff={diff:.10e}"
+                )
+                return
+    _log.info(f"[ADAM-EXACT] {label}: exact_match=True")

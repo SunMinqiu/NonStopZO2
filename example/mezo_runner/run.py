@@ -27,10 +27,12 @@ sys.path.append("../../../zo2")
 
 import logging
 import gc
+from collections import OrderedDict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+THREAD_DEBUG = os.environ.get("LOG_BASED_THREAD_DEBUG", "0") == "1"
 
 # ---- Thread origin probe (temporary) ----
 def _tc():
@@ -46,20 +48,24 @@ def _wchan():
                 wc[f.read().strip()] += 1
         except: pass
     return wc.most_common()
-logger.info(f"[THR] bare python: {_tc()}")
+if THREAD_DEBUG:
+    logger.info(f"[THR] bare python: {_tc()}")
 
 import argparse
 import time
 import tasks
-logger.info(f"[THR] after import tasks: {_tc()}")
+if THREAD_DEBUG:
+    logger.info(f"[THR] after import tasks: {_tc()}")
 
 from transformers import AutoConfig, AutoTokenizer, AutoModelForCausalLM, Trainer, HfArgumentParser, Trainer, TrainingArguments, DataCollatorWithPadding, DataCollatorForTokenClassification
-logger.info(f"[THR] after import transformers: {_tc()}")
+if THREAD_DEBUG:
+    logger.info(f"[THR] after import transformers: {_tc()}")
 
 from typing import Union, Optional
 import torch
-logger.info(f"[THR] after import torch: {_tc()}")
-logger.info(f"[THR] wchan: {_wchan()}")
+if THREAD_DEBUG:
+    logger.info(f"[THR] after import torch: {_tc()}")
+    logger.info(f"[THR] wchan: {_wchan()}")
 
 from torch.nn.parameter import Parameter
 import numpy as np
@@ -76,9 +82,14 @@ import random
 
 from zo2.trainer.hf_transformers.trainer import ZOTrainer
 from zo2.trainer.hf_transformers.log_based_checkpoint import LogBasedCheckpointCallback
-from zo2.trainer.hf_transformers.log_based_resume import resume_from_log_based
+from zo2.trainer.hf_transformers.log_based_failure_injection import (
+    format_gpu_fail_steps,
+    parse_gpu_fail_steps,
+)
+from zo2.trainer.hf_transformers.log_based_resume import resume_from_log_based_bundle
 from zo2 import zo_hf_init, ZOConfig
-logger.info(f"[THR] after all imports: {_tc()}")
+if THREAD_DEBUG:
+    logger.info(f"[THR] after all imports: {_tc()}")
 
 @dataclass
 class OurArguments(TrainingArguments):
@@ -175,7 +186,7 @@ class OurArguments(TrainingArguments):
     # L3: 即时恢复 (需要 log_based_ckpt >= 0 + enable_shadow + gpu_fail_step)
     instant_recover: bool = False  # instantly recover from shadow model when GPU failure occurs
     # GPU 故障注入 (旁路，可单独使用)
-    gpu_fail_step: int = -1  # simulate GPU failure at this step (-1 = disabled)
+    gpu_fail_step: str = "-1"  # simulate GPU failures at these global steps, e.g. "15,45,80"
     # Log-Based Resume: specify the full checkpoint path to resume from.
     # Will automatically scan parent directory for checkpoints and replay them.
     log_based_resume: str = ""  # path to base full checkpoint for resuming
@@ -189,7 +200,7 @@ class OurArguments(TrainingArguments):
     #   Phase 2: CPU→disk persist in background thread
     async_anchor: bool = False  # enable async anchor checkpoint
     log_output_dir: str = ""  # separate directory for log checkpoints when shadow is disabled
-    shadow_resume: str = ""  # soft failure: /dev/shm shadow replica safetensors path
+    shadow_resume: str = ""  # soft failure: tmpfs shadow safetensors path or flat header path
 
     # Deterministic reproducibility
     deterministic: bool = False  # enable torch.use_deterministic_algorithms for cross-process reproducibility
@@ -230,6 +241,7 @@ class Framework:
     def __init__(self, args, task):
         self.args = args
         self.task = task
+        self.initial_cpu_state_dict = None
         self.model, self.tokenizer = self.load_model()
 
 
@@ -317,6 +329,19 @@ class Framework:
                         torch_dtype=torch_dtype,
                         max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
                         load_in_8bit=self.args.load_int8,
+                    )
+                if self.args.log_based_ckpt >= 0 and not self.args.log_based_resume:
+                    self.initial_cpu_state_dict = OrderedDict(
+                        (name, tensor.detach().to(device="cpu").clone())
+                        for name, tensor in model.state_dict().items()
+                    )
+                    injected_mb = sum(
+                        tensor.numel() * tensor.element_size()
+                        for tensor in self.initial_cpu_state_dict.values()
+                    ) / (1024 ** 2)
+                    logger.info(
+                        f"[LogBased] Captured initial CPU state during model load "
+                        f"({len(self.initial_cpu_state_dict)} tensors, {injected_mb:.1f} MB)"
                     )
                 model.zo_init(self.zo_config)
             logger.info(f"Check if zo2 init correctly: {hasattr(model, 'zo_training')}")
@@ -585,11 +610,16 @@ class Framework:
 
         # GPU failure / shadow config
         # Env vars may override CLI args, but we compute and log effective values explicitly.
-        gpu_fail_step = int(os.environ.get('GPU_FAIL_STEP', str(self.args.gpu_fail_step)))
+        gpu_fail_step_spec = os.environ.get('GPU_FAIL_STEP', str(self.args.gpu_fail_step))
+        gpu_fail_steps = parse_gpu_fail_steps(gpu_fail_step_spec)
+        gpu_fail_step = gpu_fail_steps[0] if gpu_fail_steps else -1
+        gpu_fail_schedule = format_gpu_fail_steps(gpu_fail_steps)
         requested_enable_shadow = self.args.enable_shadow or os.environ.get('ENABLE_SHADOW', '') == '1'
         requested_instant_recover = self.args.instant_recover or os.environ.get('INSTANT_RECOVER', '') == '1'
         effective_enable_shadow = requested_enable_shadow
-        effective_instant_recover = requested_instant_recover and effective_enable_shadow and gpu_fail_step > 0
+        effective_instant_recover = requested_instant_recover and effective_enable_shadow and (
+            bool(gpu_fail_steps) or bool(self.args.log_based_resume) or bool(self.args.shadow_resume)
+        )
 
         self.args.enable_shadow = effective_enable_shadow
         self.args.instant_recover = effective_instant_recover
@@ -599,7 +629,7 @@ class Framework:
             f"log_based_ckpt={self.args.log_based_ckpt}, "
             f"enable_shadow={requested_enable_shadow}, "
             f"instant_recover={requested_instant_recover}, "
-            f"gpu_fail_step={gpu_fail_step}, "
+            f"gpu_fail_step={gpu_fail_schedule}, "
             f"async_anchor={self.args.async_anchor}"
         )
         logger.info(
@@ -607,7 +637,7 @@ class Framework:
             f"log_based_ckpt={self.args.log_based_ckpt}, "
             f"enable_shadow={effective_enable_shadow}, "
             f"instant_recover={effective_instant_recover}, "
-            f"gpu_fail_step={gpu_fail_step if gpu_fail_step > 0 else -1}, "
+            f"gpu_fail_step={gpu_fail_schedule}, "
             f"async_anchor={self.args.async_anchor}"
         )
 
@@ -628,9 +658,16 @@ class Framework:
             level = f"L1 ({mode_desc})"
             if log_based_callback.enable_shadow:
                 level = f"L2 (CPU Shadow) + {mode_desc}"
-                if log_based_callback.instant_recover and gpu_fail_step > 0:
+                if log_based_callback.instant_recover and gpu_fail_steps:
                     level = f"L3 (Instant Recovery) + {mode_desc}"
             logger.info(f"[LogBased] Experiment level: {level}")
+
+            if self.initial_cpu_state_dict is not None:
+                log_based_callback.set_initial_cpu_state(
+                    self.initial_cpu_state_dict,
+                    source="run.py:model_load",
+                )
+                self.initial_cpu_state_dict = None
 
             trainer.add_callback(log_based_callback)
             # 这里是注册一个 post hook，用于在每次 ZO（Zero-Order）训练步完成后，记录本次参数更新的相关信息
@@ -658,17 +695,18 @@ class Framework:
                 logger.warning("[AsyncAnchor] async_anchor requires log_based_ckpt >= 1, ignoring")
 
             # 设置 GPU 故障注入
-            if gpu_fail_step > 0:
-                log_based_callback.failure_simulator.set_fail_step(gpu_fail_step)
-                logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step}")
+            if gpu_fail_steps:
+                log_based_callback.failure_simulator.set_fail_steps(gpu_fail_steps)
+                logger.info(f"[GPU Failure] Will simulate failure at step(s) {gpu_fail_schedule}")
         else:
             # L0: Baseline (log_based_ckpt=-1)，也可以单独使用 GPU 故障注入
             logger.info("[LogBased] Disabled (L0 baseline), using default Trainer checkpoint")
-            if gpu_fail_step > 0:
-                logger.info(f"[GPU Failure] Will simulate failure at step {gpu_fail_step} (L0 baseline, no recovery)")
+            if gpu_fail_steps:
+                logger.info(f"[GPU Failure] Will simulate failure at step(s) {gpu_fail_schedule} (L0 baseline, no recovery)")
 
         # Resume training from a last checkpoint
         last_checkpoint = None
+        log_based_resumed_step = None
         from transformers.trainer_utils import get_last_checkpoint
 
         # Handle log-based resume
@@ -680,7 +718,7 @@ class Framework:
             # Both full and log-based go through resume_from_log_based.
             # Full: loads checkpoint from disk, returns state_dict
             # Log-based: loads base from _load_base_state (page cache hit) + replay
-            recovered_state = resume_from_log_based(
+            recovery = resume_from_log_based_bundle(
                 checkpoint_path=self.args.log_based_resume,
                 output_dir=self.args.output_dir,
                 pretrained_model_name=self.args.model_name,
@@ -691,10 +729,18 @@ class Framework:
                 zo2_mode=(self.args.zo_mode == "zo2"),
                 shadow_path=self.args.shadow_resume or None,
             )
+            recovered_state = recovery.state_dict
             recovered_state_on_cuda = any(
                 torch.is_tensor(tensor) and tensor.is_cuda for tensor in recovered_state.values()
             )
+            from zo2.trainer.hf_transformers.log_based_utils import _restore_tied_weights_for_model
+            _restore_tied_weights_for_model(recovered_state, self.model)
             self.model.load_state_dict(recovered_state)
+            if recovery.adam_state is not None:
+                logger.info(
+                    f"[LogBased Resume] Recovery bundle carries Adam state: "
+                    f"t={recovery.adam_state.get('t', 0)} shadow_used={recovery.shadow_used}"
+                )
 
             # Diagnostic: verify recovered model CKSUM matches original
             _cksum_recovered = sum(p.data.float().sum().item() for p in self.model.parameters())
@@ -728,6 +774,7 @@ class Framework:
             import re
             match = re.search(r'checkpoint-(\d+)', last_checkpoint)
             resumed_step = int(match.group(1)) if match else 0
+            log_based_resumed_step = resumed_step
             logger.info(f"[LogBased Resume] Will continue training from step {resumed_step}")
         elif self.args.log_based_ckpt < 0 and os.path.isdir(self.args.output_dir) and not self.args.overwrite_output_dir:
             # HuggingFace auto-resume: only when log-based checkpointing is NOT active.
@@ -745,7 +792,18 @@ class Framework:
         trainer._t_program_start = _PROGRAM_START
         if last_checkpoint is not None:
             trainer._t_full_resume_start = t_full_resume_start
-        trainer.train(resume_from_checkpoint=last_checkpoint)
+        hf_resume_checkpoint = last_checkpoint
+        if self.args.log_based_resume:
+            hf_resume_checkpoint = None
+            trainer.set_log_based_resume_state(
+                global_step=log_based_resumed_step or 0,
+                checkpoint_path=last_checkpoint,
+            )
+            logger.info(
+                f"[InstantRecover] Using log-based continuation only: "
+                f"global_step={log_based_resumed_step or 0}, checkpoint={last_checkpoint}"
+            )
+        trainer.train(resume_from_checkpoint=hf_resume_checkpoint)
 
         # Explicitly save the model
         if self.args.save_model:

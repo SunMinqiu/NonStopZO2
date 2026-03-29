@@ -5,6 +5,9 @@ import os
 import sys
 sys.path.append('./zo2')
 
+import hashlib
+import pickle
+import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,6 +18,18 @@ import logging
 from ...config.mezo_sgd import MeZOSGDConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _step_diag_enabled():
+    return os.environ.get("ZO_STEP_DIAG", "0") == "1"
+
+
+def _step_exact_enabled():
+    return os.environ.get("ZO_STEP_DIAG_EXACT", "0") == "1"
+
+
+def _rng_diag_enabled():
+    return os.environ.get("ZO_RNG_DIAG", "0") == "1" or _step_diag_enabled()
 
 
 class MeZOSGD(BaseOptimizer):
@@ -133,6 +148,87 @@ class MeZOSGD(BaseOptimizer):
 
     def compute_grad(self, loss1, loss2):
         return ((loss1 - loss2) / (2 * self.zo_eps)).item()
+
+    def _log_step_diag(self, loss1, loss2):
+        if not _step_diag_enabled():
+            return
+        loss1_value = float(loss1.detach().float().item()) if torch.is_tensor(loss1) else float(loss1)
+        loss2_value = float(loss2.detach().float().item()) if torch.is_tensor(loss2) else float(loss2)
+        model_sum = 0.0
+        tracked = {}
+        digest = hashlib.sha256()
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            cpu = param.detach().float().cpu().contiguous()
+            model_sum += cpu.sum().item()
+            if name in ("model.embed_tokens.weight", "lm_head.weight"):
+                tracked[name] = cpu.sum().item()
+            if _step_exact_enabled():
+                digest.update(name.encode("utf-8"))
+                digest.update(memoryview(cpu.numpy()).tobytes())
+        parts = [
+            f"class={self.__class__.__name__}",
+            f"seed={getattr(self, 'zo_random_seed', None)}",
+            f"loss1={loss1_value:.10e}",
+            f"loss2={loss2_value:.10e}",
+            f"projected_grad={float(getattr(self, 'projected_grad', 0.0)):.10e}",
+            f"applied_grad={float(getattr(self, '_applied_update_grad', 0.0)):.10e}",
+            f"lr={float(getattr(self, 'lr', 0.0)):.10e}",
+            f"wd={float(getattr(self, 'weight_decay', 0.0)):.10e}",
+            f"zo_eps={float(getattr(self, 'zo_eps', 0.0)):.10e}",
+            f"rng_device={getattr(self, 'rng_device', 'native')}",
+            f"model_sum={model_sum:.10e}",
+        ]
+        if hasattr(self, "t"):
+            parts.append(f"adam_t={int(getattr(self, 't', 0))}")
+        if hasattr(self, "get_adam_state"):
+            adam_state = self.get_adam_state()
+            m_sum = sum(t.float().sum().item() for t in adam_state.get("m", {}).values())
+            v_sum = sum(t.float().sum().item() for t in adam_state.get("v", {}).values())
+            parts.append(f"adam_m_sum={m_sum:.10e}")
+            parts.append(f"adam_v_sum={v_sum:.10e}")
+        if _step_exact_enabled():
+            parts.append(f"model_sha256={digest.hexdigest()}")
+        logger.info("[OPT-DIAG] " + " | ".join(parts))
+        for name, value in tracked.items():
+            logger.info(f"[OPT-DIAG] tracked[{name}]={value:.10e}")
+
+    def _log_rng_diag(self, phase):
+        if not _rng_diag_enabled():
+            return
+
+        parts = [
+            f"phase={phase}",
+            f"seed={getattr(self, 'zo_random_seed', None)}",
+            f"rng_device={getattr(self, 'rng_device', 'native')}",
+        ]
+
+        cpu_state = torch.random.get_rng_state()
+        parts.append(f"cpu_sha256={hashlib.sha256(memoryview(cpu_state.cpu().numpy()).tobytes()).hexdigest()}")
+
+        if torch.cuda.is_available():
+            try:
+                cuda_state = torch.cuda.random.get_rng_state()
+                parts.append(
+                    f"cuda_sha256={hashlib.sha256(memoryview(cuda_state.cpu().numpy()).tobytes()).hexdigest()}"
+                )
+            except Exception as exc:
+                parts.append(f"cuda_error={type(exc).__name__}")
+
+        try:
+            np_state = pickle.dumps(np.random.get_state(), protocol=4)
+            parts.append(f"numpy_sha256={hashlib.sha256(np_state).hexdigest()}")
+        except Exception as exc:
+            parts.append(f"numpy_error={type(exc).__name__}")
+
+        try:
+            py_state = pickle.dumps(random.getstate(), protocol=4)
+            parts.append(f"python_sha256={hashlib.sha256(py_state).hexdigest()}")
+        except Exception as exc:
+            parts.append(f"python_error={type(exc).__name__}")
+
+        logger.info("[RNG-DIAG] " + " | ".join(parts))
         
     @torch.inference_mode
     def zo_forward(self, *args, zo_random_seed: int=None, **kwargs):
@@ -147,9 +243,11 @@ class MeZOSGD(BaseOptimizer):
         self.zo_random_seed = zo_random_seed if zo_random_seed else np.random.randint(self.max_zo_random_seed)
         self._reset_rng(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[0])
+        self._log_rng_diag("before_loss1")
         loss1 = self.inner_zo_forward(*args, **kwargs)
         self._reset_rng(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[1])
+        self._log_rng_diag("before_loss2")
         loss2 = self.inner_zo_forward(*args, **kwargs)
         self.projected_grad = self.compute_grad(loss1, loss2)
         # In base ZO (synchronous), the update uses the grad just computed in the SAME step.
@@ -157,8 +255,10 @@ class MeZOSGD(BaseOptimizer):
         self._applied_update_grad = self.projected_grad
         self._reset_rng(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[2])
+        self._log_rng_diag("before_update")
         self._reset_rng(self.zo_random_seed)
         self.zo_update(self.model)
+        self._log_step_diag(loss1, loss2)
         return loss1
 
     #*********************** evaluate ***********************#

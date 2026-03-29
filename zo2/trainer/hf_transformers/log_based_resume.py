@@ -2,7 +2,9 @@ import logging
 import os
 import re
 import time
+import hashlib
 from collections import OrderedDict
+from dataclasses import dataclass
 
 import psutil
 import torch
@@ -13,16 +15,104 @@ from .log_based_replay import (
     _replay_updates_on_state,
     _set_replay_adam_state,
 )
-from .log_based_shadow import _load_shadow_replica
+from .log_based_shadow import (
+    _build_adam_flat_layout,
+    _build_shadow_flat_layout,
+    _shadow_flat_meta_paths,
+    _load_shadow_bundle_flat,
+    _load_shadow_replica,
+)
 from .log_based_utils import (
     _DTYPE_MAP,
     _detect_tied_weights,
+    _log_adam_checksums,
+    _log_adam_exact_fingerprint,
     _log_memory,
+    _state_exact_fingerprint as _shared_state_exact_fingerprint,
     _restore_tied_weights,
     _tie_state_dict_inplace,
 )
 
 logger = logging.getLogger(__name__)
+LOG_METADATA_NAME = "log_metadata.pt"
+
+
+@dataclass
+class LogBasedRecoveryBundle:
+    state_dict: OrderedDict
+    adam_state: dict | None
+    base_step: int
+    committed_step: int
+    pending_grad: float | None
+    base_pending_seed: int | None
+    shadow_used: bool
+
+
+def _tensor_exact_hash(tensor: torch.Tensor) -> str:
+    cpu = tensor.detach().cpu().contiguous()
+    return hashlib.sha256(memoryview(cpu.numpy()).tobytes()).hexdigest()
+
+
+def _state_exact_fingerprint(state_dict, trainable_param_names=None):
+    # Use the same full-state hashing logic as shadow_durable/train_durable_ref.
+    # Comparing hashes across resume and shadow logs is otherwise meaningless.
+    return _shared_state_exact_fingerprint(state_dict)
+
+
+def _log_state_exact_fingerprint(label, state_dict, trainable_param_names=None):
+    fp, tensor_count = _state_exact_fingerprint(state_dict, trainable_param_names=trainable_param_names)
+    logger.info(f"[DIAG-EXACT] {label}: sha256={fp} tensors={tensor_count}")
+
+
+def _log_state_exact_compare(label, lhs, rhs, trainable_param_names=None):
+    names = list(trainable_param_names) if trainable_param_names is not None else list(lhs.keys())
+    missing_lhs = [name for name in names if name in rhs and name not in lhs]
+    missing_rhs = [name for name in names if name in lhs and name not in rhs]
+    if missing_lhs or missing_rhs:
+        logger.info(
+            f"[DIAG-EXACT] {label}: exact_match=False missing_lhs={len(missing_lhs)} "
+            f"missing_rhs={len(missing_rhs)} first_missing_lhs={missing_lhs[:3]} "
+            f"first_missing_rhs={missing_rhs[:3]}"
+        )
+        return
+
+    diffs = 0
+    first_name = None
+    first_max_abs = None
+    first_lhs_hash = None
+    first_rhs_hash = None
+    for name in names:
+        if name not in lhs or name not in rhs:
+            continue
+        a = lhs[name].detach().cpu()
+        b = rhs[name].detach().cpu()
+        if not torch.equal(a, b):
+            diffs += 1
+            if first_name is None:
+                first_name = name
+                first_max_abs = (a.float() - b.float()).abs().max().item()
+                first_lhs_hash = _tensor_exact_hash(a)
+                first_rhs_hash = _tensor_exact_hash(b)
+    if diffs == 0:
+        logger.info(f"[DIAG-EXACT] {label}: exact_match=True")
+    else:
+        logger.info(
+            f"[DIAG-EXACT] {label}: exact_match=False differing_tensors={diffs} "
+            f"first_diff={first_name} first_max_abs={first_max_abs:.10e} "
+            f"lhs_sha256={first_lhs_hash} rhs_sha256={first_rhs_hash}"
+        )
+
+
+def _state_exact_matches(lhs, rhs, trainable_param_names=None):
+    names = list(trainable_param_names) if trainable_param_names is not None else list(lhs.keys())
+    for name in names:
+        if name not in lhs or name not in rhs:
+            return False
+        a = lhs[name].detach().cpu()
+        b = rhs[name].detach().cpu()
+        if not torch.equal(a, b):
+            return False
+    return True
 
 
 def _state_checksums(state_dict, trainable_param_names=None):
@@ -150,7 +240,32 @@ def _load_base_state(base_checkpoint_ref, pretrained_model_name, tied_groups, mo
     return base_state, tied_groups
 
 
-def resume_from_log_based(
+def _flat_storage_from_header_path(header_path, template_state_dict, tied_groups, trainable_param_names, has_adam):
+    stem = header_path.removesuffix(".header.json")
+    meta_paths = _shadow_flat_meta_paths(header_path)
+    storage = {
+        "enabled": True,
+        # Writer persists the authoritative flat layouts into the shadow header.
+        # Keep these template-built layouts only as legacy fallback.
+        "layout": _build_shadow_flat_layout(template_state_dict, tied_groups=tied_groups),
+        "header_path": header_path,
+        "buffer_paths": (f"{stem}.bin",),
+        "state_meta_path": meta_paths["state_meta_path"],
+        "adam_meta_path": meta_paths["adam_meta_path"],
+        "has_adam": bool(has_adam),
+    }
+    if has_adam:
+        storage["adam_layout"] = _build_adam_flat_layout(template_state_dict, trainable_param_names or [])
+        storage["adam_m_buffer_paths"] = (f"{stem}.adam_m.bin",)
+        storage["adam_v_buffer_paths"] = (f"{stem}.adam_v.bin",)
+    else:
+        storage["adam_layout"] = {"entries": [], "total_bytes": 0}
+        storage["adam_m_buffer_paths"] = ()
+        storage["adam_v_buffer_paths"] = ()
+    return storage
+
+
+def resume_from_log_based_bundle(
     checkpoint_path: str,
     output_dir: str = None,
     pretrained_model_name: str = None,
@@ -162,8 +277,8 @@ def resume_from_log_based(
     rng_device: str = "native",
     zo2_mode: bool = False,
     shadow_path: str = None,
-) -> OrderedDict:
-    """Resume from log-based checkpoints."""
+) -> LogBasedRecoveryBundle:
+    """Resume from log-based checkpoints and return a structured recovery bundle."""
     ckpt_dir = os.path.dirname(checkpoint_path) if os.path.isfile(checkpoint_path) else checkpoint_path
 
     if output_dir is None:
@@ -178,19 +293,94 @@ def resume_from_log_based(
     logger.info(f"[Resume] Replay device: {device}")
 
     optimizer_path = os.path.join(ckpt_dir, "optimizer.pt")
+    metadata_path = os.path.join(ckpt_dir, LOG_METADATA_NAME)
+
+    redo_source = None
 
     if cached_optimizer_state is not None and isinstance(cached_optimizer_state, dict) and 'zo_update_history' in cached_optimizer_state:
         optimizer_state = cached_optimizer_state
-        logger.info("[Resume] Using cached optimizer state (skipped disk I/O)")
+        redo_source = "cached_optimizer_state"
+        logger.info("[Resume] Using cached redo state (source=cached_optimizer_state, skipped disk I/O)")
+    elif os.path.exists(metadata_path):
+        optimizer_state = torch.load(metadata_path, map_location='cpu', weights_only=False)
+        if not isinstance(optimizer_state, dict):
+            raise RuntimeError(f"{LOG_METADATA_NAME} is not a dict checkpoint: {metadata_path}")
+        redo_source = LOG_METADATA_NAME
+        logger.info(f"[Resume] Found lightweight scalar redo metadata (source={LOG_METADATA_NAME})")
     elif os.path.exists(optimizer_path):
         optimizer_state = torch.load(optimizer_path, map_location='cpu', weights_only=False)
         if not isinstance(optimizer_state, dict) or 'zo_update_history' not in optimizer_state:
             logger.info("[Resume] optimizer.pt has no zo_update_history, loading as regular checkpoint")
-            return load_log_based_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
-        logger.info("[Resume] Found log-based checkpoint (optimizer.pt with zo_update_history)")
+            state_dict = load_log_based_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
+            return LogBasedRecoveryBundle(
+                state_dict=state_dict,
+                adam_state=None,
+                base_step=target_step,
+                committed_step=target_step,
+                pending_grad=None,
+                base_pending_seed=None,
+                shadow_used=False,
+            )
+        redo_source = "optimizer.pt"
+        logger.info("[Resume] Found full log checkpoint redo (source=optimizer.pt with zo_update_history)")
     else:
-        logger.info("[Resume] No optimizer.pt found, loading as regular checkpoint")
-        return load_log_based_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
+        optimizer_state = None
+        logger.info("[Resume] No optimizer.pt/log metadata found; continuing with shadow-or-regular recovery")
+
+    if optimizer_state is None:
+        if shadow_path:
+            logger.info("[Resume] No durable redo found, attempting shadow-only recovery")
+            template_state = load_log_based_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
+            tied_groups = []
+            if shadow_path.endswith(".flat.header.json"):
+                shadow_stem = shadow_path[: -len(".header.json")]
+                has_adam_shadow = os.path.exists(f"{shadow_stem}.adam_m.bin") and os.path.exists(
+                    f"{shadow_stem}.adam_v.bin"
+                )
+                flat_storage = _flat_storage_from_header_path(
+                    shadow_path,
+                    template_state,
+                    tied_groups,
+                    None,
+                    has_adam=has_adam_shadow,
+                )
+                reconstructed, shadow_adam_state, shadow_base_step, shadow_step = _load_shadow_bundle_flat(
+                    flat_storage,
+                    tied_groups=tied_groups,
+                )
+                adam_state = shadow_adam_state if has_adam_shadow else None
+            else:
+                reconstructed, shadow_base_step, shadow_step = _load_shadow_replica(
+                    shadow_path,
+                    tied_groups=tied_groups,
+                )
+                adam_state = None
+            _log_state_checksums("shadow_only_recovery", reconstructed)
+            _log_state_exact_fingerprint("shadow_only_recovery", reconstructed)
+            logger.info(
+                f"[Resume] Shadow-only recovery succeeded at step {shadow_step}; "
+                f"redo_source=shadow_only, replay_updates=0"
+            )
+            return LogBasedRecoveryBundle(
+                state_dict=reconstructed,
+                adam_state=adam_state,
+                base_step=int(shadow_base_step if shadow_base_step is not None else target_step),
+                committed_step=int(shadow_step if shadow_step is not None else target_step),
+                pending_grad=None,
+                base_pending_seed=None,
+                shadow_used=True,
+            )
+        logger.info("[Resume] Falling back to regular checkpoint load (no shadow/redo available)")
+        state_dict = load_log_based_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
+        return LogBasedRecoveryBundle(
+            state_dict=state_dict,
+            adam_state=None,
+            base_step=target_step,
+            committed_step=target_step,
+            pending_grad=None,
+            base_pending_seed=None,
+            shadow_used=False,
+        )
 
     batch_size = optimizer_state.get('batch_size', 0)
     base_checkpoint_ref = optimizer_state.get('base_checkpoint', '__initial__')
@@ -232,48 +422,207 @@ def resume_from_log_based(
     zo_method = optimizer_state.get('zo_method', 'mezo-sgd')
     is_adam = (zo_method == 'mezo-adam')
     adam_state = None
+    base_adam_state = None
 
     if is_full_checkpoint:
         logger.info("[Resume] Target is a full checkpoint, loading directly")
         if is_adam:
             _set_replay_adam_state(None)
-        return load_log_based_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
+        state_dict = load_log_based_checkpoint(ckpt_dir, base_checkpoint_dir=pretrained_model_name)
+        return LogBasedRecoveryBundle(
+            state_dict=state_dict,
+            adam_state=None,
+            base_step=target_step,
+            committed_step=target_step,
+            pending_grad=pending_grad,
+            base_pending_seed=base_pending_seed,
+            shadow_used=False,
+        )
 
     if is_adam:
         adam_state = _load_adam_state_from_base(base_checkpoint_ref, optimizer_state)
+        base_adam_state = adam_state
         logger.info(f"[Resume] Adam mode: loaded base adam state (t={adam_state.get('t', 0)}, "
                     f"betas={adam_state.get('betas')}, {len(adam_state.get('m', {}))} m/v entries)")
+        _log_adam_checksums(f"base_adam source={base_checkpoint_ref}", adam_state)
+        _log_adam_exact_fingerprint(f"base_adam source={base_checkpoint_ref}", adam_state)
 
+    base_ref_step = 0
+    if base_checkpoint_ref != "__initial__":
+        base_match = re.search(r'checkpoint-(\d+)', str(base_checkpoint_ref))
+        if base_match:
+            base_ref_step = int(base_match.group(1))
+
+    shadow_used = False
+    shadow_base_step = None
+    shadow_step = None
+    shadow_loaded_state = None
+    model_source = f"base:{base_checkpoint_ref}"
+    model_source_step = int(base_ref_step)
+    adam_source = f"base:{base_checkpoint_ref}" if is_adam else "none"
+    adam_source_step = int(base_adam_state.get("t", 0)) if base_adam_state is not None else None
+    base_template_state = None
     if shadow_path:
-        reconstructed, _shadow_base_step, shadow_step = _load_shadow_replica(
-            shadow_path,
-            tied_groups=tied_groups,
-        )
-        _log_state_checksums(
-            f"shadow_loaded step={shadow_step}",
-            reconstructed,
-            trainable_param_names=trainable_param_names,
-            tied_groups=tied_groups,
-        )
-        updates = [u for u in updates if u['step'] > shadow_step]
-        logger.info(f"[Resume] Soft recovery: shadow at step {shadow_step}, replaying {len(updates)} lag updates")
-    elif base_state_dict is not None and base_checkpoint_ref == "__initial__":
+        if shadow_path.endswith(".flat.header.json"):
+            if base_state_dict is not None and base_checkpoint_ref == "__initial__":
+                template_state = base_state_dict
+            else:
+                template_state, tied_groups = _load_base_state(
+                    base_checkpoint_ref, pretrained_model_name, tied_groups, model_dtype, output_dir=output_dir
+                )
+            base_template_state = template_state
+            flat_storage = _flat_storage_from_header_path(
+                shadow_path,
+                template_state,
+                tied_groups,
+                trainable_param_names,
+                has_adam=is_adam,
+            )
+            try:
+                reconstructed, shadow_adam_state, shadow_base_step, shadow_step = _load_shadow_bundle_flat(
+                    flat_storage,
+                    tied_groups=tied_groups,
+                )
+            except RuntimeError as e:
+                err = str(e)
+                if "missing state metadata" in err or "missing adam metadata" in err:
+                    logger.warning(
+                        f"[Resume] Ignoring legacy shadow flat snapshot at {shadow_path}; "
+                        "falling back to base checkpoint + replay. "
+                        f"Reason: {err}"
+                    )
+                    shadow_path = None
+                    shadow_adam_state = None
+                    shadow_base_step = None
+                    shadow_step = None
+                    reconstructed = None
+                else:
+                    raise
+            if shadow_path is not None:
+                model_source = f"shadow:{shadow_path}"
+                model_source_step = int(shadow_step) if shadow_step is not None else None
+                if is_adam and shadow_adam_state is not None:
+                    adam_state = shadow_adam_state
+                    adam_source = f"shadow:{shadow_path}"
+                    adam_source_step = int(shadow_adam_state.get("t", 0))
+                    _log_adam_checksums(f"shadow_loaded step={shadow_step}", shadow_adam_state)
+                    _log_adam_exact_fingerprint(f"shadow_loaded step={shadow_step}", shadow_adam_state)
+        else:
+            reconstructed, shadow_base_step, shadow_step = _load_shadow_replica(
+                shadow_path,
+                tied_groups=tied_groups,
+            )
+            model_source = f"shadow:{shadow_path}"
+            model_source_step = int(shadow_step) if shadow_step is not None else None
+        if shadow_path and reconstructed is not None:
+            _log_state_checksums(
+                f"shadow_loaded step={shadow_step}",
+                reconstructed,
+                trainable_param_names=trainable_param_names,
+                tied_groups=tied_groups,
+            )
+            _log_state_exact_fingerprint(
+                f"shadow_loaded step={shadow_step}",
+                reconstructed,
+                trainable_param_names=trainable_param_names,
+            )
+            shadow_loaded_state = reconstructed
+            shadow_reject_reason = None
+            shadow_matches_base = None
+            if base_template_state is not None:
+                shadow_matches_base = _state_exact_matches(
+                    reconstructed,
+                    base_template_state,
+                    trainable_param_names=trainable_param_names,
+                )
+                logger.info(
+                    "[Resume] Shadow-vs-base comparison: "
+                    f"shadow_step={shadow_step}, base_step={base_ref_step}, "
+                    f"exact_match={bool(shadow_matches_base)}"
+                )
+
+            if base_ref_step > 0 and (shadow_step is None or int(shadow_step) < base_ref_step):
+                details = [
+                    f"shadow_step={shadow_step}",
+                    f"base_step={base_ref_step}",
+                    f"log_retains_only_steps_gt={base_ref_step}",
+                ]
+                if shadow_matches_base is not None:
+                    details.append(f"shadow_state_matches_base={shadow_matches_base}")
+                shadow_reject_reason = (
+                    "shadow snapshot is behind the current base checkpoint; "
+                    "this indicates an incomplete rebase or a mixed-generation shadow bundle. "
+                    + ", ".join(details)
+                )
+            elif (
+                base_ref_step > 0
+                and shadow_step is not None
+                and int(shadow_step) > base_ref_step
+                and bool(shadow_matches_base)
+            ):
+                shadow_reject_reason = (
+                    "shadow snapshot header/content mismatch: "
+                    f"shadow_step={shadow_step}, base_step={base_ref_step}, "
+                    "but shadow model content exactly matches the base checkpoint. "
+                    "This indicates a mixed-generation shadow bundle, so soft recovery is unsafe."
+                )
+            if shadow_reject_reason is not None:
+                logger.error(f"[Resume] Shadow snapshot rejected: {shadow_reject_reason}")
+                raise RuntimeError(
+                    "Mixed-generation shadow snapshot detected during soft recovery. "
+                    "Refusing to continue with a potentially misaligned model/adam/log state. "
+                    f"Details: {shadow_reject_reason}"
+                )
+            else:
+                updates = [u for u in updates if u['step'] > shadow_step]
+                logger.info(f"[Resume] Soft recovery: shadow at step {shadow_step}, replaying {len(updates)} lag updates")
+                shadow_used = True
+    if reconstructed is None and base_state_dict is not None and base_checkpoint_ref == "__initial__":
         logger.info("[Resume] Using pre-loaded base state dict in-place (no clone)")
         reconstructed = base_state_dict
-    else:
+        model_source = "base:__initial__"
+        model_source_step = 0
+    elif reconstructed is None:
         base_state, tied_groups = _load_base_state(
             base_checkpoint_ref, pretrained_model_name, tied_groups, model_dtype, output_dir=output_dir
         )
         reconstructed = base_state
+        model_source = f"base:{base_checkpoint_ref}"
+        model_source_step = int(base_ref_step)
 
+    base_ready_state = base_template_state if base_template_state is not None else reconstructed
     _log_state_checksums(
         f"base_ready source={base_checkpoint_ref}",
-        reconstructed,
+        base_ready_state,
         trainable_param_names=trainable_param_names,
         tied_groups=tied_groups,
     )
+    _log_state_exact_fingerprint(
+        f"base_ready source={base_checkpoint_ref}",
+        base_ready_state,
+        trainable_param_names=trainable_param_names,
+    )
+    if shadow_used and shadow_loaded_state is not None:
+        _log_state_exact_compare(
+            f"shadow_vs_base_before_replay shadow_step={shadow_step} base={base_checkpoint_ref}",
+            shadow_loaded_state,
+            base_ready_state,
+            trainable_param_names=trainable_param_names,
+        )
 
-    logger.info(f"[Resume] Replaying {len(updates)} updates (default_zo_eps={default_zo_eps})")
+    logger.info(
+        f"[Resume] Replaying {len(updates)} updates "
+        f"(redo_source={redo_source}, default_zo_eps={default_zo_eps})"
+    )
+    log_start_step = int(updates[0]["step"]) if updates else None
+    log_end_step = int(updates[-1]["step"]) if updates else None
+    logger.info(
+        "[Resume Sources] "
+        f"model_source={model_source} model_step={model_source_step} | "
+        f"adam_source={adam_source} adam_step={adam_source_step} | "
+        f"log_source={redo_source} log_start_step={log_start_step} log_end_step={log_end_step} "
+        f"log_updates={len(updates)} target_step={target_step}"
+    )
     if pending_grad is not None:
         logger.info(f"[Resume] pending_grad={pending_grad} (will be restored to opt.projected_grad)")
 
@@ -290,6 +639,11 @@ def resume_from_log_based(
             reconstructed,
             trainable_param_names=trainable_param_names,
             tied_groups=tied_groups,
+        )
+        _log_state_exact_fingerprint(
+            "after_tie_before_replay",
+            reconstructed,
+            trainable_param_names=trainable_param_names,
         )
 
     _mem_proc = psutil.Process(os.getpid())
@@ -318,8 +672,15 @@ def resume_from_log_based(
         trainable_param_names=trainable_param_names,
         tied_groups=tied_groups,
     )
+    _log_state_exact_fingerprint(
+        "after_replay",
+        reconstructed,
+        trainable_param_names=trainable_param_names,
+    )
 
     if is_adam and adam_state is not None:
+        _log_adam_checksums("after_replay", adam_state)
+        _log_adam_exact_fingerprint("after_replay", adam_state)
         _set_replay_adam_state(adam_state)
         logger.info(f"[Resume] Cached replayed Adam state: t={adam_state.get('t', 0)}")
 
@@ -333,4 +694,49 @@ def resume_from_log_based(
         logger.info(f"[VERIFY-RESUME] pending_grad={pending_grad} => first resumed step should apply this grad")
 
     logger.info(f"[Resume] Completed! Recovered to step {target_step}")
-    return reconstructed
+    recovered_base_step = 0
+    if shadow_used and shadow_base_step is not None:
+        recovered_base_step = int(shadow_base_step)
+    elif base_checkpoint_ref != "__initial__":
+        base_match = re.search(r'checkpoint-(\d+)', str(base_checkpoint_ref))
+        if base_match:
+            recovered_base_step = int(base_match.group(1))
+    return LogBasedRecoveryBundle(
+        state_dict=reconstructed,
+        adam_state=adam_state,
+        base_step=recovered_base_step,
+        committed_step=int(shadow_step if shadow_used and shadow_step is not None else target_step),
+        pending_grad=pending_grad,
+        base_pending_seed=base_pending_seed,
+        shadow_used=shadow_used,
+    )
+
+
+def resume_from_log_based(
+    checkpoint_path: str,
+    output_dir: str = None,
+    pretrained_model_name: str = None,
+    device: str = 'cpu',
+    simulate_perturbation: bool = True,
+    replay_in_fp32: bool = False,
+    base_state_dict: OrderedDict = None,
+    cached_optimizer_state: dict = None,
+    rng_device: str = "native",
+    zo2_mode: bool = False,
+    shadow_path: str = None,
+) -> OrderedDict:
+    """Backward-compatible wrapper that returns only the recovered model state dict."""
+    bundle = resume_from_log_based_bundle(
+        checkpoint_path=checkpoint_path,
+        output_dir=output_dir,
+        pretrained_model_name=pretrained_model_name,
+        device=device,
+        simulate_perturbation=simulate_perturbation,
+        replay_in_fp32=replay_in_fp32,
+        base_state_dict=base_state_dict,
+        cached_optimizer_state=cached_optimizer_state,
+        rng_device=rng_device,
+        zo2_mode=zo2_mode,
+        shadow_path=shadow_path,
+    )
+    return bundle.state_dict

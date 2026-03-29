@@ -5,17 +5,31 @@
 
 ## 0. 当前实现说明
 
-当前 `shadow` / `async anchor latest` 已经不再使用 PyTorch shared memory、`torch_shm_manager`、`resource_tracker`、manifest、step file。
+当前实现已经切到 `flat single-buffer shadow + async anchor disk checkpoint`：
 
-现在的语义是：
+- shadow 子进程维护一份普通 CPU working copy
+- committed shadow 写到 `/dev/shm/zo_ckpt/zo_shadow_latest_<hash>.flat*`
+- async anchor / full checkpoint 仍然写磁盘 `checkpoint-N/model.safetensors`
+- shadow flat snapshot 现在由三部分 metadata 约束：
+  - `*.flat.header.json`
+  - `*.flat.state.meta.json`
+  - `*.flat.adam.meta.json`（Adam 模式）
+- writer 会把实际使用的 `layout / adam_layout` 持久化进 header；loader 优先按 header 内 layout 读，不再现场重建
+- `state.meta / adam.meta` 现在还会记录内容哈希：
+  - `state_sha256`
+  - `adam_m_sha256`
+  - `adam_v_sha256`
+- soft recovery / resume 读 shadow flat 时，会同时校验：
+  - `generation / committed_step / adam_t`
+  - 以及上述内容哈希
 
-- shadow 子进程只维护一份普通 CPU working copy
-- committed shadow 通过 `safetensors` 原子写到 `/dev/shm/zo_shadow_latest_<hash>.safetensors`
-- async anchor latest 通过 `safetensors` 原子写到 `/dev/shm/zo_anchor_latest_<hash>.safetensors`
-- `base_step` / `committed_step` 写在 safetensors metadata 里
-- soft recovery / resume 直接读这些 safetensors 文件，不再读 shm handle manifest
+也就是说，当前 shadow 协议的目标不是“总能拿到最新一步”，而是：
 
-下面仍然提到 manifest / shm / resource_tracker 的段落是旧设计，待继续清理；以代码实现为准。
+- 只发布 `durable_step`
+- `durable_step` 对应的 `model / adam / metadata` 必须自洽
+- 一旦 metadata 和内容不一致，恢复直接失败，不再 silent corruption
+
+下面仍然提到 manifest / shm / safetensors-only shadow 的段落是旧设计，待继续清理；以代码实现为准。
 
 ## 1. 文件边界
 
@@ -28,7 +42,7 @@
 | `zo2/trainer/hf_transformers/log_based_shadow.py` | shadow 子进程入口、串行/pipelined shadow、shadow safetensors 读写 | `_shadow_process_main` / `_shadow_process_serial` / `_shadow_process_pipelined` / `_commit_shadow_state` / `_load_shadow_replica` |
 | `zo2/trainer/hf_transformers/log_based_failure_injection.py` | GPU 故障注入、`SIGKILL` 顺序控制 | `GPUFailureSimulator.set_fail_step` / `check_and_fail` / `trigger_failure` |
 | `zo2/trainer/hf_transformers/log_based_utils.py` | tied weights、fsync、内存统计、线程快照 | `_detect_tied_weights` / `_tie_state_dict_inplace` / `_restore_tied_weights` / `_fsync_file` / `_fsync_directory` / `_log_memory` / `_thread_snapshot` |
-| `zo2/trainer/hf_transformers/async_anchor_checkpoint.py` | async anchor 的 GPU→CPU→`/dev/shm latest`→disk 两阶段异步落盘 | `AsyncAnchorCheckpointer.try_save_full_checkpoint` / `_persist_worker` / `get_latest_published_anchor_step` / `get_latest_completed_anchor_step` / `shutdown` |
+| `zo2/trainer/hf_transformers/async_anchor_checkpoint.py` | async anchor 的 GPU→CPU→`/dev/shm/zo_ckpt latest`→disk 两阶段异步落盘 | `AsyncAnchorCheckpointer.try_save_full_checkpoint` / `_persist_worker` / `get_latest_published_anchor_step` / `get_latest_completed_anchor_step` / `shutdown` |
 | `zo2/trainer/hf_transformers/log_based_tuning.py` | shadow / replay 的 benchmark 和线程分配标定 | `calibrate_producer_consumer` / `optimize_thread_allocation` |
 | `zo2/trainer/hf_transformers/trainer.py` | HF Trainer 接线、保存 `optimizer.pt` 元数据、恢复优化器状态 | `ZOTrainer._load_from_checkpoint` / `_save_checkpoint` / `_load_optimizer_and_scheduler` |
 
@@ -430,7 +444,7 @@ ASYNC_ANCHOR=1        -> full checkpoint 改成 async anchor 语义
 2. 放入 shared memory，形成 `shadow_shared`
 3. 重新 tie tied weights
 4. 从 `resource_tracker` 注销这些 shm 文件
-5. 生成 manifest，写到 `/dev/shm/zo_shadow_manifest_<hash>.json`
+5. 生成 manifest，写到 `/dev/shm/zo_ckpt/zo_shadow_manifest_<hash>.json`
 6. 设置 `shadow_step = len(update_history)`
 
 ### 12.3 启动 shadow 子进程
@@ -717,7 +731,98 @@ shadow 收到后会：
 6. 清理：
    - manifest 文件
    - step 文件
-   - `/dev/shm` 中对应的 shm data file
+   - `/dev/shm/zo_ckpt` 中对应的 shm data file
+
+### 18.3 2026-03-29 排障增量
+
+这一轮排障的目标只有一个：
+
+- 明确区分“在线 replay / shadow 计算差异”和“真正的恢复错版”
+- 把 `model / adam / metadata / log` 的恢复来源和内容一致性钉死
+
+当前代码中已经落地的增量如下。
+
+#### A. shadow writer / loader 协议
+
+- shadow flat snapshot 从“只看 header/meta 步数”升级为“步数 + 内容哈希”：
+  - `state.meta` 记录 `state_sha256`
+  - `adam.meta` 记录 `adam_m_sha256 / adam_v_sha256`
+- `_load_shadow_bundle_flat()` 读完内容后会重算 hash 并验证；不一致直接报错
+- writer 会把 `layout / adam_layout` 持久化到 `header`；resume/load 优先使用 header 里的 layout，而不是根据 base template 现场重建 layout
+
+这一点是为了解决之前可能出现的两类问题：
+
+- metadata 说自己是 `step=K`，但内容其实不是 `K`
+- writer 和 loader 如果用不同 layout 解释同一份 `.bin`，会把字节切错
+
+#### B. shadow 步数语义
+
+shadow 进程现在明确区分三种步数：
+
+- `applied_step`
+  - CPU `working_state / adam_state` 已经 apply 到哪一步
+- `desired_commit_step`
+  - 当前希望落盘到哪一步
+- `durable_step`
+  - 真正已经写完并可恢复的是哪一步
+
+训练 / 健康日志中的：
+
+- `applied=...`
+- `desired=...`
+- `durable=...`
+
+对应的就是这三种语义。resume 只信 `durable_step`。
+
+#### C. commit / rebase 调度
+
+- pipeline shadow 在写盘前会先停 producer，清掉过期预取，再对静止的 `working_state` 做 commit
+- rebase 后不再把“内存里大概到哪”直接当成可恢复步数；只有 commit 成功后才发布新的 `durable_step`
+
+#### D. resume 来源日志
+
+resume 现在固定打印：
+
+- `[Resume] Shadow-vs-base comparison: shadow_step=..., base_step=..., exact_match=...`
+- `[Resume Sources] model_source=... model_step=... | adam_source=... adam_step=... | log_source=... log_start_step=... log_end_step=...`
+
+这两条日志用于回答两个问题：
+
+- 这次 soft recovery 选的是 `base` 还是 `shadow`
+- replay 的起点到底是从哪一步开始
+
+#### E. durable 边界对账
+
+训练 / shadow 两侧都加了 durable 边界日志：
+
+- `train_durable_ref step=N`
+- `shadow_durable step=N`
+- `shadow_loaded step=N`
+
+用途分别是：
+
+- `train_durable_ref`
+  - live train 在 commit 边界的参考值
+- `shadow_durable`
+  - shadow 刚发布 `durable_step` 时，内存中的 snapshot
+- `shadow_loaded`
+  - resume 时从 flat storage 读出来的 snapshot
+
+这一轮已经确认：
+
+- `shadow_durable step=64`
+- `shadow_loaded step=64`
+
+在统一 hash helper 后，`STATE-EXACT / ADAM-EXACT` 可以直接比。
+
+#### F. 本轮定位结论
+
+结合 `/home/users/u0001609/ZO_log/29.log`，当前能确认的结论是：
+
+- “shadow_durable 写的是 A，shadow_loaded 读出来是 B” 这条恢复错版，在当前协议下**没有新证据**
+- 之前一部分“读出来不一样”的判断，来自两套不同的 `STATE-EXACT` helper；这一点已经统一
+- layout mismatch 也是实打实的风险点，现已通过“writer 持久化 layout，loader 按 header layout 读取”修掉
+- 如果后面再出现 `model / adam / metadata / log` 错版，优先会在 `_load_shadow_bundle_flat()` 的内容校验里直接报错，而不是静默继续恢复
 
 ## 19. 参数速查
 
@@ -735,6 +840,8 @@ shadow 收到后会：
 | `LOG_BASED_REPLAY_FP32` | `0` | CPU replay 时临时 upcast 到 fp32 |
 | `SHADOW_PIPELINE` | `0` | 是否启用 pipelined shadow |
 | `SHADOW_PIPELINE_WORKERS` | `2` | shadow pipeline producer 数 |
+| `SHADOW_COMMIT_INTERVAL` | `1` | shadow durable commit 的步数间隔 |
+| `SHADOW_FLAT_COMMIT` | `0` | 是否使用 `/dev/shm/zo_ckpt/*.flat*` 单 buffer shadow |
 | `SHADOW_RESERVE_THREADS` | `1` | shadow 为训练预留的核数 |
 | `SHADOW_CONSUMER_THREADS` | `auto` | shadow consumer 的 ATen 线程数 |
 | `ASYNC_ANCHOR` | `0` | 启用 async anchor |
@@ -753,6 +860,34 @@ shadow 收到后会：
 | `CLOSEDFORM_RECOVERY` | `0` | legacy closed-form replay 开关 |
 | `CLOSEDFORM_WORKERS` | `1` | legacy closed-form worker 数 |
 | `CLOSEDFORM_PRECISION` | `mixed` | legacy closed-form 精度模式 |
+
+### debug / 诊断
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `ZO_STEP_DIAG` | `0` | 打开按步 checksum / brief 诊断 |
+| `ZO_STEP_DIAG_EXACT` | `0` | 打开按步 exact hash 诊断 |
+| `ZO_RNG_DIAG` | `0` | 打印 `before_loss1 / before_loss2 / before_update` RNG 状态 |
+| `ZO_Z_DIAG` | `1` | 在 `ZO_STEP_DIAG` 或 `ZO_STEP_DIAG_EXACT` 打开时，额外打印 z checksum / hash |
+| `ZO_BATCH_DEBUG` | unset | 打印 batch 内容摘要 |
+| `ZO_BATCH_DEBUG_STEP_START` | unset | 只从某个 step 开始打印 batch |
+| `ZO_BATCH_DEBUG_STEP_END` | unset | 只打印到某个 step 为止 |
+| `ZO_BATCH_DEBUG_RESUME_STEPS` | unset | resume 后额外打印若干步 batch |
+| `ZO_BATCH_DEBUG_EVERY` | unset | 每隔多少步打印一次 batch |
+
+### 关键日志标签
+
+| 日志标签 | 含义 |
+|----------|------|
+| `[Resume Sources]` | 这次恢复实际用的是哪份 `model / adam / log` |
+| `[Resume] Shadow-vs-base comparison` | `shadow_step` 对应内容是否等于当前 base checkpoint |
+| `[STATE-EXACT] train_durable_ref step=N` | live train 在 durable 边界的完整 state hash |
+| `[STATE-EXACT] shadow_durable step=N` | shadow 刚发布 durable snapshot 时的完整 state hash |
+| `[DIAG-EXACT] shadow_loaded step=N` | resume 从 shadow flat 读出来后的完整 state hash |
+| `[ADAM-EXACT] ...` | 对应时刻的完整 `m/v/t` hash |
+| `[Shadow] ... applied=... desired=... durable=...` | shadow 内存进度、目标 commit 步数、实际 durable 步数 |
+| `[Replay] Replaying ...` | replay 的设备、扰动模式、rng 设备 |
+| `[VERIFY-RESUME]` | 最后一条 replayed update 和 `pending_grad` 的恢复提示 |
 
 ## 20. 最短调用图
 

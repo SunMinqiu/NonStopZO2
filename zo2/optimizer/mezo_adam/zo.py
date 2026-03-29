@@ -6,6 +6,7 @@ import torch.nn as nn
 import logging
 
 from ..mezo_sgd.zo import MeZOSGD
+from .shared import apply_mezo_adam_update
 from ...config.mezo_adam import MeZOAdamConfig
 
 logger = logging.getLogger(__name__)
@@ -47,37 +48,22 @@ class MeZOAdam(MeZOSGD):
         In MeZO, g = projected_grad * z is tiny, so g^2 underflows to 0 in fp16,
         collapsing the denominator to eps and causing explosive updates.
         """
-        beta1, beta2 = self.betas
-        bias_correction1 = 1 - beta1 ** self.t
-        bias_correction2 = 1 - beta2 ** self.t
-        step_size = self.lr / bias_correction1
-
-        for name, param in module.named_parameters():
-            if param.requires_grad:
-                z = self._generate_z(param)
-                g = (self.projected_grad * z).float()  # fp32 to prevent underflow
-
-                pid = id(param)
-                # Lazy init in fp32 (like PyTorch Adam) for numerical stability
-                if pid not in self.m:
-                    self.m[pid] = torch.zeros_like(param.data, dtype=torch.float32)
-                    self.v[pid] = torch.zeros_like(param.data, dtype=torch.float32)
-
-                # Update biased first and second moment estimates (in-place)
-                self.m[pid].mul_(beta1).add_(g, alpha=1 - beta1)
-                self.v[pid].mul_(beta2).addcmul_(g, g, value=1 - beta2)
-
-                # Adam step: denom = sqrt(v_hat) + eps, update = step_size * m / denom
-                denom = (self.v[pid] / bias_correction2).sqrt_().add_(self.adam_eps)
-                update = self.m[pid].div(denom).mul_(step_size)
-
-                # Decoupled weight decay (AdamW), skip bias/layernorm
-                if weight_decay is not None:
-                    update.add_(param.data, alpha=self.lr * weight_decay)
-                else:
-                    if all(x not in name for x in ["bias", "layer_norm", "layernorm", "ln"]):
-                        update.add_(param.data, alpha=self.lr * self.weight_decay)
-                param.data.sub_(update.to(param.data.dtype))
+        apply_mezo_adam_update(
+            ((name, param) for name, param in module.named_parameters() if param.requires_grad),
+            get_z=lambda _name, param_tensor: self._generate_z(param_tensor),
+            grad=self.projected_grad,
+            lr=self.lr,
+            weight_decay=weight_decay,
+            default_weight_decay=self.weight_decay,
+            betas=self.betas,
+            adam_eps=self.adam_eps,
+            t=self.t,
+            m_state=self.m,
+            v_state=self.v,
+            state_key=lambda _name, param: id(param),
+            diag_label=f"train_live step={self.t}",
+            diag_logger=logger,
+        )
 
     # ---- Adam state serialization for checkpoint / replay ----
 

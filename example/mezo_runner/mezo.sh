@@ -40,7 +40,7 @@ LOG_BASED_CKPT=${LOG_BASED_CKPT:--1}
 ENABLE_SHADOW=${ENABLE_SHADOW:-0}
 INSTANT_RECOVER=${INSTANT_RECOVER:-0}
 GPU_FAIL_STEP=${GPU_FAIL_STEP:--1}
-# Failure type: "soft" (/dev/shm shadow replica survives) or "hard" (DRAM lost, disk recovery)
+# Failure type: "soft" (tmpfs shadow replica survives) or "hard" (DRAM lost, disk recovery)
 FAILURE_TYPE=${FAILURE_TYPE:-soft}
 # Shadow Pipeline: CPU 端 pipelined z 预生成 + ring buffer, 需要 ENABLE_SHADOW=1
 # P 个 producer 线程并行生成 z (释放GIL)，1 个 consumer 串行更新 shadow
@@ -53,6 +53,7 @@ OUTPUT_LOG=${OUTPUT_LOG:-""}
 LOG_BASED_RESUME=${LOG_BASED_RESUME:-""}
 LOG_BASED_REPLAY_DEVICE=${LOG_BASED_REPLAY_DEVICE:-cuda}
 LOG_BASED_SIMULATE_PERTURBATION=${LOG_BASED_SIMULATE_PERTURBATION:-1}
+SHM_ROOT=${ZO_SHM_DIR:-/dev/shm/zo_ckpt}
 # 确定性随机数: DETERMINISTIC=1 启用 torch.use_deterministic_algorithms (跨进程/跨GPU可复现)
 DETERMINISTIC=${DETERMINISTIC:-0}
 # ZO RNG 设备: "native" (用参数所在设备, 快), "cpu" (跨GPU可移植, 慢两百来倍！),
@@ -141,16 +142,38 @@ if [ "$ZO_METHOD" == "mezo-adam" ]; then
 fi
 TAG=mezo-$MODE-$LR-$EPS-$SEED
 
-# Output directory (used for retry loop and /dev/shm shadow/anchor filenames)
+# Output directory (used for retry loop and tmpfs shadow/anchor filenames)
 OUTPUT_DIR="${OUTPUT_ROOT:-/lvs0/rccs-hpbdrt/minqiu/ZO_ckpt_New}/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG"
 RUN_HASH=$(echo -n "$OUTPUT_DIR" | md5sum | head -c 8)
+mkdir -p "$SHM_ROOT"
 
 # Wandb resume support (same run across retries)
 [ -z "$WANDB_RUN_ID" ] && WANDB_RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")
 export WANDB_RUN_ID WANDB_RESUME=allow
 
-# Clean old shm files and output directory from previous runs
-rm -f "/dev/shm/zo_shadow_latest_${RUN_HASH}.safetensors" "/dev/shm/zo_anchor_latest_${RUN_HASH}.safetensors"
+# Clean old tmpfs files and output directory from previous runs
+rm -f \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.safetensors" \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.safetensors" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.header.json" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.0.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.1.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_m.0.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_m.1.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_m.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_v.0.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_v.1.bin" \
+    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_v.bin"
+rm -f \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.header.json" \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.0.bin" \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.1.bin" \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_m.0.bin" \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_m.1.bin" \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_v.0.bin" \
+    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_v.1.bin"
+rm -rf "$SHM_ROOT/zo_rebase_payload_${RUN_HASH}"
 if [ -d "$OUTPUT_DIR" ]; then
     echo "Cleaning old output directory: $OUTPUT_DIR"
     rm -rf "$OUTPUT_DIR"
@@ -234,6 +257,38 @@ _run_training() {
         "$@"
 }
 
+_remaining_fail_steps_after_first() {
+    local spec="$1"
+    if [ -z "$spec" ] || [ "$spec" = "-1" ]; then
+        echo "-1"
+        return
+    fi
+
+    local IFS=','
+    read -r -a parts <<< "$spec"
+    local remaining=()
+    local idx=0
+    for part in "${parts[@]}"; do
+        part="${part//[[:space:]]/}"
+        [ -z "$part" ] && continue
+        if [ $idx -eq 0 ]; then
+            idx=$((idx + 1))
+            continue
+        fi
+        remaining+=("$part")
+        idx=$((idx + 1))
+    done
+
+    if [ ${#remaining[@]} -eq 0 ]; then
+        echo "-1"
+    else
+        local joined
+        local IFS=','
+        joined="${remaining[*]}"
+        echo "$joined"
+    fi
+}
+
 # First run
 _run_training "$@"; EXIT_CODE=$?
 
@@ -244,19 +299,32 @@ while [ $EXIT_CODE -eq 137 ] && [ "$INSTANT_RECOVER" == "1" ]; do
     [ -z "$LATEST" ] && { echo "No checkpoint found in $OUTPUT_DIR"; exit 137; }
     echo "Latest checkpoint: $LATEST"
 
-    # Disable failure injection for retry (override both arg AND env var)
-    export GPU_FAIL_STEP=-1
-    # Build retry args: remove overwrite_output_dir and gpu_fail_step from original
-    RETRY_ARGS=$(echo "$ORIG_EXTRA_ARGS" | sed 's/--overwrite_output_dir//g; s/--gpu_fail_step [0-9-]*//g')
-    RETRY_ARGS="$RETRY_ARGS --gpu_fail_step -1 --log_based_resume $LATEST --log_based_replay_device cuda"
+    NEXT_GPU_FAIL_STEP=$(_remaining_fail_steps_after_first "$GPU_FAIL_STEP")
+    export GPU_FAIL_STEP="$NEXT_GPU_FAIL_STEP"
+    echo "Remaining GPU_FAIL_STEP schedule: $GPU_FAIL_STEP"
 
-    SHADOW_REPLICA="/dev/shm/zo_shadow_latest_${RUN_HASH}.safetensors"
-    ANCHOR_LATEST="/dev/shm/zo_anchor_latest_${RUN_HASH}.safetensors"
+    # Build retry args: remove overwrite_output_dir and gpu_fail_step from original
+    RETRY_ARGS=$(echo "$ORIG_EXTRA_ARGS" | sed 's/--overwrite_output_dir//g; s/--gpu_fail_step [^ ]*//g')
+    RETRY_ARGS="$RETRY_ARGS --gpu_fail_step $GPU_FAIL_STEP --log_based_resume $LATEST --log_based_replay_device cuda"
+
+    SHADOW_REPLICA="$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.safetensors"
+    SHADOW_FLAT_HEADER="$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.header.json"
+    SHADOW_FLAT_BUF="$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.bin"
+    SHADOW_FLAT_ADAM_M="$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_m.bin"
+    SHADOW_FLAT_ADAM_V="$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_v.bin"
+    ANCHOR_LATEST="$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.safetensors"
+    REBASE_PAYLOAD_DIR="$SHM_ROOT/zo_rebase_payload_${RUN_HASH}"
     if [ "$FAILURE_TYPE" == "hard" ]; then
-        # Simulate DRAM loss: delete shadow/anchor latest replicas in /dev/shm
-        rm -f "$SHADOW_REPLICA" "$ANCHOR_LATEST"
+        # Simulate DRAM loss: delete shadow/anchor latest replicas in tmpfs
+        rm -f \
+            "$SHADOW_REPLICA" "$SHADOW_FLAT_HEADER" "$SHADOW_FLAT_BUF" \
+            "$SHADOW_FLAT_ADAM_M" "$SHADOW_FLAT_ADAM_V" \
+            "$ANCHOR_LATEST"
+        rm -rf "$REBASE_PAYLOAD_DIR"
+    elif [ "$SHADOW_FLAT_COMMIT" == "1" ] && [ -f "$SHADOW_FLAT_HEADER" ]; then
+        RETRY_ARGS="$RETRY_ARGS --shadow_resume $SHADOW_FLAT_HEADER"
     elif [ -f "$SHADOW_REPLICA" ]; then
-        # Soft failure: shadow replica survives in /dev/shm
+        # Soft failure: shadow replica survives in tmpfs
         RETRY_ARGS="$RETRY_ARGS --shadow_resume $SHADOW_REPLICA"
     fi
 

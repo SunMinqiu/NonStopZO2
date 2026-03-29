@@ -6,7 +6,16 @@ from collections import OrderedDict
 import psutil
 import torch
 
-from .log_based_utils import _log_memory
+from ...optimizer.mezo_adam.shared import apply_mezo_adam_update
+from .log_based_utils import (
+    _log_adam_checksums,
+    _log_adam_exact_fingerprint,
+    _log_memory,
+    _log_state_checksums,
+    _log_state_exact_fingerprint,
+    _step_diag_enabled,
+    _step_exact_enabled,
+)
 from .legacy_pipeline_closed_form_replay import (
     _closedform_replay_on_state,
     _parallel_replay_updates_on_state,
@@ -93,33 +102,23 @@ def _apply_single_update_with_pregenerated_z(state, update, param_names, z_dict,
                 _alpha = float(scaling_factor * zo_eps)
                 for name in param_names:
                     state[name].data.add_(z_dict[name], alpha=_alpha)
-
-        beta1, beta2 = adam_state['betas']
-        a_eps = adam_state['adam_eps']
         adam_state['t'] += 1
-        t = adam_state['t']
-        bc1, bc2 = 1 - beta1 ** t, 1 - beta2 ** t
-        step_size = lr / bc1
-
-        for name in param_names:
-            param = state[name]
-            z = z_dict[name]
-            g = (grad * z).float()
-
-            m, v = adam_state['m'], adam_state['v']
-            if name not in m:
-                m[name] = torch.zeros_like(param, dtype=torch.float32)
-                v[name] = torch.zeros_like(param, dtype=torch.float32)
-
-            m[name].mul_(beta1).add_(g, alpha=1 - beta1)
-            v[name].mul_(beta2).addcmul_(g, g, value=1 - beta2)
-
-            denom = (v[name] / bc2).sqrt_().add_(a_eps)
-            upd = m[name].div(denom).mul_(step_size)
-
-            if all(x not in name for x in ['bias', 'layer_norm', 'layernorm', 'ln']):
-                upd.add_(param.float(), alpha=lr * wd)
-            param.sub_(upd.to(param.dtype))
+        apply_mezo_adam_update(
+            ((name, state[name]) for name in param_names),
+            get_z=lambda name, _param_tensor: z_dict[name],
+            grad=grad,
+            lr=lr,
+            weight_decay=None,
+            default_weight_decay=wd,
+            betas=adam_state['betas'],
+            adam_eps=adam_state['adam_eps'],
+            t=adam_state['t'],
+            m_state=adam_state['m'],
+            v_state=adam_state['v'],
+            state_key=lambda name, _param: name,
+            diag_label=f"adam_apply step={update.get('step', '?')}",
+            diag_logger=_diag_logger,
+        )
         return
 
     if zo2_mode and grad != 0:
@@ -180,6 +179,13 @@ def _load_adam_state_from_base(base_checkpoint_ref, fallback_optimizer_state=Non
         adam_eps = fallback_optimizer_state.get('adam_eps_value', 1e-8) if fallback_optimizer_state else 1e-8
         return {'m': {}, 'v': {}, 't': 0, 'betas': betas, 'adam_eps': adam_eps}
 
+    adam_sidecar_path = os.path.join(base_checkpoint_ref, "adam_state.pt")
+    if os.path.exists(adam_sidecar_path):
+        adam_state = torch.load(adam_sidecar_path, map_location='cpu', weights_only=False)
+        if isinstance(adam_state, dict):
+            logger.info(f"[Adam Replay] Loaded adam_state from sidecar {adam_sidecar_path}")
+            return adam_state
+
     opt_path = os.path.join(base_checkpoint_ref, "optimizer.pt")
     if os.path.exists(opt_path):
         opt = torch.load(opt_path, map_location='cpu', weights_only=False)
@@ -228,38 +234,36 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                     _t0 = time.time()
                     param.data.add_(z, alpha=float(scaling_factor * zo_eps))
                     t_update += time.time() - _t0
-
-        beta1, beta2 = adam_state['betas']
-        a_eps = adam_state['adam_eps']
         adam_state['t'] += 1
-        t = adam_state['t']
-        bc1, bc2 = 1 - beta1 ** t, 1 - beta2 ** t
-        step_size = lr / bc1
 
         zo_gen = _reset_rng()
-        for name in param_names:
-            param = state[name]
+        def _get_z(_name, param_tensor):
+            nonlocal t_z
             _t0 = time.time()
-            z = _generate_z_for_replay(param, rng_device, zo_gen)
+            z = _generate_z_for_replay(param_tensor, rng_device, zo_gen)
             t_z += time.time() - _t0
-            _t0 = time.time()
-            g = (grad * z).float()
+            return z
 
-            m, v = adam_state['m'], adam_state['v']
-            if name not in m:
-                m[name] = torch.zeros_like(param, dtype=torch.float32)
-                v[name] = torch.zeros_like(param, dtype=torch.float32)
-
-            m[name].mul_(beta1).add_(g, alpha=1 - beta1)
-            v[name].mul_(beta2).addcmul_(g, g, value=1 - beta2)
-
-            denom = (v[name] / bc2).sqrt_().add_(a_eps)
-            upd = m[name].div(denom).mul_(step_size)
-
-            if all(x not in name for x in ['bias', 'layer_norm', 'layernorm', 'ln']):
-                upd.add_(param.float(), alpha=lr * wd)
-            param.sub_(upd.to(param.dtype))
-            t_update += time.time() - _t0
+        helper_t0 = time.time()
+        z_before = t_z
+        apply_mezo_adam_update(
+            ((name, state[name]) for name in param_names),
+            get_z=_get_z,
+            grad=grad,
+            lr=lr,
+            weight_decay=None,
+            default_weight_decay=wd,
+            betas=adam_state['betas'],
+            adam_eps=adam_state['adam_eps'],
+            t=adam_state['t'],
+            m_state=adam_state['m'],
+            v_state=adam_state['v'],
+            state_key=lambda name, _param: name,
+            diag_label=f"replay_live step={update.get('step', '?')}",
+            diag_logger=logger,
+        )
+        helper_elapsed = time.time() - helper_t0
+        t_update += max(0.0, helper_elapsed - (t_z - z_before))
 
         return {'total': time.time() - t_start, 'z_gen': t_z, 'update': t_update}
 
@@ -434,12 +438,20 @@ def _replay_updates_on_state(
         if i > 0 and i % _seq_quarter == 0:
             _log_memory(f"sequential step {i}/{len(updates)}", _seq_proc, actual_device, _seq_cpu0, _seq_gpu0)
 
-        if i < 3 or i == len(updates) - 1:
+        if _step_diag_enabled() or _step_exact_enabled():
             logger.info(f"[Replay] update {i}: step={update.get('step','?')}, seed={update['seed']}, "
                         f"grad={update['grad']:.6e}, lr={update['lr']}, wd={update.get('wd', 0.0)}, "
                         f"zo_eps={update.get('zo_eps', default_zo_eps)}, "
                         f"time={timing['total']:.4f}s (z_gen={timing['z_gen']:.4f}s, update={timing['update']:.4f}s)")
-        elif i == 3:
+            if _step_diag_enabled():
+                _log_state_checksums(f"replay_live step={update.get('step','?')}", state)
+                if adam_state is not None:
+                    _log_adam_checksums(f"replay_live step={update.get('step','?')}", adam_state)
+            if _step_exact_enabled():
+                _log_state_exact_fingerprint(f"replay_live step={update.get('step','?')}", state)
+                if adam_state is not None:
+                    _log_adam_exact_fingerprint(f"replay_live step={update.get('step','?')}", adam_state)
+        elif _step_diag_enabled() and i == 3 and len(updates) > 4:
             logger.info(f"[Replay] ... ({len(updates) - 4} more updates) ...")
 
     if timings:

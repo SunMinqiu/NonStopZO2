@@ -3,8 +3,9 @@ Async Anchor Checkpoint for ZO Training.
 
 Two-phase async pipeline for full model checkpoint saving:
   Phase 1 (GPU→CPU): Dedicated CUDA stream async-copies model params to pinned CPU buffer
-  Phase 2 (CPU→/dev/shm latest→disk): Background daemon thread clones buffer,
-      publishes the latest anchor to /dev/shm, then forks a subprocess to write
+  Phase 2 (CPU→tmpfs latest→disk): Background daemon thread clones buffer,
+      publishes the latest anchor to the configured tmpfs directory, then forks
+      a subprocess to write
 
 At most one checkpoint persist is in progress at any time. When a new checkpoint
 triggers, the training thread waits for the previous persist to finish before
@@ -28,9 +29,10 @@ from collections import OrderedDict
 
 import torch
 
-from .log_based_utils import _atomic_save_state_dict_safetensors
+from .log_based_utils import _atomic_save_state_dict_safetensors, _ensure_zo_shm_dir
 
 logger = logging.getLogger(__name__)
+ADAM_STATE_NAME = "adam_state.pt"
 
 
 def _subprocess_write_checkpoint(state_dict, save_path, step):
@@ -63,6 +65,7 @@ class _PersistJob:
         'copy_done_event',
         'uses_cuda',
         'd2h_fallback_s',
+        'adam_state',
     ]
 
     def __init__(
@@ -73,6 +76,7 @@ class _PersistJob:
         copy_done_event,
         uses_cuda,
         d2h_fallback_s=0.0,
+        adam_state=None,
     ):
         self.step = step
         self.output_dir = output_dir
@@ -80,6 +84,7 @@ class _PersistJob:
         self.copy_done_event = copy_done_event
         self.uses_cuda = uses_cuda
         self.d2h_fallback_s = d2h_fallback_s
+        self.adam_state = adam_state
 
 
 class AsyncAnchorCheckpointer:
@@ -88,7 +93,7 @@ class AsyncAnchorCheckpointer:
     Pre-allocates a single CPU pinned buffer matching the model size.
     At anchor steps, async-copies GPU params to the pinned buffer via a
     dedicated CUDA stream, then a background thread first publishes
-    `/dev/shm/zo_anchor_latest_<hash>.safetensors` and finally persists
+    `<ZO_SHM_DIR>/zo_anchor_latest_<hash>.safetensors` and finally persists
     the same snapshot to disk as `model.safetensors`.
 
     Args:
@@ -101,8 +106,12 @@ class AsyncAnchorCheckpointer:
 
     def __init__(self, model, checkpoint_dir, tied_groups=None):
         self._checkpoint_dir = checkpoint_dir
+        self._shm_dir = _ensure_zo_shm_dir()
         self._anchor_latest_path = (
-            f"/dev/shm/zo_anchor_latest_{hashlib.md5(checkpoint_dir.encode()).hexdigest()[:8]}.safetensors"
+            os.path.join(
+                self._shm_dir,
+                f"zo_anchor_latest_{hashlib.md5(checkpoint_dir.encode()).hexdigest()[:8]}.safetensors",
+            )
         )
 
         # Compute excluded keys from tied weight groups (keep first, exclude rest)
@@ -216,6 +225,24 @@ class AsyncAnchorCheckpointer:
                 pinned[name].copy_(state_dict[name])
         t_copy = time.time() - t_copy_start
 
+        adam_state = None
+        opt = getattr(model, "opt", None)
+        if opt is not None and hasattr(opt, "get_adam_state") and hasattr(opt, "betas") and hasattr(opt, "adam_eps"):
+            adam_raw = opt.get_adam_state()
+            adam_state = {
+                'm': OrderedDict(
+                    (name, tensor.detach().to(device='cpu', dtype=torch.float32).clone())
+                    for name, tensor in adam_raw.get('m', {}).items()
+                ),
+                'v': OrderedDict(
+                    (name, tensor.detach().to(device='cpu', dtype=torch.float32).clone())
+                    for name, tensor in adam_raw.get('v', {}).items()
+                ),
+                't': int(adam_raw.get('t', 0)),
+                'betas': tuple(adam_raw.get('betas', getattr(opt, 'betas', (0.9, 0.999)))),
+                'adam_eps': float(adam_raw.get('adam_eps', getattr(opt, 'adam_eps', 1e-8))),
+            }
+
         # Queue Phase 2 (CPU→disk) for background thread
         self._persist_queue.put(
             _PersistJob(
@@ -225,6 +252,7 @@ class AsyncAnchorCheckpointer:
                 copy_done_event=copy_done_event,
                 uses_cuda=has_cuda,
                 d2h_fallback_s=t_copy,
+                adam_state=adam_state,
             )
         )
         self._anchors_saved += 1
@@ -351,11 +379,12 @@ class AsyncAnchorCheckpointer:
             with self._lock:
                 if job.step > self._latest_published_step:
                     self._latest_published_step = job.step
-                    self._latest_published_snapshot = snapshot
+                    self._latest_published_snapshot = (snapshot, job.adam_state)
 
             # Phase 2b: Fork subprocess for disk I/O.
             os.makedirs(job.output_dir, exist_ok=True)
             save_path = os.path.join(job.output_dir, "model.safetensors")
+            adam_path = os.path.join(job.output_dir, ADAM_STATE_NAME)
 
             self._persist_done.clear()  # Mark persist as in-progress
             t0 = time.time()
@@ -372,19 +401,29 @@ class AsyncAnchorCheckpointer:
             cpu_total_s = time.time() - cpu_ready_t0
             child_ok = os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
             if child_ok:
+                if job.adam_state is not None:
+                    torch.save(job.adam_state, adam_path)
                 if force_fsync:
                     fd = os.open(save_path, os.O_RDONLY)
                     try:
                         os.fsync(fd)
                     finally:
                         os.close(fd)
+                    if job.adam_state is not None:
+                        fd = os.open(adam_path, os.O_RDONLY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
                 with self._lock:
                     if job.step > self._latest_completed_step:
                         self._latest_completed_step = job.step
                         self._latest_completed_path = job.output_dir
                 logger.info(
                     f"[AsyncAnchor] Persisted step {job.step} "
-                    f"(d2h={d2h_s:.3f}s, cpu_total={cpu_total_s:.3f}s) "
+                    f"(d2h={d2h_s:.3f}s, cpu_total={cpu_total_s:.3f}s, "
+                    f"has_adam={job.adam_state is not None}, "
+                    f"adam_t={int(job.adam_state.get('t', 0)) if job.adam_state is not None else 0}) "
                     f"→ {save_path}"
                 )
             else:

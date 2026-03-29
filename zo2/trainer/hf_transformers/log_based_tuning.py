@@ -7,6 +7,8 @@ from collections import OrderedDict
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ZO_SHM_DIR = "/dev/shm/zo_ckpt"
+
 
 def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
                              n_warmup, n_measure, zo_eps, adam_state,
@@ -248,7 +250,7 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
                                 core_start=1, core_stop=None, core_step=1,
                                 commit_interval=1, measure_commit=True,
                                 commit_n_warmup=1, commit_n_measure=2,
-                                commit_dir="/dev/shm"):
+                                commit_dir=DEFAULT_ZO_SHM_DIR):
     """Benchmark t_gen/t_update curves and find optimal (c, P, c_cons)."""
     if t_train is None:
         raise ValueError("t_train (GPU step time in seconds) is required")
