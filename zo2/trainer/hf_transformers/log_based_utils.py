@@ -11,8 +11,10 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from ...utils.logging_controls import (
-    consistency_log_enabled,
     resource_log_enabled,
+    state_diag_log_enabled,
+    state_exact_log_enabled,
+    thread_snapshot_log_enabled,
 )
 
 logger = logging.getLogger(__name__)
@@ -41,15 +43,15 @@ def _ensure_zo_shm_dir():
 
 
 def _thread_debug_enabled():
-    return resource_log_enabled()
+    return thread_snapshot_log_enabled()
 
 
 def _step_diag_enabled():
-    return consistency_log_enabled()
+    return state_diag_log_enabled()
 
 
 def _step_exact_enabled():
-    return consistency_log_enabled()
+    return state_exact_log_enabled()
 
 def _clone_state_dict_to_cpu(state_dict, *, exclude_keys=None):
     """Clone a state dict to regular CPU tensors."""
@@ -290,7 +292,7 @@ def _state_exact_fingerprint(state_dict):
 
 
 def _log_state_checksums(label, state_dict, tracked_names=None, _logger=None):
-    if not consistency_log_enabled():
+    if not state_diag_log_enabled():
         return
     _log = _logger or logger
     if state_dict is None:
@@ -306,7 +308,7 @@ def _log_state_checksums(label, state_dict, tracked_names=None, _logger=None):
 
 
 def _log_state_exact_fingerprint(label, state_dict, _logger=None):
-    if not consistency_log_enabled():
+    if not state_exact_log_enabled():
         return
     _log = _logger or logger
     if state_dict is None:
@@ -317,7 +319,7 @@ def _log_state_exact_fingerprint(label, state_dict, _logger=None):
 
 
 def _log_state_exact_compare(label, lhs, rhs, _logger=None):
-    if not consistency_log_enabled():
+    if not state_exact_log_enabled():
         return
     _log = _logger or logger
     if lhs is None or rhs is None:
@@ -401,7 +403,7 @@ def _adam_exact_fingerprint(adam_state):
 
 
 def _log_adam_brief(label, adam_state, tracked_names=None, _logger=None):
-    if not consistency_log_enabled():
+    if not state_diag_log_enabled():
         return
     _log = _logger or logger
     if adam_state is None:
@@ -430,7 +432,7 @@ def _log_adam_brief(label, adam_state, tracked_names=None, _logger=None):
 
 
 def _log_adam_checksums(label, adam_state, tracked_names=None, _logger=None):
-    if not consistency_log_enabled():
+    if not state_diag_log_enabled():
         return
     _log = _logger or logger
     if adam_state is None:
@@ -452,7 +454,7 @@ def _log_adam_checksums(label, adam_state, tracked_names=None, _logger=None):
 
 
 def _log_adam_exact_fingerprint(label, adam_state, _logger=None):
-    if not consistency_log_enabled():
+    if not state_exact_log_enabled():
         return
     _log = _logger or logger
     if adam_state is None:
@@ -463,7 +465,7 @@ def _log_adam_exact_fingerprint(label, adam_state, _logger=None):
 
 
 def _log_adam_exact_compare(label, lhs, rhs, _logger=None):
-    if not consistency_log_enabled():
+    if not state_exact_log_enabled():
         return
     _log = _logger or logger
     if lhs is None or rhs is None:

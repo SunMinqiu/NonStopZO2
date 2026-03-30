@@ -3,7 +3,7 @@ import logging
 
 import torch
 
-from ...utils.logging_controls import consistency_log_enabled
+from ...utils.logging_controls import z_diag_log_enabled, z_exact_log_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +23,11 @@ def _uses_weight_decay(name):
 
 
 def _z_diag_enabled():
-    return consistency_log_enabled()
+    return z_diag_log_enabled()
 
 
 def _z_exact_enabled():
-    return consistency_log_enabled()
+    return z_exact_log_enabled()
 
 
 def _log_z_stats(label, z_tensors, _logger=None):

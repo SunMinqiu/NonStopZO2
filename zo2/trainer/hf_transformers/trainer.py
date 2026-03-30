@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 import warnings
+from collections import OrderedDict
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
@@ -184,9 +185,23 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.quantization_config import QuantizationMethod
 
 from ...utils.logging_controls import (
+    batch_debug_log_enabled,
     consistency_log_enabled,
+    memory_debug_log_enabled,
     resource_log_enabled,
     time_log_enabled,
+)
+from ...utils.trace import (
+    configure_trace,
+    default_trace_path,
+    directory_size_bytes,
+    shm_usage_bytes,
+    start_resource_sampler,
+    stop_resource_sampler,
+    trace_begin,
+    trace_enabled,
+    trace_end,
+    trace_instant,
 )
 
 
@@ -371,8 +386,10 @@ class ZOTrainer(Trainer):
         self._memory_debug_every = 0
         self._memory_debug_sync = True
         self._memory_debug_process = None
+        self._trace_resource_process = None
+        self._trainer_trace_runtime_started = False
 
-        if self.zo and torch.cuda.is_available() and resource_log_enabled():
+        if self.zo and torch.cuda.is_available() and memory_debug_log_enabled():
             if isinstance(getattr(args, "logging_steps", 0), int) and args.logging_steps > 0:
                 self._memory_debug_every = args.logging_steps
             else:
@@ -389,13 +406,58 @@ class ZOTrainer(Trainer):
         }
         self._log_based_resume_checkpoint = checkpoint_path
 
+    def _has_active_log_based_callback(self) -> bool:
+        try:
+            from .log_based_checkpoint import LogBasedCheckpointCallback
+        except Exception:
+            return False
+        for callback in self.callback_handler.callbacks:
+            if isinstance(callback, LogBasedCheckpointCallback) and getattr(callback, "batch_size", -1) >= 0:
+                return True
+        return False
+
+    def _trainer_trace_resource_counters(self):
+        if self._trace_resource_process is None:
+            self._trace_resource_process = psutil.Process(os.getpid())
+            self._trace_resource_process.cpu_percent(interval=None)
+        counters = {
+            "train_rss_mb": self._trace_resource_process.memory_info().rss / 1024**2,
+            "train_cpu_percent": self._trace_resource_process.cpu_percent(interval=None),
+            "train_num_threads": int(self._trace_resource_process.num_threads()),
+            "zo_shm_used_mb": shm_usage_bytes(os.environ.get("ZO_SHM_DIR", "/dev/shm/zo_ckpt")) / 1024**2,
+        }
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            counters["gpu0_alloc_mb"] = torch.cuda.memory_allocated(0) / 1024**2
+            counters["gpu0_reserved_mb"] = torch.cuda.memory_reserved(0) / 1024**2
+            counters["gpu0_peak_mb"] = torch.cuda.max_memory_allocated(0) / 1024**2
+        return counters
+
+    def _ensure_trainer_trace_runtime(self):
+        if not trace_enabled() or self._has_active_log_based_callback():
+            return
+        if not self._trainer_trace_runtime_started:
+            trace_path = os.environ.get("ZO_TRACE_PATH") or default_trace_path(self.args.output_dir)
+            resolved_path = configure_trace(path=trace_path, process_role="train")
+            trace_instant(
+                panel="gpu_train",
+                lane="meta",
+                event="trace_config",
+                extra={
+                    "trace_path": resolved_path,
+                    "output_dir": self.args.output_dir,
+                    "source": "trainer",
+                },
+            )
+            self._trainer_trace_runtime_started = True
+        start_resource_sampler(panel="gpu_train", provider=self._trainer_trace_resource_counters)
+
     def _memory_debug_due(self, step: int) -> bool:
         if not self.zo or self._memory_debug_every <= 0 or not torch.cuda.is_available():
             return False
         return step <= 3 or step % self._memory_debug_every == 0
 
     def _should_log_batch_debug(self, step: int) -> bool:
-        return consistency_log_enabled()
+        return batch_debug_log_enabled()
 
     def _batch_tensor_hash(self, tensor: torch.Tensor) -> str:
         cpu = tensor.detach().cpu().contiguous()
@@ -425,7 +487,7 @@ class ZOTrainer(Trainer):
         logger.info(f"[BATCH] step={step} " + " | ".join(parts))
 
     def _log_memory_debug(self, tag: str, step: int, *, reset_peak: bool = False) -> None:
-        if not resource_log_enabled() or not torch.cuda.is_available():
+        if not memory_debug_log_enabled() or not torch.cuda.is_available():
             return
         if reset_peak:
             torch.cuda.reset_peak_memory_stats()
@@ -516,6 +578,17 @@ class ZOTrainer(Trainer):
             self._total_loss_scalar += tr_loss_scalar
             self._globalstep_last_logged = self.state.global_step
             self.store_flos()
+            if trace_enabled():
+                trace_instant(
+                    panel="gpu_train",
+                    lane="counters",
+                    event="train_scalar",
+                    step=int(self.state.global_step),
+                    counters={
+                        "loss": logs.get("loss"),
+                        "learning_rate": logs.get("learning_rate"),
+                    },
+                )
             self.log(logs, start_time)
 
         # --- Evaluate ---
@@ -535,22 +608,47 @@ class ZOTrainer(Trainer):
             if self._memory_debug_due(step):
                 self._log_memory_debug("before_save", step, reset_peak=True)
             t_ckpt_start = time_module.time()
-            t_save_impl_start = time_module.time()
-            self._save_checkpoint(model, trial)
-            t_save_impl_elapsed = time_module.time() - t_save_impl_start
-            t_on_save_start = time_module.time()
-            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
-            t_on_save_elapsed = time_module.time() - t_on_save_start
-            t_ckpt_elapsed = time_module.time() - t_ckpt_start
+            ckpt_trace_token = trace_begin(
+                panel="gpu_train",
+                lane="blocking",
+                event="checkpoint_save",
+                step=int(self.state.global_step),
+            )
+            t_save_impl_elapsed = None
+            t_on_save_elapsed = None
             log_based_callback = None
-            from .log_based_checkpoint import LogBasedCheckpointCallback
+            ckpt_error = None
+            try:
+                t_save_impl_start = time_module.time()
+                self._save_checkpoint(model, trial)
+                t_save_impl_elapsed = time_module.time() - t_save_impl_start
+                t_on_save_start = time_module.time()
+                self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+                t_on_save_elapsed = time_module.time() - t_on_save_start
+                from .log_based_checkpoint import LogBasedCheckpointCallback
 
-            for callback in self.callback_handler.callbacks:
-                if isinstance(callback, LogBasedCheckpointCallback):
-                    log_based_callback = callback
-                    break
-            if self._memory_debug_due(step):
-                self._log_memory_debug("after_save", step)
+                for callback in self.callback_handler.callbacks:
+                    if isinstance(callback, LogBasedCheckpointCallback):
+                        log_based_callback = callback
+                        break
+                if self._memory_debug_due(step):
+                    self._log_memory_debug("after_save", step)
+            except Exception as exc:
+                ckpt_error = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                t_ckpt_elapsed = time_module.time() - t_ckpt_start
+                trace_end(
+                    ckpt_trace_token,
+                    step=int(self.state.global_step),
+                    counters={
+                        "save_impl_ms": (t_save_impl_elapsed * 1000.0) if t_save_impl_elapsed is not None else None,
+                        "on_save_ms": (t_on_save_elapsed * 1000.0) if t_on_save_elapsed is not None else None,
+                        "total_ms": t_ckpt_elapsed * 1000.0,
+                        "output_ckpt_used_mb": directory_size_bytes(self.args.output_dir) / 1024**2,
+                    },
+                    extra={"error": ckpt_error} if ckpt_error else None,
+                )
             if log_based_callback is not None and getattr(log_based_callback, "_last_save_is_full", False):
                 log_based_callback.timing_stats['checkpoint_total_times'].append(t_ckpt_elapsed)
                 if time_log_enabled():
@@ -642,19 +740,25 @@ class ZOTrainer(Trainer):
             if not shadow_keeps_log_only and not sync_full_uses_sidecar:
                 # Save trainer state
                 t0 = time.time()
+                state_json_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
                 self.state.save_to_json(os.path.join(output_dir, TRAINER_STATE_NAME))
                 t_state_json = time.time() - t0
+                trace_end(state_json_token, step=int(self.state.global_step), counters={"duration_ms": t_state_json * 1000.0})
 
                 # Save scheduler state
                 if self.lr_scheduler is not None:
                     t0 = time.time()
+                    scheduler_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
                     torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
                     t_scheduler = time.time() - t0
+                    trace_end(scheduler_token, step=int(self.state.global_step), counters={"duration_ms": t_scheduler * 1000.0})
 
                 # Save RNG state for deterministic resume
                 t0 = time.time()
+                rng_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_rng_save", step=int(self.state.global_step))
                 self._save_rng_state(output_dir)
                 t_rng = time.time() - t0
+                trace_end(rng_token, step=int(self.state.global_step), counters={"duration_ms": t_rng * 1000.0})
 
                 # Detect model dtype for replay consistency
                 model_dtype = None
@@ -667,6 +771,7 @@ class ZOTrainer(Trainer):
                 # metadata; storing MeZO-Adam's full adam_state defeats the purpose
                 # of log-based checkpointing.
                 t0 = time.time()
+                opt_build_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_cpu_serialize", step=int(self.state.global_step))
                 if is_full_step:
                     optimizer_state = self.optimizer.state_dict()
                 else:
@@ -717,13 +822,16 @@ class ZOTrainer(Trainer):
                     if key not in {"state", "param_groups", "adam_state"}
                 }
                 t_opt_build = time.time() - t0
+                trace_end(opt_build_token, step=int(self.state.global_step), counters={"duration_ms": t_opt_build * 1000.0})
 
                 opt_path = os.path.join(output_dir, OPTIMIZER_NAME)
                 t0 = time.time()
+                opt_save_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
                 torch.save(optimizer_state, opt_path)
                 from .log_based_utils import _fsync_file
                 _fsync_file(opt_path)
                 t_opt_save = time.time() - t0
+                trace_end(opt_save_token, step=int(self.state.global_step), counters={"duration_ms": t_opt_save * 1000.0})
                 log_based_callback.disk_log_save_count += 1
                 logger.info(
                     f"[ZOTrainer] Saved {len(updates)} updates to disk, "
@@ -759,12 +867,16 @@ class ZOTrainer(Trainer):
             elif persist_lightweight_redo:
                 if self.lr_scheduler is not None:
                     t0 = time.time()
+                    scheduler_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
                     torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
                     t_scheduler = time.time() - t0
+                    trace_end(scheduler_token, step=int(self.state.global_step), counters={"duration_ms": t_scheduler * 1000.0})
 
                 t0 = time.time()
+                rng_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_rng_save", step=int(self.state.global_step))
                 self._save_rng_state(output_dir)
                 t_rng = time.time() - t0
+                trace_end(rng_token, step=int(self.state.global_step), counters={"duration_ms": t_rng * 1000.0})
 
                 model_dtype = None
                 for p in model.parameters():
@@ -772,6 +884,7 @@ class ZOTrainer(Trainer):
                     break
 
                 t0 = time.time()
+                meta_build_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_cpu_serialize", step=int(self.state.global_step))
                 zo_method = 'mezo-sgd'
                 log_metadata = {
                     'zo_update_history': updates,
@@ -796,13 +909,16 @@ class ZOTrainer(Trainer):
                     log_metadata['adam_eps_value'] = model.opt.adam_eps
                 log_metadata['zo_method'] = zo_method
                 t_opt_build = time.time() - t0
+                trace_end(meta_build_token, step=int(self.state.global_step), counters={"duration_ms": t_opt_build * 1000.0})
 
                 meta_path = os.path.join(output_dir, LOG_METADATA_NAME)
                 t0 = time.time()
+                meta_save_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
                 torch.save(log_metadata, meta_path)
                 from .log_based_utils import _fsync_file
                 _fsync_file(meta_path)
                 t_meta_save = time.time() - t0
+                trace_end(meta_save_token, step=int(self.state.global_step), counters={"duration_ms": t_meta_save * 1000.0})
                 log_based_callback.disk_log_save_count += 1
                 logger.info(
                     f"[ZOTrainer] Saved lightweight scalar redo metadata to {LOG_METADATA_NAME}, "
@@ -838,8 +954,37 @@ class ZOTrainer(Trainer):
                 else:
                     # Sync path: save model files via Trainer, then clear history
                     t0 = time.time()
-                    super()._save_checkpoint(model, trial)
-                    t_super_full = time.time() - t0
+                    full_model_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
+                    pending_d2h_token = trace_begin(
+                        panel="gpu_train",
+                        lane="blocking",
+                        event="checkpoint_d2h_copy",
+                        step=int(self.state.global_step),
+                    )
+                    self._pending_checkpoint_d2h_token = pending_d2h_token
+                    self._pending_checkpoint_d2h_step = int(self.state.global_step)
+                    full_model_error = None
+                    try:
+                        super()._save_checkpoint(model, trial)
+                    except Exception as exc:
+                        full_model_error = f"{type(exc).__name__}: {exc}"
+                        raise
+                    finally:
+                        t_super_full = time.time() - t0
+                        if getattr(self, "_pending_checkpoint_d2h_token", None) is not None:
+                            trace_end(
+                                self._pending_checkpoint_d2h_token,
+                                step=getattr(self, "_pending_checkpoint_d2h_step", int(self.state.global_step)),
+                                extra={"error": full_model_error} if full_model_error else None,
+                            )
+                            self._pending_checkpoint_d2h_token = None
+                            self._pending_checkpoint_d2h_step = None
+                        trace_end(
+                            full_model_token,
+                            step=int(self.state.global_step),
+                            counters={"duration_ms": t_super_full * 1000.0},
+                            extra={"error": full_model_error} if full_model_error else None,
+                        )
                     t0 = time.time()
                     log_based_callback.full_anchor_save_count += 1
                     # Update callback state
@@ -855,10 +1000,12 @@ class ZOTrainer(Trainer):
                         log_metadata['is_full_checkpoint'] = True
                         meta_path = os.path.join(output_dir, LOG_METADATA_NAME)
                         t_meta_start = time.time()
+                        meta_save_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
                         torch.save(log_metadata, meta_path)
                         from .log_based_utils import _fsync_file
                         _fsync_file(meta_path)
                         t_meta_save = time.time() - t_meta_start
+                        trace_end(meta_save_token, step=int(self.state.global_step), counters={"duration_ms": t_meta_save * 1000.0})
                         logger.info(
                             f"[ZOTrainer] Saved lightweight full-step sidecar metadata to {LOG_METADATA_NAME}, "
                             f"pending_grad={log_metadata['pending_grad']:.6e}, is_full_step=True"
@@ -878,12 +1025,94 @@ class ZOTrainer(Trainer):
             return
 
         # Default behavior: save full checkpoint when log-based checkpointing is disabled
-        super()._save_checkpoint(model, trial)
+        pending_d2h_token = trace_begin(
+            panel="gpu_train",
+            lane="blocking",
+            event="checkpoint_d2h_copy",
+            step=int(self.state.global_step),
+        )
+        self._pending_checkpoint_d2h_token = pending_d2h_token
+        self._pending_checkpoint_d2h_step = int(self.state.global_step)
+        checkpoint_error = None
+        try:
+            super()._save_checkpoint(model, trial)
+        except Exception as exc:
+            checkpoint_error = f"{type(exc).__name__}: {exc}"
+            raise
+        finally:
+            if getattr(self, "_pending_checkpoint_d2h_token", None) is not None:
+                trace_end(
+                    self._pending_checkpoint_d2h_token,
+                    step=getattr(self, "_pending_checkpoint_d2h_step", int(self.state.global_step)),
+                    extra={"error": checkpoint_error} if checkpoint_error else None,
+                )
+                self._pending_checkpoint_d2h_token = None
+                self._pending_checkpoint_d2h_step = None
         # Fsync full checkpoint directory for L0 baseline
         from .log_based_utils import _fsync_directory
         run_dir = self._get_output_dir(trial=trial)
         ckpt_dir = os.path.join(run_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
         _fsync_directory(ckpt_dir)
+
+    def _save(self, output_dir: Optional[str] = None, state_dict=None):
+        checkpoint_step = int(getattr(self.state, "global_step", 0))
+        if not trace_enabled():
+            return super()._save(output_dir, state_dict=state_dict)
+
+        pending_d2h_token = getattr(self, "_pending_checkpoint_d2h_token", None)
+        closed_pending_d2h = False
+        if pending_d2h_token is not None:
+            trace_end(
+                pending_d2h_token,
+                step=getattr(self, "_pending_checkpoint_d2h_step", checkpoint_step),
+                counters={"num_tensors": len(state_dict) if state_dict is not None else 0},
+            )
+            self._pending_checkpoint_d2h_token = None
+            self._pending_checkpoint_d2h_step = None
+            closed_pending_d2h = True
+
+        effective_state_dict = state_dict
+        if effective_state_dict is None and not closed_pending_d2h:
+            d2h_token = trace_begin(
+                panel="gpu_train",
+                lane="blocking",
+                event="checkpoint_d2h_copy",
+                step=checkpoint_step,
+            )
+            d2h_error = None
+            effective_state_dict = OrderedDict()
+            try:
+                source_state = self.model.state_dict()
+                for key, value in source_state.items():
+                    if torch.is_tensor(value):
+                        effective_state_dict[key] = value.detach().cpu()
+                    else:
+                        effective_state_dict[key] = value
+            except Exception as exc:
+                d2h_error = f"{type(exc).__name__}: {exc}"
+                raise
+            finally:
+                trace_end(
+                    d2h_token,
+                    step=checkpoint_step,
+                    counters={"num_tensors": len(effective_state_dict)},
+                    extra={"error": d2h_error} if d2h_error else None,
+                )
+
+        persist_token = trace_begin(
+            panel="gpu_train",
+            lane="blocking",
+            event="checkpoint_model_persist",
+            step=checkpoint_step,
+        )
+        try:
+            return super()._save(output_dir, state_dict=effective_state_dict)
+        finally:
+            trace_end(
+                persist_token,
+                step=checkpoint_step,
+                counters={"num_tensors": len(effective_state_dict) if effective_state_dict is not None else 0},
+            )
 
     def _inner_training_loop(
         self, batch_size=None, args=None, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None
@@ -1164,6 +1393,7 @@ class ZOTrainer(Trainer):
         grad_norm: Optional[float] = None
         learning_rate = None
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
+        self._ensure_trainer_trace_runtime()
 
         if args.eval_on_start:
             self._evaluate(trial, ignore_keys_for_eval, skip_scheduler=True)
@@ -1191,6 +1421,13 @@ class ZOTrainer(Trainer):
                     # RandomSampler consumes extra RNG near the end of iteration,
                     # so exhaust it to land on the same next-epoch shuffle state.
                     _ = list(train_dataloader.sampler)
+
+        framework_trace_token = trace_begin(
+            panel="gpu_train",
+            lane="framework",
+            event="framework_overhead",
+            step=int(self.state.global_step),
+        ) if trace_enabled() else None
 
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_dataloader = train_dataloader
@@ -1275,10 +1512,23 @@ class ZOTrainer(Trainer):
                         steps_trained_progress_bar.close()
                         steps_trained_progress_bar = None
 
+                    expected_step = self.state.global_step + 1
+                    trace_end(framework_trace_token, step=int(expected_step))
+                    train_step_trace_token = trace_begin(
+                        panel="gpu_train",
+                        lane="train_step",
+                        event="train_step",
+                        step=int(expected_step),
+                        counters={
+                            "epoch": int(epoch),
+                            "micro_step": int(step),
+                            "global_step_before": int(self.state.global_step),
+                        },
+                    ) if trace_enabled() else None
+
                     if step % args.gradient_accumulation_steps == 0:
                         self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
 
-                    expected_step = self.state.global_step + 1
                     self._log_batch_debug(expected_step, inputs)
 
                     # Log full resume time on first real training step
@@ -1295,13 +1545,38 @@ class ZOTrainer(Trainer):
                                 logger.info(
                                     f"[Full Resume] Total time from program start to first step: {t_from_program:.3f}s"
                                 )
+                            if trace_enabled():
+                                trace_instant(
+                                    panel="gpu_train",
+                                    lane="counters",
+                                    event="first_step_latency",
+                                    step=int(expected_step),
+                                    counters={
+                                        "program_to_first_step_ms": t_from_program * 1000.0,
+                                        "resume_to_first_step_ms": t_full_resume * 1000.0,
+                                    },
+                                )
                             del self._t_program_start
                     elif hasattr(self, '_t_program_start'):
                         t_from_program = time.time() - self._t_program_start
                         if time_log_enabled():
                             logger.info(f"[No Resume] Total time from program start to first step: {t_from_program:.3f}s")
+                        if trace_enabled():
+                            trace_instant(
+                                panel="gpu_train",
+                                lane="counters",
+                                event="first_step_latency",
+                                step=int(expected_step),
+                                counters={"program_to_first_step_ms": t_from_program * 1000.0},
+                            )
                         del self._t_program_start
 
+                    train_compute_token = trace_begin(
+                        panel="gpu_train",
+                        lane="train_step",
+                        event="train_compute",
+                        step=int(expected_step),
+                    ) if trace_enabled() else None
                     # ZO2 added -> estimate gradient and updates
                     if self.zo:
                         tr_loss_step = self.zo2_training_step(model, inputs)
@@ -1315,6 +1590,7 @@ class ZOTrainer(Trainer):
                         )
                         with context():
                             tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+                    trace_end(train_compute_token, step=int(expected_step))
 
                     if (
                         args.logging_nan_inf_filter
@@ -1396,8 +1672,31 @@ class ZOTrainer(Trainer):
                             start_time,
                             learning_rate=learning_rate,
                         )
+                        trace_end(
+                            train_step_trace_token,
+                            step=int(self.state.global_step),
+                            counters={
+                                "global_step_after": int(self.state.global_step),
+                                "do_sync_step": True,
+                            },
+                        )
                     else:
                         self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+                        trace_end(
+                            train_step_trace_token,
+                            step=int(expected_step),
+                            counters={
+                                "global_step_after": int(self.state.global_step),
+                                "do_sync_step": False,
+                            },
+                        )
+
+                    framework_trace_token = trace_begin(
+                        panel="gpu_train",
+                        lane="framework",
+                        event="framework_overhead",
+                        step=int(self.state.global_step),
+                    ) if trace_enabled() else None
 
                     # PyTorch/XLA relies on the data loader to insert the mark_step for
                     # each step. Since we are breaking the loop early, we need to manually
@@ -1436,6 +1735,8 @@ class ZOTrainer(Trainer):
                     )
             if self.control.should_training_stop:
                 break
+
+        trace_end(framework_trace_token, step=int(self.state.global_step))
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training
@@ -1486,6 +1787,7 @@ class ZOTrainer(Trainer):
                     shutil.rmtree(checkpoint, ignore_errors=True)
 
         self.control = self.callback_handler.on_train_end(args, self.state, self.control)
+        stop_resource_sampler()
 
         # Wait for the checkpoint to be uploaded.
         self._finish_current_push()

@@ -9,7 +9,14 @@ from dataclasses import dataclass
 import psutil
 import torch
 
-from ...utils.logging_controls import consistency_log_enabled, resource_log_enabled, time_log_enabled
+from ...utils.logging_controls import (
+    consistency_log_enabled,
+    resource_log_enabled,
+    state_diag_log_enabled,
+    state_exact_log_enabled,
+    time_log_enabled,
+)
+from ...utils.trace import configure_trace, default_trace_path, trace_enabled, trace_instant, trace_span
 from .log_based_replay import (
     _load_adam_state_from_base,
     _replay_updates_on_state,
@@ -60,14 +67,14 @@ def _state_exact_fingerprint(state_dict, trainable_param_names=None):
 
 
 def _log_state_exact_fingerprint(label, state_dict, trainable_param_names=None):
-    if not consistency_log_enabled():
+    if not state_exact_log_enabled():
         return
     fp, tensor_count = _state_exact_fingerprint(state_dict, trainable_param_names=trainable_param_names)
     logger.info(f"[DIAG-EXACT] {label}: sha256={fp} tensors={tensor_count}")
 
 
 def _log_state_exact_compare(label, lhs, rhs, trainable_param_names=None):
-    if not consistency_log_enabled():
+    if not state_exact_log_enabled():
         return
     names = list(trainable_param_names) if trainable_param_names is not None else list(lhs.keys())
     missing_lhs = [name for name in names if name in rhs and name not in lhs]
@@ -148,7 +155,7 @@ def _state_checksums(state_dict, trainable_param_names=None):
 
 
 def _log_state_checksums(label, state_dict, trainable_param_names=None, tied_groups=None):
-    if not consistency_log_enabled():
+    if not state_diag_log_enabled():
         return
     """Emit consistent checksum diagnostics for resume/replay debugging."""
     stats = _state_checksums(state_dict, trainable_param_names)
@@ -285,6 +292,8 @@ def resume_from_log_based_bundle(
     shadow_path: str = None,
 ) -> LogBasedRecoveryBundle:
     """Resume from log-based checkpoints and return a structured recovery bundle."""
+    if trace_enabled() and output_dir is not None:
+        configure_trace(path=os.environ.get("ZO_TRACE_PATH") or default_trace_path(output_dir), process_role="train")
     ckpt_dir = os.path.dirname(checkpoint_path) if os.path.isfile(checkpoint_path) else checkpoint_path
 
     if output_dir is None:
@@ -298,6 +307,13 @@ def resume_from_log_based_bundle(
     if time_log_enabled():
         logger.info(f"[Resume] Target checkpoint: {ckpt_dir} (step {target_step})")
         logger.info(f"[Resume] Replay device: {device}")
+    trace_instant(
+        panel="gpu_train",
+        lane="blocking",
+        event="resume_begin",
+        step=int(target_step),
+        extra={"checkpoint_dir": ckpt_dir, "device": device},
+    )
 
     optimizer_path = os.path.join(ckpt_dir, "optimizer.pt")
     metadata_path = os.path.join(ckpt_dir, LOG_METADATA_NAME)
@@ -465,7 +481,9 @@ def resume_from_log_based_bundle(
         if base_match:
             base_ref_step = int(base_match.group(1))
 
+    reconstructed = None
     shadow_used = False
+    shadow_adam_state = None
     shadow_base_step = None
     shadow_step = None
     shadow_loaded_state = None
@@ -668,17 +686,25 @@ def resume_from_log_based_bundle(
     _mem_cpu0, _mem_gpu0 = _log_memory("before replay", _mem_proc, device) if _mem_proc is not None else (None, None)
 
     t_replay_start = time.time()
-    _replay_updates_on_state(
-        reconstructed, updates, device=device, move_to_device=False,
-        trainable_param_names=trainable_param_names,
-        default_zo_eps=default_zo_eps,
-        simulate_perturbation=simulate_perturbation,
-        replay_in_fp32=replay_in_fp32,
-        rng_device=rng_device,
-        zo2_mode=zo2_mode,
-        initial_prev_seed=base_pending_seed,
-        adam_state=adam_state,
-    )
+    with trace_span(
+        panel="gpu_train",
+        lane="blocking",
+        event="replay_updates",
+        step=int(target_step),
+        counters={"num_updates": len(updates)},
+        extra={"source": "resume"},
+    ):
+        _replay_updates_on_state(
+            reconstructed, updates, device=device, move_to_device=False,
+            trainable_param_names=trainable_param_names,
+            default_zo_eps=default_zo_eps,
+            simulate_perturbation=simulate_perturbation,
+            replay_in_fp32=replay_in_fp32,
+            rng_device=rng_device,
+            zo2_mode=zo2_mode,
+            initial_prev_seed=base_pending_seed,
+            adam_state=adam_state,
+        )
     if device == 'cuda' and torch.cuda.is_available():
         torch.cuda.synchronize()
     _log_state_checksums(
@@ -714,6 +740,13 @@ def resume_from_log_based_bundle(
 
     if time_log_enabled():
         logger.info(f"[Resume] Completed! Recovered to step {target_step}")
+    trace_instant(
+        panel="gpu_train",
+        lane="blocking",
+        event="resume_end",
+        step=int(target_step),
+        counters={"num_updates": len(updates)},
+    )
     recovered_base_step = 0
     if shadow_used and shadow_base_step is not None:
         recovered_base_step = int(shadow_base_step)

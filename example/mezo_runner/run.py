@@ -78,6 +78,7 @@ from torch.utils.data import Dataset
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from metrics import calculate_metric
 from utils import *
+from zo2.utils.trace import trace_enabled, trace_instant
 import random
 
 from zo2.trainer.hf_transformers.trainer import ZOTrainer
@@ -735,7 +736,20 @@ class Framework:
             )
             from zo2.trainer.hf_transformers.log_based_utils import _restore_tied_weights_for_model
             _restore_tied_weights_for_model(recovered_state, self.model)
+            _t_recovery_load_start = time.time()
             self.model.load_state_dict(recovered_state)
+            _t_recovery_load_ms = (time.time() - _t_recovery_load_start) * 1000.0
+            if trace_enabled():
+                trace_instant(
+                    panel="gpu_train",
+                    lane="counters",
+                    event="recovery_load",
+                    counters={"load_cpu_to_gpu_ms": _t_recovery_load_ms},
+                    extra={
+                        "source": "shadow" if recovery.shadow_used else "checkpoint",
+                        "state_on_cuda": bool(recovered_state_on_cuda),
+                    },
+                )
             if recovery.adam_state is not None:
                 logger.info(
                     f"[LogBased Resume] Recovery bundle carries Adam state: "
@@ -854,11 +868,17 @@ def main():
         for train_set_id, train_samples in enumerate(train_sets):
             train_set_seed = train_set_id if args.train_set_seed is None else args.train_set_seed
 
-            # Sample eval samples
-            if args.num_eval is not None:
-                eval_samples = task.sample_subset(data_split="valid", seed=train_set_seed, num=args.num_eval)
+            eval_strategy = getattr(args, "eval_strategy", "no")
+            eval_strategy_name = getattr(eval_strategy, "value", str(eval_strategy)).lower()
+            need_eval_samples = (eval_strategy_name != "no") or (not args.no_eval)
+
+            if need_eval_samples:
+                if args.num_eval is not None:
+                    eval_samples = task.sample_subset(data_split="valid", seed=train_set_seed, num=args.num_eval)
+                else:
+                    eval_samples = task.valid_samples
             else:
-                eval_samples = task.valid_samples
+                eval_samples = []
 
             if args.trainer != "none":
                 if args.num_dev is not None:
@@ -869,7 +889,10 @@ def main():
                     dev_samples = None
 
                 # Training
-                framework.train(train_samples, dev_samples if dev_samples is not None else eval_samples)
+                trainer_eval_samples = []
+                if need_eval_samples:
+                    trainer_eval_samples = dev_samples if dev_samples is not None else eval_samples
+                framework.train(train_samples, trainer_eval_samples)
 
                 if not args.no_eval:
                     metrics = framework.evaluate([], eval_samples) # No in-context learning if there is training

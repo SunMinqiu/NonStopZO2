@@ -7,7 +7,8 @@ import psutil
 import torch
 
 from ...optimizer.mezo_adam.shared import apply_mezo_adam_update
-from ...utils.logging_controls import resource_log_enabled, time_log_enabled
+from ...utils.logging_controls import replay_step_time_log_enabled, resource_log_enabled, time_log_enabled
+from ...utils.trace import trace_instant
 from .log_based_utils import (
     _log_adam_checksums,
     _log_adam_exact_fingerprint,
@@ -435,11 +436,23 @@ def _replay_updates_on_state(
             adam_state=adam_state
         )
         timings.append(timing)
+        trace_instant(
+            panel="gpu_train",
+            lane="counters",
+            event="replay_step",
+            step=int(update.get("step", i + 1)),
+            counters={
+                "replay_total_ms": float(timing["total"] * 1000.0),
+                "replay_z_ms": float(timing["z_gen"] * 1000.0),
+                "replay_update_ms": float(timing["update"] * 1000.0),
+            },
+            extra={"device": actual_device},
+        )
 
         if _seq_proc is not None and i > 0 and i % _seq_quarter == 0:
             _log_memory(f"sequential step {i}/{len(updates)}", _seq_proc, actual_device, _seq_cpu0, _seq_gpu0)
 
-        if time_log_enabled():
+        if replay_step_time_log_enabled():
             logger.info(f"[Replay] update {i}: step={update.get('step','?')}, seed={update['seed']}, "
                         f"grad={update['grad']:.6e}, lr={update['lr']}, wd={update.get('wd', 0.0)}, "
                         f"zo_eps={update.get('zo_eps', default_zo_eps)}, "

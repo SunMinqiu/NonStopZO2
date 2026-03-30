@@ -17,9 +17,11 @@ MAX_LENGTH=${MAX_LENGTH:-2048}
 # ZO 优化器选择: "mezo-sgd" (默认) 或 "mezo-adam"
 ZO_METHOD=${ZO_METHOD:-mezo-sgd}
 TRAIN=${TRAIN:-1000}
-DEV=${DEV:-500}
+DEV=${DEV-500}
 EVAL=${EVAL:-1000}
 STEPS=${STEPS:-20000}
+NUM_EPOCHS=${NUM_EPOCHS:-""}
+EVAL_STRATEGY=${EVAL_STRATEGY:-steps}
 EVAL_STEPS=${EVAL_STEPS:-4000}
 LOGGING_STEPS=${LOGGING_STEPS:-10}
 
@@ -53,7 +55,6 @@ OUTPUT_LOG=${OUTPUT_LOG:-""}
 LOG_BASED_RESUME=${LOG_BASED_RESUME:-""}
 LOG_BASED_REPLAY_DEVICE=${LOG_BASED_REPLAY_DEVICE:-cuda}
 LOG_BASED_SIMULATE_PERTURBATION=${LOG_BASED_SIMULATE_PERTURBATION:-1}
-SHM_ROOT=${ZO_SHM_DIR:-/dev/shm/zo_ckpt}
 # 确定性随机数: DETERMINISTIC=1 启用 torch.use_deterministic_algorithms (跨进程/跨GPU可复现)
 DETERMINISTIC=${DETERMINISTIC:-0}
 # ZO RNG 设备: "native" (用参数所在设备, 快), "cpu" (跨GPU可移植, 慢两百来倍！),
@@ -71,6 +72,13 @@ DTYPE=${DTYPE:-fp16}
 TRAIN_NAME=${TRAIN_NAME:-"Test_staging_8"}
 RESUME_CKPT=${RESUME_CKPT:-""}
 DO_EVAL=${DO_EVAL:-1}
+RESET_OUTPUT_DIR=${RESET_OUTPUT_DIR:-1}
+
+# 路径策略: 只手动指定 TRAIN_NAME，其余路径固定派生
+OUTPUT_DIR="/tmp/ZO_ckpt/$TRAIN_NAME"
+SHM_ROOT="/dev/shm/ZO_ckpt/$TRAIN_NAME"
+export ZO_SHM_DIR="$SHM_ROOT"
+export ZO_TRACE_PATH="$OUTPUT_DIR/zo_trace.jsonl"
 
 EXTRA_ARGS=""
 # 全局规则: 持久化阶段永远不触发 replacement，不设置 save_total_limit
@@ -143,40 +151,33 @@ fi
 TAG=mezo-$MODE-$LR-$EPS-$SEED
 
 # Output directory (used for retry loop and tmpfs shadow/anchor filenames)
-OUTPUT_DIR="${OUTPUT_ROOT:-/lvs0/rccs-hpbdrt/minqiu/ZO_ckpt_New}/$TRAIN_NAME-$TASK-${MODEL_NAME}-$TAG"
 RUN_HASH=$(echo -n "$OUTPUT_DIR" | md5sum | head -c 8)
-mkdir -p "$SHM_ROOT"
 
 # Wandb resume support (same run across retries)
 [ -z "$WANDB_RUN_ID" ] && WANDB_RUN_ID=$(python3 -c "import uuid; print(uuid.uuid4().hex[:8])")
 export WANDB_RUN_ID WANDB_RESUME=allow
 
+# Validate reset/resume behavior before any cleanup
+if [ "$RESET_OUTPUT_DIR" = "1" ]; then
+    if [ -n "$LOG_BASED_RESUME" ] || [ -n "$RESUME_CKPT" ]; then
+        echo "ERROR: RESET_OUTPUT_DIR=1 cannot be used with LOG_BASED_RESUME or RESUME_CKPT" >&2
+        exit 2
+    elif [ "$INSTANT_RECOVER" = "1" ]; then
+        echo "INSTANT_RECOVER=1, ignoring RESET_OUTPUT_DIR and keeping OUTPUT_DIR: $OUTPUT_DIR"
+    fi
+fi
+
 # Clean old tmpfs files and output directory from previous runs
-rm -f \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.safetensors" \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.safetensors" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.header.json" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.0.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.1.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_m.0.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_m.1.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_m.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_v.0.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_v.1.bin" \
-    "$SHM_ROOT/zo_shadow_latest_${RUN_HASH}.flat.adam_v.bin"
-rm -f \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.header.json" \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.0.bin" \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.1.bin" \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_m.0.bin" \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_m.1.bin" \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_v.0.bin" \
-    "$SHM_ROOT/zo_anchor_latest_${RUN_HASH}.flat.adam_v.1.bin"
-rm -rf "$SHM_ROOT/zo_rebase_payload_${RUN_HASH}"
-if [ -d "$OUTPUT_DIR" ]; then
-    echo "Cleaning old output directory: $OUTPUT_DIR"
-    rm -rf "$OUTPUT_DIR"
+if [ -d "$SHM_ROOT" ]; then
+    echo "Cleaning old shm directory: $SHM_ROOT"
+    rm -rf "$SHM_ROOT"
+fi
+mkdir -p "$SHM_ROOT"
+if [ "$RESET_OUTPUT_DIR" = "1" ] && [ "$INSTANT_RECOVER" != "1" ]; then
+    if [ -d "$OUTPUT_DIR" ]; then
+        echo "Cleaning old output directory: $OUTPUT_DIR"
+        rm -rf "$OUTPUT_DIR"
+    fi
 fi
 
 TASK_ARGS=""
@@ -204,8 +205,11 @@ echo "========== Configuration =========="
 echo "TAG: $TAG"
 echo "BS: $BS, LR: $LR, EPS: $EPS, SEED: $SEED"
 echo "MAX_LENGTH: $MAX_LENGTH"
-echo "STEPS: $STEPS, EVAL_STEPS: $EVAL_STEPS, SAVE_STEPS: $SAVE_STEPS, LOGGING_STEPS: $LOGGING_STEPS"
+echo "STEPS: $STEPS, NUM_EPOCHS: ${NUM_EPOCHS:-<unset>}, EVAL_STRATEGY: $EVAL_STRATEGY, EVAL_STEPS: $EVAL_STEPS, SAVE_STEPS: $SAVE_STEPS, LOGGING_STEPS: $LOGGING_STEPS"
 echo "MODE: $MODE, DTYPE: $DTYPE, DO_EVAL: $DO_EVAL, ZO_METHOD: $ZO_METHOD"
+echo "OUTPUT_DIR: $OUTPUT_DIR"
+echo "ZO_TRACE_PATH: $ZO_TRACE_PATH"
+echo "ZO_SHM_DIR: $ZO_SHM_DIR"
 echo "--- Log-Based Checkpoint ---"
 echo "LOG_BASED_CKPT: $LOG_BASED_CKPT (-1=disabled, 0=log-based, N>=1=full+log)"
 echo "ENABLE_SHADOW: $ENABLE_SHADOW"
@@ -227,6 +231,14 @@ echo "===================================="
 ORIG_EXTRA_ARGS="$EXTRA_ARGS"
 
 _run_training() {
+    local num_dev_args=()
+    local num_epoch_args=()
+    if [ -n "$DEV" ]; then
+        num_dev_args=(--num_dev "$DEV")
+    fi
+    if [ -n "$NUM_EPOCHS" ]; then
+        num_epoch_args=(--num_train_epochs "$NUM_EPOCHS")
+    fi
     python /home/users/u0001609/NonStopZO2/example/mezo_runner/run.py \
         --model_name $MODEL \
         --task_name $TASK \
@@ -235,10 +247,11 @@ _run_training() {
         --tag $TAG \
         --train_set_seed $SEED \
         --num_train $TRAIN \
-        --num_dev $DEV \
+        "${num_dev_args[@]}" \
         --num_eval $EVAL \
         --logging_steps $LOGGING_STEPS \
         --max_steps $STEPS \
+        "${num_epoch_args[@]}" \
         --trainer zo \
         $([ "$DTYPE" == "fp16" ] && echo "--load_float16" || [ "$DTYPE" == "bf16" ] && echo "--load_bfloat16") \
         --max_length $MAX_LENGTH \
@@ -246,7 +259,7 @@ _run_training() {
         --zo_eps $EPS \
         --per_device_train_batch_size $BS \
         --lr_scheduler_type "constant" \
-        --eval_strategy steps \
+        --eval_strategy $EVAL_STRATEGY \
         --save_strategy steps \
         --eval_steps $EVAL_STEPS \
         --save_steps $SAVE_STEPS \

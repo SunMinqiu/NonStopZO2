@@ -55,7 +55,22 @@ from transformers import TrainerCallback
 
 from ...utils.logging_controls import (
     resource_log_enabled,
+    shadow_send_time_log_enabled,
     time_log_enabled,
+    train_step_resource_log_enabled,
+)
+from ...utils.trace import (
+    configure_trace,
+    default_trace_path,
+    directory_size_bytes,
+    shm_usage_bytes,
+    start_resource_sampler,
+    stop_resource_sampler,
+    trace_begin,
+    trace_enabled,
+    trace_end,
+    trace_instant,
+    trace_span,
 )
 from .log_based_failure_injection import GPUFailureSimulator, format_gpu_fail_steps
 from .log_based_resume import load_log_based_checkpoint
@@ -220,6 +235,86 @@ class LogBasedCheckpointCallback(TrainerCallback):
         }
         self.disk_log_save_count = 0
         self.full_anchor_save_count = 0
+        self._trace_path = None
+        self._trace_run_id = None
+        self._trace_resource_process = None
+
+    def _trace_resource_counters(self):
+        if self._trace_resource_process is None:
+            self._trace_resource_process = psutil.Process(os.getpid())
+            self._trace_resource_process.cpu_percent(interval=None)
+        counters = {
+            "train_rss_mb": self._trace_resource_process.memory_info().rss / 1024**2,
+            "train_cpu_percent": self._trace_resource_process.cpu_percent(interval=None),
+            "train_num_threads": int(self._trace_resource_process.num_threads()),
+            "zo_shm_used_mb": shm_usage_bytes(self.shm_dir or _ensure_zo_shm_dir()) / 1024**2,
+            "update_history_len": len(self.update_history),
+            "active_base_step": int(self.active_base_step),
+            "shadow_applied_step": int(self.shadow_step),
+            "shadow_durable_step": int(self.shadow_step_val.value if self.shadow_step_val is not None else self.shadow_step),
+            "anchor_completed_step": int(
+                getattr(getattr(self, "_async_anchor", None) or getattr(self.trainer, "_async_anchor", None), "get_latest_completed_anchor_step", lambda: -1)()
+            ),
+        }
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            counters["gpu0_alloc_mb"] = torch.cuda.memory_allocated(0) / 1024**2
+            counters["gpu0_reserved_mb"] = torch.cuda.memory_reserved(0) / 1024**2
+            counters["gpu0_peak_mb"] = torch.cuda.max_memory_allocated(0) / 1024**2
+        return counters
+
+    def _start_trace_runtime(self):
+        if not trace_enabled():
+            return
+        trace_path = os.environ.get("ZO_TRACE_PATH")
+        if not trace_path:
+            trace_path = default_trace_path(self.output_dir)
+        run_id = os.environ.get("ZO_TRACE_RUN_ID") or hashlib.md5(
+            f"{self.output_dir}:{os.getpid()}:{time.time_ns()}".encode("utf-8")
+        ).hexdigest()[:16]
+        self._trace_path = configure_trace(
+            path=trace_path,
+            run_id=run_id,
+            process_role="train",
+        )
+        self._trace_run_id = run_id
+        trace_instant(
+            panel="gpu_train",
+            lane="meta",
+            event="trace_config",
+            extra={
+                "trace_path": self._trace_path,
+                "output_dir": self.output_dir,
+                "enable_shadow": self.enable_shadow,
+                "batch_size": self.batch_size,
+            },
+        )
+        start_resource_sampler(panel="gpu_train", provider=self._trace_resource_counters)
+
+    def _emit_train_progress_trace(self, step: int):
+        if not trace_enabled():
+            return
+        shadow_applied_step = int(self.shadow_step)
+        shadow_durable_step = int(self.shadow_step_val.value if self.shadow_step_val is not None else self.shadow_step)
+        async_anchor = getattr(self, "_async_anchor", None) or getattr(self.trainer, "_async_anchor", None)
+        anchor_completed_step = int(async_anchor.get_latest_completed_anchor_step()) if async_anchor is not None else -1
+        counters = {
+            "train_step": int(step),
+            "update_history_len": len(self.update_history),
+            "active_base_step": int(self.active_base_step),
+            "shadow_applied_step": shadow_applied_step,
+            "shadow_durable_step": shadow_durable_step,
+            "shadow_apply_backlog": int(step) - shadow_applied_step,
+            "shadow_durable_lag": int(step) - shadow_durable_step,
+            "anchor_completed_step": anchor_completed_step,
+            "anchor_lag": int(step) - anchor_completed_step if anchor_completed_step >= 0 else None,
+        }
+        trace_instant(
+            panel="gpu_train",
+            lane="counters",
+            event="train_progress",
+            step=int(step),
+            counters=counters,
+        )
 
     def _run_hash(self):
         if not self.output_dir:
@@ -273,6 +368,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
             "header_path": header_path,
             "state_meta_path": meta_paths["state_meta_path"],
             "adam_meta_path": meta_paths["adam_meta_path"],
+            "expected_generation_path": meta_paths["expected_generation_path"],
             "buffer_paths": tuple(buffer_paths),
             "has_adam": bool(adam_state is not None),
         }
@@ -623,6 +719,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
                     *self.shadow_flat_adam_v_buffer_paths,
                     meta_paths["state_meta_path"],
                     meta_paths["adam_meta_path"],
+                    meta_paths["expected_generation_path"],
                 ):
                     if path and os.path.exists(path):
                         try:
@@ -642,6 +739,15 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         if 'trainer' in kwargs:
             self.trainer = kwargs['trainer']
+
+        self._start_trace_runtime()
+        if trace_enabled():
+            trace_instant(
+                panel="gpu_train",
+                lane="framework",
+                event="train_begin",
+                step=int(state.global_step),
+            )
 
         # batch_size=-1: disabled, use default Trainer checkpoint — skip all setup
         if self.batch_size < 0:
@@ -1196,8 +1302,21 @@ class LogBasedCheckpointCallback(TrainerCallback):
         ready_timeout_s = float(os.environ.get("SHADOW_READY_TIMEOUT", "60"))
         if wait_shadow_ready:
             t_wait_ready = time.perf_counter()
+            wait_token = trace_begin(
+                panel="gpu_train",
+                lane="blocking",
+                event="wait_shadow_ready",
+                step=int(self.current_step),
+                extra={"timeout_s": ready_timeout_s},
+            )
             ready = self.shadow_ready_event.wait(timeout=ready_timeout_s)
             wait_ready_elapsed_s = time.perf_counter() - t_wait_ready
+            trace_end(
+                wait_token,
+                step=int(self.current_step),
+                counters={"wait_ms": wait_ready_elapsed_s * 1000.0},
+                extra={"ready": bool(ready)},
+            )
             if not ready:
                 alive = self.shadow_process.is_alive()
                 raise RuntimeError(
@@ -1230,97 +1349,111 @@ class LogBasedCheckpointCallback(TrainerCallback):
             wd = getattr(opt, 'weight_decay', 0)
             zo_eps = getattr(opt, 'zo_eps', 0.0)
 
-            with self.update_lock:
-                # Use current_step + 1 since this hook is called BEFORE global_step is incremented
-                actual_step = self.current_step + 1
+            hook_token = trace_begin(
+                panel="gpu_train",
+                lane="blocking",
+                event="zo_update_hook",
+                step=int(self.current_step + 1),
+            )
+            try:
+                with self.update_lock:
+                    # Use current_step + 1 since this hook is called BEFORE global_step is incremented
+                    actual_step = self.current_step + 1
 
-                # Save the pending grad (newly computed, not yet applied) for checkpoint/resume.
-                # On resume, this will be restored to opt.projected_grad so the first step applies it.
-                self._pending_grad = float(new_grad) if not isinstance(new_grad, float) else new_grad
-                # Save the seed from this step — needed by ZO2 to reconstruct last_rstate on resume.
-                self._pending_seed = int(seed) if seed is not None else 0
+                    with trace_span(
+                        panel="gpu_train",
+                        lane="blocking",
+                        event="log_send_cpu",
+                        step=int(actual_step),
+                    ):
+                        # Save the pending grad (newly computed, not yet applied) for checkpoint/resume.
+                        # On resume, this will be restored to opt.projected_grad so the first step applies it.
+                        self._pending_grad = float(new_grad) if not isinstance(new_grad, float) else new_grad
+                        # Save the seed from this step — needed by ZO2 to reconstruct last_rstate on resume.
+                        self._pending_seed = int(seed) if seed is not None else 0
 
-                # Always record entries, including grad=0 (step 0 perturbation-only).
-                # This captures fp16 rounding from the perturbation-restore cycle AND
-                # provides the seed chain needed for ZO2 replay (entry[i-1]'s seed is
-                # used for entry[i]'s gradient update).
-                update = {
-                    'step': actual_step,
-                    'seed': int(seed) if seed is not None else 0,
-                    'grad': float(applied_grad) if not isinstance(applied_grad, float) else applied_grad,
-                    'lr': float(lr),
-                    'wd': float(wd),
-                    'zo_eps': float(zo_eps),
-                }
-                self.update_history.append(update)
-                # Non-blocking send to shadow process (no lock, no GIL contention)
-                if self.update_queue is not None:
-                    try:
-                        t_shadow_send_start = time.perf_counter()
-                        self.update_queue.put_nowait({"cmd": "update", "update": update})
-                        shadow_send_s = time.perf_counter() - t_shadow_send_start
-                        self.timing_stats['shadow_send_times'].append(shadow_send_s)
-                        if time_log_enabled():
-                            logger.info(
-                                f"[ShadowSend] step={actual_step} enqueue={shadow_send_s * 1000.0:.3f}ms"
-                            )
-                    except Exception as e:
-                        if not getattr(self, '_queue_error_logged', False):
-                            logger.warning(f"[LogBased] Failed to send update to shadow: {e}")
-                            self._queue_error_logged = True
-                # Thread diagnostics
-                if _step_diag_enabled() and actual_step == 1:
-                    _thread_snapshot("Train step=1 AFTER_ZO_FORWARD", detail=True)
-                if _step_diag_enabled():
-                    _cksum = sum(p.data.float().sum().item() for p in model.parameters())
-                    logger.info(f"[CKSUM] step={actual_step} checksum={_cksum:.10e}")
-                if (_step_diag_enabled() or _step_exact_enabled()) and hasattr(model, "opt") and hasattr(model.opt, "get_adam_state"):
-                    live_adam = model.opt.get_adam_state()
+                        update = {
+                            'step': actual_step,
+                            'seed': int(seed) if seed is not None else 0,
+                            'grad': float(applied_grad) if not isinstance(applied_grad, float) else applied_grad,
+                            'lr': float(lr),
+                            'wd': float(wd),
+                            'zo_eps': float(zo_eps),
+                        }
+                        self.update_history.append(update)
+                        if self.update_queue is not None:
+                            try:
+                                t_shadow_send_start = time.perf_counter()
+                                self.update_queue.put_nowait({"cmd": "update", "update": update})
+                                shadow_send_s = time.perf_counter() - t_shadow_send_start
+                                self.timing_stats['shadow_send_times'].append(shadow_send_s)
+                                if shadow_send_time_log_enabled():
+                                    logger.info(
+                                        f"[ShadowSend] step={actual_step} enqueue={shadow_send_s * 1000.0:.3f}ms"
+                                    )
+                            except Exception as e:
+                                if not getattr(self, '_queue_error_logged', False):
+                                    logger.warning(f"[LogBased] Failed to send update to shadow: {e}")
+                                    self._queue_error_logged = True
+                    # Thread diagnostics
+                    if _step_diag_enabled() and actual_step == 1:
+                        _thread_snapshot("Train step=1 AFTER_ZO_FORWARD", detail=True)
                     if _step_diag_enabled():
-                        _log_adam_brief(f"train_live step={actual_step}", live_adam)
-                        _log_adam_checksums(f"train_live step={actual_step}", live_adam)
-                        if _step_exact_enabled():
-                            _log_adam_exact_fingerprint(f"train_live step={actual_step}", live_adam)
-                    elif _step_exact_enabled():
-                        _log_adam_exact_fingerprint(f"train_live step={actual_step}", live_adam)
-                if _step_diag_enabled():
-                    live_state = OrderedDict(
-                        (name, tensor.detach())
-                        for name, tensor in model.state_dict().items()
-                        if torch.is_tensor(tensor)
-                    )
-                    _log_state_checksums(f"train_live step={actual_step}", live_state)
-                    if _step_exact_enabled():
-                        _log_state_exact_fingerprint(f"train_live step={actual_step}", live_state)
-                if (
-                    self.enable_shadow
-                    and self.shadow_commit_interval > 0
-                    and actual_step % self.shadow_commit_interval == 0
-                ):
-                    live_state = OrderedDict(
-                        (name, tensor.detach())
-                        for name, tensor in model.state_dict().items()
-                        if torch.is_tensor(tensor)
-                    )
-                    _log_state_checksums(f"train_durable_ref step={actual_step}", live_state)
-                    _log_state_exact_fingerprint(f"train_durable_ref step={actual_step}", live_state)
-                    if hasattr(model, "opt") and hasattr(model.opt, "get_adam_state"):
+                        _cksum = sum(p.data.float().sum().item() for p in model.parameters())
+                        logger.info(f"[CKSUM] step={actual_step} checksum={_cksum:.10e}")
+                    if (_step_diag_enabled() or _step_exact_enabled()) and hasattr(model, "opt") and hasattr(model.opt, "get_adam_state"):
                         live_adam = model.opt.get_adam_state()
-                        _log_adam_checksums(f"train_durable_ref step={actual_step}", live_adam)
-                        _log_adam_exact_fingerprint(f"train_durable_ref step={actual_step}", live_adam)
-                if _step_diag_enabled() and actual_step == 1:
-                    _thread_snapshot("Train step=1 AFTER_CKSUM", detail=True)
-                if _step_diag_enabled() and (actual_step <= 20 or actual_step % 50 == 0):
-                    _thread_snapshot(f"Train step={actual_step}")
-                if _step_diag_enabled() and applied_grad != 0:
-                    logger.info(f"[HOOK] step={actual_step}, UPDATE RECORDED: seed={update['seed']}, "
-                                f"applied_grad={update['grad']:.6e}, new_grad={new_grad:.6e}, lr={lr}, wd={wd}")
-                    # Verification tag: grep "[VERIFY]" to cross-check train vs replay
-                    logger.info(f"[VERIFY] step={actual_step} total_updates={len(self.update_history)} "
-                                f"pending_grad={self._pending_grad:.6e}")
-                elif _step_diag_enabled():
-                    logger.info(f"[HOOK] step={actual_step}, PERTURBATION-ONLY (grad=0): "
-                                f"seed={update['seed']}, new_grad={new_grad:.6e} (will be applied next step)")
+                        if _step_diag_enabled():
+                            _log_adam_brief(f"train_live step={actual_step}", live_adam)
+                            _log_adam_checksums(f"train_live step={actual_step}", live_adam)
+                            if _step_exact_enabled():
+                                _log_adam_exact_fingerprint(f"train_live step={actual_step}", live_adam)
+                        elif _step_exact_enabled():
+                            _log_adam_exact_fingerprint(f"train_live step={actual_step}", live_adam)
+                    if _step_diag_enabled():
+                        live_state = OrderedDict(
+                            (name, tensor.detach())
+                            for name, tensor in model.state_dict().items()
+                            if torch.is_tensor(tensor)
+                        )
+                        _log_state_checksums(f"train_live step={actual_step}", live_state)
+                        if _step_exact_enabled():
+                            _log_state_exact_fingerprint(f"train_live step={actual_step}", live_state)
+                    if (
+                        self.enable_shadow
+                        and self.shadow_commit_interval > 0
+                        and actual_step % self.shadow_commit_interval == 0
+                    ):
+                        live_state = OrderedDict(
+                            (name, tensor.detach())
+                            for name, tensor in model.state_dict().items()
+                            if torch.is_tensor(tensor)
+                        )
+                        _log_state_checksums(f"train_durable_ref step={actual_step}", live_state)
+                        _log_state_exact_fingerprint(f"train_durable_ref step={actual_step}", live_state)
+                        if hasattr(model, "opt") and hasattr(model.opt, "get_adam_state"):
+                            live_adam = model.opt.get_adam_state()
+                            _log_adam_checksums(f"train_durable_ref step={actual_step}", live_adam)
+                            _log_adam_exact_fingerprint(f"train_durable_ref step={actual_step}", live_adam)
+                    if _step_diag_enabled() and actual_step == 1:
+                        _thread_snapshot("Train step=1 AFTER_CKSUM", detail=True)
+                    if _step_diag_enabled() and (actual_step <= 20 or actual_step % 50 == 0):
+                        _thread_snapshot(f"Train step={actual_step}")
+                    if _step_diag_enabled() and applied_grad != 0:
+                        logger.info(f"[HOOK] step={actual_step}, UPDATE RECORDED: seed={update['seed']}, "
+                                    f"applied_grad={update['grad']:.6e}, new_grad={new_grad:.6e}, lr={lr}, wd={wd}")
+                        # Verification tag: grep "[VERIFY]" to cross-check train vs replay
+                        logger.info(f"[VERIFY] step={actual_step} total_updates={len(self.update_history)} "
+                                    f"pending_grad={self._pending_grad:.6e}")
+                    elif _step_diag_enabled():
+                        logger.info(f"[HOOK] step={actual_step}, PERTURBATION-ONLY (grad=0): "
+                                    f"seed={update['seed']}, new_grad={new_grad:.6e} (will be applied next step)")
+            finally:
+                trace_end(
+                    hook_token,
+                    step=int(self.current_step + 1),
+                    counters={"update_history_len": len(self.update_history)},
+                )
 
         return model, inputs, loss
 
@@ -1342,6 +1475,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def on_step_end(self, args, state, control, **kwargs):
         """Called at end of each step"""
         self.current_step = state.global_step
+        self._emit_train_progress_trace(self.current_step)
 
         async_anchor = getattr(self, "_async_anchor", None) or getattr(self.trainer, "_async_anchor", None)
         if async_anchor is not None:
@@ -1371,7 +1505,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         if self.current_step % 10 == 0:
             num_updates = len(self.update_history)
-            if resource_log_enabled():
+            if train_step_resource_log_enabled():
                 cpu_pct, mem_gb, mem_total, gpu_alloc, gpu_rsv = _system_stats()
                 if self.enable_shadow:
                     shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
@@ -1392,6 +1526,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def recover_from_shadow(self) -> OrderedDict:
         """Recover from the latest committed shadow replica in the configured tmpfs directory."""
         t_start = time.time()
+        recover_token = trace_begin(
+            panel="gpu_train",
+            lane="blocking",
+            event="recover_shadow",
+            step=int(self.current_step),
+        )
 
         if self.enable_shadow and self._shadow_storage_available():
             try:
@@ -1430,9 +1570,20 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 'shadow_step': shadow_step,
                 'gpu_step': self.current_step
             })
+            trace_end(
+                recover_token,
+                step=int(self.current_step),
+                counters={"shadow_step": int(shadow_step), "gpu_step": int(self.current_step)},
+                extra={"source": "shadow"},
+            )
 
             return recovered
         else:
+            trace_end(
+                recover_token,
+                step=int(self.current_step),
+                extra={"source": "on_demand"},
+            )
             return self._reconstruct_on_demand()
 
     def _reconstruct_on_demand(self) -> OrderedDict:
@@ -1475,14 +1626,22 @@ class LogBasedCheckpointCallback(TrainerCallback):
             zo2_mode = hasattr(self.trainer.model.opt, 'rstate_queue')
 
         # Replay all updates using only trainable param names (matching zo_update iteration)
-        _replay_updates_on_state(
-            reconstructed, updates,
-            trainable_param_names=self._trainable_param_names,
-            default_zo_eps=fallback_zo_eps,
-            rng_device=rng_device,
-            zo2_mode=zo2_mode,
-            initial_prev_seed=self._active_base_pending_seed,
-        )
+        with trace_span(
+            panel="gpu_train",
+            lane="blocking",
+            event="replay_updates",
+            step=int(base_step),
+            counters={"num_updates": num_updates},
+            extra={"source": "on_demand"},
+        ):
+            _replay_updates_on_state(
+                reconstructed, updates,
+                trainable_param_names=self._trainable_param_names,
+                default_zo_eps=fallback_zo_eps,
+                rng_device=rng_device,
+                zo2_mode=zo2_mode,
+                initial_prev_seed=self._active_base_pending_seed,
+            )
         if num_updates > 0 and time_log_enabled():
             logger.info(f"[Recovery] Replayed {num_updates} updates")
 
@@ -1553,6 +1712,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
         """Update base_checkpoint_state from current model (full step only for batch_size>=1).
         GPU → CPU clone, then publish anchor latest / notify shadow to rebase."""
         self._check_anchor_publisher_health()
+        trace_token = trace_begin(
+            panel="gpu_train",
+            lane="blocking",
+            event="full_checkpoint_refresh",
+            step=int(step),
+        )
         t0_total = time.time()
         t0 = time.time()
         base_checkpoint_state = _clone_state_dict_to_cpu(model.state_dict())
@@ -1609,6 +1774,17 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 f"publish_anchor={publish_anchor_s:.3f}s queue_rebase={queue_rebase_s:.3f}s "
                 f"total={time.time() - t0_total:.3f}s"
             )
+        trace_end(
+            trace_token,
+            step=int(step),
+            counters={
+                "clone_model_ms": clone_model_s * 1000.0,
+                "clone_adam_ms": clone_adam_s * 1000.0,
+                "submit_anchor_ms": submit_anchor_s * 1000.0,
+                "publish_anchor_ms": publish_anchor_s * 1000.0,
+                "queue_rebase_ms": queue_rebase_s * 1000.0,
+            },
+        )
         if _step_diag_enabled() or _step_exact_enabled():
             if live_adam_state is not None:
                 _log_adam_checksums(f"train_snapshot step={step}", live_adam_state)
@@ -1666,6 +1842,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         """Called at training end"""
         logger.info("[LogBased] Training ended, cleaning up...")
+        cleanup_token = trace_begin(
+            panel="gpu_train",
+            lane="blocking",
+            event="train_end_cleanup",
+            step=int(state.global_step),
+        )
 
         # Shutdown async anchor checkpointer (wait for last persist to finish)
         async_anchor = getattr(self, '_async_anchor', None)
@@ -1720,6 +1902,19 @@ class LogBasedCheckpointCallback(TrainerCallback):
 
         status = self.get_recovery_status()
         logger.info(f"[LogBased] Final status: {status}")
+        trace_instant(
+            panel="gpu_train",
+            lane="framework",
+            event="train_end",
+            step=int(state.global_step),
+            counters={
+                "final_step": int(state.global_step),
+                "update_history_len": len(self.update_history),
+            },
+            extra={"status": status},
+        )
+        trace_end(cleanup_token, step=int(state.global_step))
+        stop_resource_sampler()
 
         if self.base_checkpoint_state:
             del self.base_checkpoint_state
@@ -1734,6 +1929,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
             meta_paths = _shadow_flat_meta_paths(self.shadow_flat_header_path)
             cleanup_paths.append(meta_paths["state_meta_path"])
             cleanup_paths.append(meta_paths["adam_meta_path"])
+            cleanup_paths.append(meta_paths["expected_generation_path"])
 
         if self.rebase_payload_dir:
             for payload_path in list(self._staged_rebase_payloads):

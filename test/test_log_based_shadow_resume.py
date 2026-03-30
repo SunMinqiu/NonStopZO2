@@ -23,7 +23,9 @@ from zo2.trainer.hf_transformers.log_based_shadow import (
     _load_shadow_replica,
     _open_shadow_bundle_flat_writer,
     _read_shadow_flat_header,
+    _reserve_shadow_epoch,
     _replay_retained_suffix,
+    _shadow_flat_meta_paths,
 )
 
 
@@ -87,10 +89,14 @@ class DummyAsyncAnchor:
 def _make_adam_flat_storage(tmp_path, state_dict, trainable_param_names, has_adam=True):
     header_path = tmp_path / "shadow.flat.header.json"
     stem = str(header_path).removesuffix(".header.json")
+    meta_paths = _shadow_flat_meta_paths(str(header_path))
     storage = {
         "enabled": True,
         "layout": _build_shadow_flat_layout(state_dict),
         "header_path": str(header_path),
+        "state_meta_path": meta_paths["state_meta_path"],
+        "adam_meta_path": meta_paths["adam_meta_path"],
+        "expected_generation_path": meta_paths["expected_generation_path"],
         "buffer_paths": (f"{stem}.bin",),
         "has_adam": bool(has_adam),
     }
@@ -185,6 +191,7 @@ def test_shadow_bundle_flat_round_trip_preserves_adam_state_and_header(tmp_path)
     assert header["committed_step"] == 8
     assert header["has_adam"] is True
     assert header["adam_t"] == 8
+    assert header["integrity_mode"] == "header_only"
 
     loaded_state, loaded_adam, base_step, committed_step = _load_shadow_bundle_flat(flat_storage)
     assert base_step == 7
@@ -193,6 +200,68 @@ def test_shadow_bundle_flat_round_trip_preserves_adam_state_and_header(tmp_path)
     assert torch.equal(loaded_adam["m"]["w"], next_adam["m"]["w"])
     assert torch.equal(loaded_adam["v"]["w"], next_adam["v"]["w"])
     assert loaded_adam["t"] == 8
+
+
+def test_shadow_bundle_flat_rebase_epoch_forces_full_sha256_then_loader_rejects_stale_generation(tmp_path):
+    state_dict = OrderedDict([("w", torch.arange(4, dtype=torch.float32).view(2, 2))])
+    flat_storage = _make_adam_flat_storage(tmp_path, state_dict, ["w"], has_adam=False)
+
+    _init_shadow_bundle_flat_storage(
+        state_dict,
+        flat_storage,
+        base_step=1,
+        committed_step=1,
+        adam_state=None,
+    )
+
+    writer = _open_shadow_bundle_flat_writer(flat_storage)
+    try:
+        next_generation = _reserve_shadow_epoch(writer, reason="rebase")
+        assert next_generation == 2
+    finally:
+        _close_shadow_bundle_flat_writer(writer)
+
+    try:
+        _load_shadow_bundle_flat(flat_storage)
+    except RuntimeError as e:
+        assert "stale or mismatched generation" in str(e)
+    else:
+        raise AssertionError("expected stale generation to be rejected after rebase epoch is reserved")
+
+
+def test_shadow_bundle_flat_first_commit_after_rebase_uses_full_sha256(tmp_path):
+    state_dict = OrderedDict([("w", torch.arange(4, dtype=torch.float32).view(2, 2))])
+    flat_storage = _make_adam_flat_storage(tmp_path, state_dict, ["w"], has_adam=False)
+
+    _init_shadow_bundle_flat_storage(
+        state_dict,
+        flat_storage,
+        base_step=1,
+        committed_step=1,
+        adam_state=None,
+    )
+
+    writer = _open_shadow_bundle_flat_writer(flat_storage)
+    try:
+        _reserve_shadow_epoch(writer, reason="rebase")
+        next_state = OrderedDict((name, tensor.clone().add_(1.0)) for name, tensor in state_dict.items())
+        _commit_shadow_bundle_flat(
+            next_state,
+            adam_state=None,
+            flat_writer=writer,
+            base_step=2,
+            committed_step=2,
+        )
+    finally:
+        _close_shadow_bundle_flat_writer(writer)
+
+    header = _read_shadow_flat_header(flat_storage["header_path"])
+    state_meta = _read_shadow_flat_header(flat_storage["state_meta_path"])
+    generation_meta = _read_shadow_flat_header(flat_storage["expected_generation_path"])
+    assert header["generation"] == 2
+    assert header["integrity_mode"] == "full_sha256"
+    assert "state_sha256" in state_meta
+    assert generation_meta["expected_generation"] == 2
 
 
 def test_shadow_bundle_flat_load_fails_when_snapshot_not_ready(tmp_path):

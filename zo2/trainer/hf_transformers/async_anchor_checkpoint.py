@@ -31,6 +31,7 @@ import torch
 
 from .log_based_utils import _atomic_save_state_dict_safetensors, _ensure_zo_shm_dir
 from ...utils.logging_controls import resource_log_enabled, time_log_enabled
+from ...utils.trace import directory_size_bytes, trace_begin, trace_end, trace_end_external, trace_instant
 
 logger = logging.getLogger(__name__)
 ADAM_STATE_NAME = "adam_state.pt"
@@ -67,6 +68,8 @@ class _PersistJob:
         'uses_cuda',
         'd2h_fallback_s',
         'adam_state',
+        'd2h_trace_id',
+        'd2h_started_ns',
     ]
 
     def __init__(
@@ -78,6 +81,8 @@ class _PersistJob:
         uses_cuda,
         d2h_fallback_s=0.0,
         adam_state=None,
+        d2h_trace_id=None,
+        d2h_started_ns=None,
     ):
         self.step = step
         self.output_dir = output_dir
@@ -86,6 +91,8 @@ class _PersistJob:
         self.uses_cuda = uses_cuda
         self.d2h_fallback_s = d2h_fallback_s
         self.adam_state = adam_state
+        self.d2h_trace_id = d2h_trace_id
+        self.d2h_started_ns = d2h_started_ns
 
 
 class AsyncAnchorCheckpointer:
@@ -188,14 +195,30 @@ class AsyncAnchorCheckpointer:
         """
         t_lock_start = time.time()
         # Ensure previous persist is done before starting a new one
+        persist_wait_token = trace_begin(
+            panel="gpu_train",
+            lane="blocking",
+            event="wait_anchor_persist",
+            step=int(step),
+        )
         self._persist_done.wait()
+        trace_end(persist_wait_token, step=int(step))
         with self._buffer_cond:
+            buffer_wait_token = None
             while not self._buffer_free:
+                if buffer_wait_token is None:
+                    buffer_wait_token = trace_begin(
+                        panel="gpu_train",
+                        lane="blocking",
+                        event="wait_anchor_buffer",
+                        step=int(step),
+                    )
                 if time_log_enabled():
                     logger.info(
                         f"[AsyncAnchor] Waiting for buffer at step {step}..."
                     )
                 self._buffer_cond.wait()
+            trace_end(buffer_wait_token, step=int(step))
             self._buffer_free = False
         t_lock = time.time() - t_lock_start
 
@@ -207,6 +230,12 @@ class AsyncAnchorCheckpointer:
 
         # Phase 1: async copy on dedicated CUDA stream
         t_copy_start = time.time()
+        d2h_token = trace_begin(
+            panel="gpu_train",
+            lane="anchor_thread",
+            event="anchor_d2h_copy",
+            step=int(step),
+        )
         has_cuda = any(t.is_cuda for t in state_dict.values())
         if has_cuda:
             copy_start_event = torch.cuda.Event(enable_timing=True)
@@ -257,11 +286,27 @@ class AsyncAnchorCheckpointer:
                 uses_cuda=has_cuda,
                 d2h_fallback_s=t_copy,
                 adam_state=adam_state,
+                d2h_trace_id=d2h_token.event_id if d2h_token is not None else None,
+                d2h_started_ns=d2h_token.started_ns if d2h_token is not None else None,
             )
         )
         self._anchors_saved += 1
         t_total = time.time() - t_lock_start
         self._enqueue_times.append(t_total)
+        trace_instant(
+            panel="gpu_train",
+            lane="anchor_thread",
+            event="anchor_enqueue",
+            step=int(step),
+            triggered_by=d2h_token.event_id if d2h_token is not None else None,
+            counters={
+                "enqueue_cpu_ms": t_total * 1000.0,
+                "wait_ms": t_lock * 1000.0,
+                "state_dict_ms": t_sd * 1000.0,
+                "launch_ms": t_copy * 1000.0,
+                "pinned_buffer_mb": sum(t.numel() * t.element_size() for t in self._pinned_buffer.values()) / 1024**2,
+            },
+        )
 
         if time_log_enabled():
             logger.info(
@@ -364,6 +409,16 @@ class AsyncAnchorCheckpointer:
                 d2h_s = job.copy_start_event.elapsed_time(job.copy_done_event) / 1000.0
             else:
                 d2h_s = job.d2h_fallback_s
+            if job.d2h_trace_id is not None:
+                trace_end_external(
+                    event_id=job.d2h_trace_id,
+                    panel="gpu_train",
+                    lane="anchor_thread",
+                    event="anchor_d2h_copy",
+                    started_ns=job.d2h_started_ns,
+                    step=int(job.step),
+                    counters={"d2h_ms": d2h_s * 1000.0},
+                )
             cpu_ready_t0 = time.time()
 
             # Phase 2a: Clone pinned buffer → regular CPU memory.
@@ -374,6 +429,13 @@ class AsyncAnchorCheckpointer:
                 self._buffer_free = True
                 self._buffer_cond.notify()
 
+            publish_token = trace_begin(
+                panel="gpu_train",
+                lane="anchor_thread",
+                event="anchor_publish_latest",
+                step=int(job.step),
+                triggered_by=job.d2h_trace_id,
+            )
             _atomic_save_state_dict_safetensors(
                 snapshot,
                 self._anchor_latest_path,
@@ -382,6 +444,7 @@ class AsyncAnchorCheckpointer:
                     "committed_step": int(job.step),
                 },
             )
+            trace_end(publish_token, step=int(job.step))
             with self._lock:
                 if job.step > self._latest_published_step:
                     self._latest_published_step = job.step
@@ -394,6 +457,13 @@ class AsyncAnchorCheckpointer:
 
             self._persist_done.clear()  # Mark persist as in-progress
             t0 = time.time()
+            persist_token = trace_begin(
+                panel="gpu_train",
+                lane="anchor_thread",
+                event="anchor_persist",
+                step=int(job.step),
+                triggered_by=job.d2h_trace_id,
+            )
             pid = os.fork()
             if pid == 0:
                 _subprocess_write_checkpoint(snapshot, save_path, job.step)
@@ -425,6 +495,16 @@ class AsyncAnchorCheckpointer:
                     if job.step > self._latest_completed_step:
                         self._latest_completed_step = job.step
                         self._latest_completed_path = job.output_dir
+                trace_end(
+                    persist_token,
+                    step=int(job.step),
+                    counters={
+                        "d2h_ms": d2h_s * 1000.0,
+                        "cpu_total_ms": cpu_total_s * 1000.0,
+                        "output_ckpt_used_mb": directory_size_bytes(job.output_dir) / 1024**2,
+                    },
+                    extra={"save_path": save_path},
+                )
                 if time_log_enabled():
                     logger.info(
                         f"[AsyncAnchor] Persisted step {job.step} "
@@ -445,6 +525,15 @@ class AsyncAnchorCheckpointer:
                         f"{os.WEXITSTATUS(status) if os.WIFEXITED(status) else '?'} "
                         f"for step {job.step}"
                     )
+                trace_end(
+                    persist_token,
+                    step=int(job.step),
+                    counters={
+                        "d2h_ms": d2h_s * 1000.0,
+                        "cpu_total_ms": cpu_total_s * 1000.0,
+                    },
+                    extra={"child_ok": False},
+                )
             self._d2h_times.append(d2h_s)
             self._cpu_persist_total_times.append(cpu_total_s)
             self._persist_done.set()  # Allow next checkpoint

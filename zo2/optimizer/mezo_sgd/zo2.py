@@ -13,7 +13,7 @@ import logging
 from .zo import MeZOSGD
 from ...config.mezo_sgd import MeZOSGDConfig
 from .utils import *
-from ...utils.logging_controls import consistency_log_enabled
+from ...utils.logging_controls import opt_step_log_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +197,7 @@ class MeZO2SGD(MeZOSGD):
         loss1, loss2 = self.inner_zo_forward(*args, **kwargs)
         torch.cuda.synchronize()    # global sync to make sure all tasks finish
         self.projected_grad = self.compute_grad(loss1, loss2)
-        if consistency_log_enabled():
+        if opt_step_log_enabled():
             logger.info(
                 f"[OPT] seed={self.zo_random_seed}, "
                 f"applied_grad={self._applied_update_grad}, new_grad={self.projected_grad}"

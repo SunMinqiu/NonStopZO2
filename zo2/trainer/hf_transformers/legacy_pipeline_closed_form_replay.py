@@ -16,7 +16,7 @@ from collections import OrderedDict
 import psutil
 import torch
 
-from ...utils.logging_controls import resource_log_enabled, time_log_enabled
+from ...utils.logging_controls import replay_step_time_log_enabled, resource_log_enabled, time_log_enabled
 from .log_based_utils import _log_memory
 
 logger = logging.getLogger(__name__)
@@ -81,11 +81,11 @@ def _pipelined_replay_cpu(state, updates, param_names, rng_device,
         buffer[slot] = None
         free[slot].set()
 
-        if time_log_enabled() and (step < 3 or step == n - 1):
+        if replay_step_time_log_enabled() and (step < 3 or step == n - 1):
             logger.info(f"[PipelinedReplay] update {step}: step={updates[step].get('step','?')}, "
                         f"seed={updates[step]['seed']}, grad={updates[step]['grad']:.6e}, "
                         f"lr={updates[step]['lr']}, wd={updates[step].get('wd', 0.0)}")
-        elif time_log_enabled() and step == 3:
+        elif replay_step_time_log_enabled() and step == 3:
             logger.info(f"[PipelinedReplay] ... ({n - 4} more updates) ...")
 
     for t in threads:
@@ -149,11 +149,11 @@ def _pipelined_replay_gpu(state, updates, param_names, rng_device,
         else:
             buffer[slot] = None
 
-        if time_log_enabled() and (step < 3 or step == n - 1):
+        if replay_step_time_log_enabled() and (step < 3 or step == n - 1):
             logger.info(f"[PipelinedReplay] update {step}: step={updates[step].get('step','?')}, "
                         f"seed={updates[step]['seed']}, grad={updates[step]['grad']:.6e}, "
                         f"lr={updates[step]['lr']}, wd={updates[step].get('wd', 0.0)}")
-        elif time_log_enabled() and step == 3:
+        elif replay_step_time_log_enabled() and step == 3:
             logger.info(f"[PipelinedReplay] ... ({n - 4} more updates) ...")
 
     torch.cuda.synchronize()

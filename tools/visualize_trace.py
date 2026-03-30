@@ -1,0 +1,971 @@
+#!/usr/bin/env python3
+import argparse
+from collections import defaultdict
+import json
+from pathlib import Path
+import statistics
+
+
+_GB_KEYS = {
+    "train_rss_mb",
+    "shadow_rss_mb",
+    "gpu0_alloc_mb",
+    "gpu0_reserved_mb",
+    "gpu0_peak_mb",
+    "zo_shm_used_mb",
+}
+
+_DISPLAY_NAMES = {
+    "train_cpu_percent": "train_cpu_percent",
+    "train_rss_mb": "train_rss_gb",
+    "shadow_cpu_percent": "shadow_cpu_percent",
+    "shadow_rss_mb": "shadow_rss_gb",
+    "gpu0_alloc_mb": "gpu_alloc_gb",
+    "gpu0_reserved_mb": "gpu_reserved_gb",
+    "gpu0_peak_mb": "gpu_peak_gb",
+    "zo_shm_used_mb": "dram_gb",
+    "shadow_apply_backlog": "shadow_apply_backlog",
+    "shadow_durable_lag": "shadow_durable_lag",
+    "anchor_lag": "anchor_lag",
+    "update_history_len": "update_history_len",
+}
+
+_TIMELINE_VISIBLE = {
+    "framework_overhead",
+    "train_step",
+    "checkpoint_d2h_copy",
+    "checkpoint_cpu_serialize",
+    "checkpoint_rng_save",
+    "checkpoint_disk_persist",
+    "checkpoint_model_persist",
+    "checkpoint_save",
+    "wait_shadow_ready",
+    "wait_anchor_persist",
+    "wait_anchor_buffer",
+    "recover_shadow",
+    "replay_updates",
+    "full_checkpoint_refresh",
+    "train_end_cleanup",
+    "resume_begin",
+    "resume_end",
+    "shadow_boot",
+    "shadow_wait_update",
+    "shadow_apply",
+    "shadow_commit",
+    "shadow_rebase",
+    "shadow_stop",
+    "anchor_d2h_copy",
+    "anchor_publish_latest",
+    "anchor_persist",
+}
+
+_TOPLEVEL_TIMELINE_EVENTS = {
+    "framework_overhead",
+    "train_step",
+    "wait_shadow_ready",
+    "wait_anchor_persist",
+    "wait_anchor_buffer",
+    "recover_shadow",
+    "replay_updates",
+    "full_checkpoint_refresh",
+    "train_end_cleanup",
+    "resume_begin",
+    "resume_end",
+    "shadow_boot",
+    "shadow_wait_update",
+    "shadow_apply",
+    "shadow_commit",
+    "shadow_rebase",
+    "shadow_stop",
+}
+
+_SHADOW_BLOCK_EVENTS = {
+    "wait_shadow_ready",
+    "wait_anchor_persist",
+    "wait_anchor_buffer",
+    "recover_shadow",
+    "replay_updates",
+    "full_checkpoint_refresh",
+    "resume_begin",
+    "resume_end",
+}
+
+
+def _format_scalar(name, value):
+    if name == "learning_rate":
+        return f"{value:.3e}"
+    return f"{value:.6f}"
+
+
+def _percentile(values, pct):
+    if not values:
+        return None
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * pct
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return ordered[lo] * (1.0 - frac) + ordered[hi] * frac
+
+
+def load_records(path):
+    path = Path(path)
+    records = []
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            records.append(json.loads(line))
+    records.sort(key=lambda item: (item.get("wall_time_ns", 0), item.get("phase", "")))
+    return records
+
+
+def build_spans(records):
+    open_tokens = {}
+    spans = []
+    instants = []
+    for record in records:
+        phase = record.get("phase")
+        event_id = record.get("event_id")
+        if phase == "B":
+            open_tokens[event_id] = record
+        elif phase == "E":
+            begin = open_tokens.pop(event_id, None)
+            if begin is None:
+                continue
+            spans.append(
+                {
+                    "panel": record["panel"],
+                    "lane": record["lane"],
+                    "event": record["event"],
+                    "start_ns": begin["wall_time_ns"],
+                    "end_ns": record["wall_time_ns"],
+                    "duration_ms": record.get("duration_ms"),
+                    "step": record.get("step"),
+                    "pid": record.get("pid"),
+                    "tid": record.get("tid"),
+                    "triggered_by": begin.get("triggered_by"),
+                }
+            )
+        elif phase == "I":
+            instants.append(record)
+    return spans, instants
+
+
+def load_trace(path):
+    records = load_records(path)
+    spans, instants = build_spans(records)
+    return {
+        "path": str(Path(path).resolve()),
+        "records": records,
+        "spans": spans,
+        "instants": instants,
+    }
+
+
+def _ns_to_s(ns, origin_ns):
+    return (ns - origin_ns) / 1_000_000_000.0
+
+
+def _origin_ns(records, spans, instants):
+    all_times = [item["wall_time_ns"] for item in records]
+    for span in spans:
+        all_times.extend([span["start_ns"], span["end_ns"]])
+    for instant in instants:
+        all_times.append(instant["wall_time_ns"])
+    if not all_times:
+        raise RuntimeError("trace has no events to plot")
+    return min(all_times)
+
+
+def _extract_series(records, event_name, key, panel=None):
+    xs = []
+    ys = []
+    for record in records:
+        if record.get("phase") != "I":
+            continue
+        if record.get("event") != event_name:
+            continue
+        if panel is not None and record.get("panel") != panel:
+            continue
+        counters = record.get("counters") or {}
+        if key not in counters or counters[key] is None:
+            continue
+        xs.append(record["wall_time_ns"])
+        ys.append(counters[key])
+    return xs, ys
+
+
+def _extract_series_any(records, event_name, keys, panel=None):
+    xs = []
+    ys = []
+    matched_key = None
+    for key in keys:
+        xs, ys = _extract_series(records, event_name, key, panel=panel)
+        if xs:
+            matched_key = key
+            break
+    return xs, ys, matched_key
+
+
+def _to_display_unit(label, values):
+    if label in _GB_KEYS:
+        return [value / 1024.0 for value in values]
+    return values
+
+
+def _extract_step_series(records, event_name, key, panel=None):
+    xs = []
+    ys = []
+    for record in records:
+        if record.get("phase") != "I":
+            continue
+        if record.get("event") != event_name:
+            continue
+        if panel is not None and record.get("panel") != panel:
+            continue
+        step = record.get("step")
+        counters = record.get("counters") or {}
+        value = counters.get(key)
+        if step is None or value is None:
+            continue
+        xs.append(step)
+        ys.append(value)
+    return xs, ys
+
+
+def _group_span_durations_by_event(spans):
+    grouped = defaultdict(list)
+    for span in spans:
+        duration_ms = span.get("duration_ms")
+        if duration_ms is None:
+            duration_ms = (span["end_ns"] - span["start_ns"]) / 1_000_000.0
+        grouped[span["event"]].append(float(duration_ms))
+    return grouped
+
+
+def _collect_event_samples(grouped, event_names):
+    samples = []
+    for event_name in event_names:
+        samples.extend(grouped.get(event_name, []))
+    return samples
+
+
+def _extract_instant_counter(records, event_name, key, panel=None, extra_key=None, extra_value=None):
+    values = []
+    for record in records:
+        if record.get("phase") != "I":
+            continue
+        if record.get("event") != event_name:
+            continue
+        if panel is not None and record.get("panel") != panel:
+            continue
+        if extra_key is not None:
+            extra = record.get("extra") or {}
+            if extra.get(extra_key) != extra_value:
+                continue
+        counters = record.get("counters") or {}
+        value = counters.get(key)
+        if value is None:
+            continue
+        values.append(float(value))
+    return values
+
+
+def _stat_block(samples):
+    if not samples:
+        return None
+    return {
+        "count": len(samples),
+        "total_ms": float(sum(samples)),
+        "avg_ms": float(statistics.mean(samples)),
+        "p50_ms": float(_percentile(samples, 0.50)),
+        "p95_ms": float(_percentile(samples, 0.95)),
+        "max_ms": float(max(samples)),
+    }
+
+
+def _derive_replay_steady(samples):
+    if not samples:
+        return None
+    if len(samples) == 1:
+        steady = float(samples[0])
+        cold = 0.0
+    else:
+        tail = [float(v) for v in samples[1:]]
+        steady = float(statistics.mean(tail))
+        cold = max(0.0, float(samples[0]) - steady)
+    result = _stat_block(samples)
+    result["steady_avg_ms"] = steady
+    result["cold_start_ms"] = cold
+    return result
+
+
+def summarize_trace(trace_or_records, spans=None, instants=None):
+    if isinstance(trace_or_records, dict):
+        records = trace_or_records["records"]
+        spans = trace_or_records["spans"]
+        instants = trace_or_records["instants"]
+    else:
+        records = trace_or_records
+        if spans is None or instants is None:
+            spans, instants = build_spans(records)
+
+    origin_ns = _origin_ns(records, spans, instants)
+    end_ns = max(
+        [item["wall_time_ns"] for item in records] +
+        [item["end_ns"] for item in spans] +
+        [item["wall_time_ns"] for item in instants]
+    )
+    total_wall_s = (end_ns - origin_ns) / 1_000_000_000.0
+
+    span_groups = defaultdict(list)
+    panel_totals = defaultdict(float)
+    lane_totals = defaultdict(float)
+    for span in spans:
+        duration_ms = span.get("duration_ms")
+        if duration_ms is None:
+            duration_ms = (span["end_ns"] - span["start_ns"]) / 1_000_000.0
+        key = (span["panel"], span["lane"], span["event"])
+        span_groups[key].append(float(duration_ms))
+        panel_totals[span["panel"]] += float(duration_ms)
+        lane_totals[(span["panel"], span["lane"])] += float(duration_ms)
+    span_by_event = _group_span_durations_by_event(spans)
+
+    span_summary = []
+    total_wall_ms = total_wall_s * 1000.0
+    for (panel, lane, event), durations in sorted(span_groups.items()):
+        total_ms = sum(durations)
+        span_summary.append(
+            {
+                "panel": panel,
+                "lane": lane,
+                "event": event,
+                "count": len(durations),
+                "total_ms": total_ms,
+                "avg_ms": statistics.mean(durations),
+                "p50_ms": _percentile(durations, 0.50),
+                "p95_ms": _percentile(durations, 0.95),
+                "max_ms": max(durations),
+                "share_pct": (100.0 * total_ms / total_wall_ms) if total_wall_ms > 0 else 0.0,
+            }
+        )
+
+    resource_specs = {
+        "train_cpu_percent": ("resource_sample", ["train_cpu_percent"], "gpu_train"),
+        "train_rss_mb": ("resource_sample", ["train_rss_mb"], "gpu_train"),
+        "shadow_cpu_percent": ("resource_sample", ["shadow_cpu_percent"], "cpu_shadow"),
+        "shadow_rss_mb": ("resource_sample", ["shadow_rss_mb"], "cpu_shadow"),
+        "gpu0_alloc_mb": ("resource_sample", ["gpu0_alloc_mb", "gpu_alloc_mb"], "gpu_train"),
+        "gpu0_reserved_mb": ("resource_sample", ["gpu0_reserved_mb", "gpu_reserved_mb"], "gpu_train"),
+        "gpu0_peak_mb": ("resource_sample", ["gpu0_peak_mb", "gpu_peak_mb"], "gpu_train"),
+        "zo_shm_used_mb": ("resource_sample", ["zo_shm_used_mb"], None),
+        "shadow_apply_backlog": ("train_progress", ["shadow_apply_backlog"], "gpu_train"),
+        "shadow_durable_lag": ("train_progress", ["shadow_durable_lag"], "gpu_train"),
+        "anchor_lag": ("train_progress", ["anchor_lag"], "gpu_train"),
+        "update_history_len": ("train_progress", ["update_history_len"], "gpu_train"),
+    }
+    resource_summary = {}
+    missing = []
+    for label, (event_name, keys, panel) in resource_specs.items():
+        xs, ys, matched_key = _extract_series_any(records, event_name, keys, panel=panel)
+        if not xs:
+            missing.append(label)
+            continue
+        display_ys = _to_display_unit(label, ys)
+        resource_summary[label] = {
+            "display_name": _DISPLAY_NAMES.get(label, label),
+            "source_key": matched_key,
+            "samples": len(display_ys),
+            "avg": statistics.mean(display_ys),
+            "p50": _percentile(display_ys, 0.50),
+            "p95": _percentile(display_ys, 0.95),
+            "max": max(display_ys),
+            "min": min(display_ys),
+            "unit": "GB" if label in _GB_KEYS else "",
+        }
+
+    scalar_specs = {
+        "loss": ("train_scalar", "loss", "gpu_train"),
+    }
+    scalar_summary = {}
+    last_scalars = {}
+    for label, (event_name, key, panel) in scalar_specs.items():
+        xs, ys = _extract_step_series(records, event_name, key, panel=panel)
+        if not xs:
+            continue
+        scalar_summary[label] = {
+            "samples": len(ys),
+            "avg": statistics.mean(ys),
+            "p50": _percentile(ys, 0.50),
+            "p95": _percentile(ys, 0.95),
+            "max": max(ys),
+            "min": min(ys),
+        }
+        last_scalars[label] = {
+            "step": xs[-1],
+            "value": ys[-1],
+        }
+
+    replay_cuda = _extract_instant_counter(records, "replay_step", "replay_total_ms", panel="gpu_train", extra_key="device", extra_value="cuda")
+    replay_cpu = _extract_instant_counter(records, "replay_step", "replay_total_ms", panel="gpu_train", extra_key="device", extra_value="cpu")
+    first_step_latency = _extract_instant_counter(records, "first_step_latency", "program_to_first_step_ms", panel="gpu_train")
+    recovery_load_shadow = _extract_instant_counter(records, "recovery_load", "load_cpu_to_gpu_ms", panel="gpu_train", extra_key="source", extra_value="shadow")
+
+    replay_cuda_stats = _derive_replay_steady(replay_cuda)
+    replay_cpu_stats = _derive_replay_steady(replay_cpu)
+    replay_cold_ms = 0.0
+    if replay_cuda_stats is not None:
+        replay_cold_ms = replay_cuda_stats["cold_start_ms"]
+    elif replay_cpu_stats is not None:
+        replay_cold_ms = replay_cpu_stats["cold_start_ms"]
+
+    checkpoint_total_ms = float(sum(span_by_event.get("checkpoint_save", [])))
+    framework_overhead_total_ms = float(sum(span_by_event.get("framework_overhead", [])))
+    train_step_total_ms = float(sum(span_by_event.get("train_step", [])))
+    shadow_block_total_ms = float(sum(sum(span_by_event.get(event, [])) for event in _SHADOW_BLOCK_EVENTS))
+    train_step_count = len(span_by_event.get("train_step", []))
+    derived_t_step_total_ms = max(0.0, total_wall_ms - checkpoint_total_ms - shadow_block_total_ms)
+
+    checkpoint_d2h_samples = _collect_event_samples(
+        span_by_event,
+        [
+            "anchor_d2h_copy",
+            "checkpoint_d2h_copy",
+        ],
+    )
+    checkpoint_persist_samples = _collect_event_samples(
+        span_by_event,
+        [
+            "anchor_persist",
+            "checkpoint_model_persist",
+            "checkpoint_disk_persist",
+            "checkpoint_rng_save",
+        ],
+    )
+
+    named_time_metrics = {
+        "checkpoint_total": {**(_stat_block(span_by_event.get("checkpoint_save", [])) or {}), "status": "exact"} if span_by_event.get("checkpoint_save") else None,
+        "t_step": {
+            "count": train_step_count,
+            "total_ms": derived_t_step_total_ms,
+            "avg_ms": (derived_t_step_total_ms / train_step_count) if train_step_count > 0 else 0.0,
+            "status": "derived",
+        } if train_step_count > 0 else None,
+        "t_l": {**(_stat_block(span_by_event.get("log_send_cpu", [])) or {}), "status": "exact"} if span_by_event.get("log_send_cpu") else None,
+        "t_d2h": {
+            **(_stat_block(checkpoint_d2h_samples) or {}),
+            "status": "exact",
+        } if checkpoint_d2h_samples else None,
+        "t_persist": {
+            **(_stat_block(checkpoint_persist_samples) or {}),
+            "status": "exact",
+        } if checkpoint_persist_samples else None,
+        "t_cp": {**(_stat_block(span_by_event.get("shadow_commit", [])) or {}), "status": "exact"} if span_by_event.get("shadow_commit") else None,
+        "t_r": {**replay_cuda_stats, "status": "derived"} if replay_cuda_stats is not None else None,
+        "t_rc": {**replay_cpu_stats, "status": "derived"} if replay_cpu_stats is not None else None,
+        "L_disk": {
+            "count": len(first_step_latency),
+            "total_ms": float(sum(first_step_latency)),
+            "avg_ms": float(statistics.mean(first_step_latency)),
+            "p50_ms": float(_percentile(first_step_latency, 0.50)),
+            "p95_ms": float(_percentile(first_step_latency, 0.95)),
+            "max_ms": float(max(first_step_latency)),
+            "status": "exact",
+        } if first_step_latency else None,
+        "L_cpu": {
+            "count": len(recovery_load_shadow),
+            "total_ms": float(sum(recovery_load_shadow) + replay_cold_ms),
+            "avg_ms": float((statistics.mean(recovery_load_shadow) if recovery_load_shadow else 0.0) + replay_cold_ms),
+            "p50_ms": float((_percentile(recovery_load_shadow, 0.50) if recovery_load_shadow else 0.0) + replay_cold_ms),
+            "p95_ms": float((_percentile(recovery_load_shadow, 0.95) if recovery_load_shadow else 0.0) + replay_cold_ms),
+            "max_ms": float((max(recovery_load_shadow) if recovery_load_shadow else 0.0) + replay_cold_ms),
+            "status": "derived",
+        } if (recovery_load_shadow or replay_cold_ms > 0.0) else None,
+        "L_cpu_cold": {
+            "count": 1,
+            "total_ms": float(replay_cold_ms),
+            "avg_ms": float(replay_cold_ms),
+            "p50_ms": float(replay_cold_ms),
+            "p95_ms": float(replay_cold_ms),
+            "max_ms": float(replay_cold_ms),
+            "status": "derived",
+        } if replay_cold_ms > 0.0 else None,
+    }
+
+    return {
+        "overview": {
+            "trace_start_ns": origin_ns,
+            "trace_end_ns": end_ns,
+            "total_wall_s": total_wall_s,
+            "checkpoint_total_s": checkpoint_total_ms / 1000.0,
+            "train_step_total_s": train_step_total_ms / 1000.0,
+            "framework_overhead_total_s": framework_overhead_total_ms / 1000.0,
+            "shadow_block_total_s": shadow_block_total_ms / 1000.0,
+            "approx_sum_s": (checkpoint_total_ms + train_step_total_ms + framework_overhead_total_ms + shadow_block_total_ms) / 1000.0,
+            "record_count": len(records),
+            "span_count": len(spans),
+            "instant_count": len(instants),
+            "resource_sample_count": sum(1 for r in records if r.get("event") == "resource_sample"),
+        },
+        "panel_totals_ms": dict(sorted(panel_totals.items())),
+        "lane_totals_ms": {
+            f"{panel}/{lane}": total for (panel, lane), total in sorted(lane_totals.items())
+        },
+        "span_summary": span_summary,
+        "resource_summary": resource_summary,
+        "scalar_summary": scalar_summary,
+        "last_scalars": last_scalars,
+        "named_time_metrics": named_time_metrics,
+        "missing_series": missing,
+    }
+
+
+def print_summary(summary, *, top_n=20):
+    overview = summary["overview"]
+    print("=== Trace Overview ===")
+    print(f"total_wall_s: {overview['total_wall_s']:.3f}")
+    print()
+
+    print("=== Named Time Metrics ===")
+    for name in ("checkpoint_total", "t_step", "t_l", "t_d2h", "t_persist", "t_r", "t_rc", "t_cp", "L_disk", "L_cpu"):
+        stats = summary["named_time_metrics"].get(name)
+        if not stats:
+            print(f"{name}: missing")
+            continue
+        if name == "t_l":
+            line = (
+                f"{name}: total_ms={stats['total_ms']:.3f} "
+                f"avg_ms={stats['avg_ms']:.3f}"
+            )
+        else:
+            line = (
+                f"{name}: total_s={stats['total_ms'] / 1000.0:.3f} "
+                f"avg_s={stats['avg_ms'] / 1000.0:.3f}"
+            )
+        if "steady_avg_ms" in stats:
+            line += f" steady_avg_s={stats['steady_avg_ms'] / 1000.0:.3f}"
+        if "cold_start_ms" in stats:
+            line += f" cold_start_s={stats['cold_start_ms'] / 1000.0:.3f}"
+        line += f" count={stats['count']}"
+        print(line)
+    print()
+
+    print("=== Resource Stats ===")
+    for _name, stats in sorted(summary["resource_summary"].items()):
+        print(
+            f"{stats['display_name']}: avg={stats['avg']:.3f} max={stats['max']:.3f}"
+        )
+    if summary["last_scalars"]:
+        print()
+        print("=== Last Scalars ===")
+        for name, stats in sorted(summary["last_scalars"].items()):
+            print(f"{name}: step={stats['step']} value={_format_scalar(name, stats['value'])}")
+    if summary["missing_series"]:
+        print()
+        print("=== Missing Series ===")
+        for name in summary["missing_series"]:
+            print(name)
+    l_cpu_cold = summary["named_time_metrics"].get("L_cpu_cold")
+    if l_cpu_cold:
+        print()
+        print(
+            f"L_cpu_cold: total_s={l_cpu_cold['total_ms'] / 1000.0:.3f} "
+            f"avg_s={l_cpu_cold['avg_ms'] / 1000.0:.3f} count={l_cpu_cold['count']}"
+        )
+
+
+def plot_timeline(trace_or_records, spans=None, instants=None, *, figsize=(18, 10)):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to plot timeline figures") from exc
+
+    if isinstance(trace_or_records, dict):
+        records = trace_or_records["records"]
+        spans = trace_or_records["spans"]
+        instants = trace_or_records["instants"]
+    else:
+        records = trace_or_records
+        if spans is None or instants is None:
+            spans, instants = build_spans(records)
+
+    panel_order = ["gpu_train", "cpu_shadow"]
+    panel_titles = {"gpu_train": "GPU / Train", "cpu_shadow": "CPU / Shadow"}
+    row_order = [
+        "framework_overhead",
+        "train_step",
+        "checkpoint_save",
+        "checkpoint_d2h_copy",
+        "checkpoint_cpu_serialize",
+        "checkpoint_rng_save",
+        "checkpoint_disk_persist",
+        "checkpoint_model_persist",
+        "wait_shadow_ready",
+        "wait_anchor_persist",
+        "wait_anchor_buffer",
+        "recover_shadow",
+        "replay_updates",
+        "full_checkpoint_refresh",
+        "train_end_cleanup",
+        "anchor_d2h_copy",
+        "anchor_publish_latest",
+        "anchor_persist",
+        "resume_begin",
+        "resume_end",
+        "shadow_boot",
+        "shadow_wait_update",
+        "shadow_apply",
+        "shadow_commit",
+        "shadow_rebase",
+        "shadow_stop",
+    ]
+    colors = {
+        "framework_overhead": "#c7c7c7",
+        "train_step": "#1f77b4",
+        "zo_update_hook": "#ff7f0e",
+        "checkpoint_save": "#2ca02c",
+        "checkpoint_d2h_copy": "#98df8a",
+        "checkpoint_cpu_serialize": "#ffbb78",
+        "checkpoint_rng_save": "#c5b0d5",
+        "checkpoint_disk_persist": "#8c564b",
+        "checkpoint_model_persist": "#17becf",
+        "wait_shadow_ready": "#d62728",
+        "wait_anchor_persist": "#9467bd",
+        "wait_anchor_buffer": "#8c564b",
+        "recover_shadow": "#e377c2",
+        "replay_updates": "#7f7f7f",
+        "full_checkpoint_refresh": "#bcbd22",
+        "shadow_boot": "#17becf",
+        "shadow_wait_update": "#c7c7c7",
+        "shadow_apply": "#1f77b4",
+        "shadow_commit": "#2ca02c",
+        "shadow_rebase": "#d62728",
+        "anchor_d2h_copy": "#ff9896",
+        "anchor_publish_latest": "#98df8a",
+        "anchor_persist": "#aec7e8",
+        "train_end_cleanup": "#c49c94",
+        "resume_begin": "#9edae5",
+        "resume_end": "#9edae5",
+    }
+
+    origin_ns = _origin_ns(records, spans, instants)
+    fig, axes = plt.subplots(2, 1, sharex=True, figsize=figsize)
+
+    for ax, panel in zip(axes, panel_order):
+        panel_spans = [
+            item for item in spans
+            if item["panel"] == panel and item["event"] in _TIMELINE_VISIBLE
+        ]
+        panel_instants = [
+            item for item in instants
+            if item["panel"] == panel and item["event"] in _TIMELINE_VISIBLE
+        ]
+        row_keys = []
+        present = {item["event"] for item in panel_spans}
+        present.update(
+            item["event"]
+            for item in panel_instants
+            if item["lane"] not in ("resource", "counters", "meta")
+        )
+        for key in row_order:
+            if key in present:
+                row_keys.append(key)
+        y_positions = {key: idx * 10 for idx, key in enumerate(row_keys)}
+
+        for item in panel_spans:
+            start_s = _ns_to_s(item["start_ns"], origin_ns)
+            width_s = max(_ns_to_s(item["end_ns"], item["start_ns"]), 1e-6)
+            ax.broken_barh(
+                [(start_s, width_s)],
+                (y_positions[item["event"]], 8),
+                facecolors=colors.get(item["event"], "#4c78a8"),
+                edgecolors="black",
+                linewidth=0.4,
+                alpha=0.9,
+            )
+
+        for item in panel_instants:
+            if item["lane"] in ("resource", "counters", "meta"):
+                continue
+            x = _ns_to_s(item["wall_time_ns"], origin_ns)
+            y = y_positions.get(item["event"])
+            if y is None:
+                continue
+            ax.plot([x], [y + 4], marker="|", markersize=12, color="black")
+
+        ax.set_yticks([y_positions[key] + 4 for key in row_keys] or [0])
+        ax.set_yticklabels(row_keys or ["no_events"])
+        ax.set_title(panel_titles.get(panel, panel))
+        ax.grid(axis="x", linestyle="--", alpha=0.35)
+
+    axes[-1].set_xlabel("Wall Time Since Trace Start (s)")
+    fig.tight_layout()
+    return fig, axes
+
+
+def plot_resources(trace_or_records, *, figsize=(18, 10)):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to plot resource figures") from exc
+
+    if isinstance(trace_or_records, dict):
+        records = trace_or_records["records"]
+        spans = trace_or_records["spans"]
+        instants = trace_or_records["instants"]
+    else:
+        records = trace_or_records
+        spans, instants = build_spans(records)
+
+    origin_ns = _origin_ns(records, spans, instants)
+    width, total_height = figsize
+    per_height = max(total_height / 4.0, 2.5)
+
+    fig_mem, ax_mem = plt.subplots(1, 1, figsize=(width, per_height))
+    fig_gpu, ax_gpu = plt.subplots(1, 1, figsize=(width, per_height))
+    fig_cpu, ax_cpu = plt.subplots(1, 1, figsize=(width, per_height))
+    fig_lag, ax_lag = plt.subplots(1, 1, figsize=(width, per_height))
+
+    memory_specs = [
+        ("gpu_train", ["train_rss_mb"], "Train RSS", "#2ca02c"),
+        ("cpu_shadow", ["shadow_rss_mb"], "Shadow RSS", "#d62728"),
+        (None, ["zo_shm_used_mb"], "DRAM", "#9467bd"),
+    ]
+    for panel, keys, label, color in memory_specs:
+        xs, ys, _ = _extract_series_any(records, "resource_sample", keys, panel=panel)
+        if not xs:
+            continue
+        ax_mem.plot([_ns_to_s(x, origin_ns) for x in xs], [y / 1024.0 for y in ys], label=label, color=color)
+
+    ax_mem.set_ylabel("GB")
+    ax_mem.grid(axis="x", linestyle="--", alpha=0.35)
+    handles, labels = ax_mem.get_legend_handles_labels()
+    if handles:
+        ax_mem.legend(loc="upper left", ncol=3)
+
+    gpu_xs, gpu_ys, _ = _extract_series_any(records, "resource_sample", ["gpu0_alloc_mb", "gpu_alloc_mb"], panel="gpu_train")
+    if gpu_xs:
+        ax_gpu.plot([_ns_to_s(x, origin_ns) for x in gpu_xs], [y / 1024.0 for y in gpu_ys], label="GPU alloc", color="#1f77b4")
+    ax_gpu.set_ylabel("GB")
+    ax_gpu.grid(axis="x", linestyle="--", alpha=0.35)
+    handles, labels = ax_gpu.get_legend_handles_labels()
+    if handles:
+        ax_gpu.legend(loc="upper left", ncol=2)
+
+    cpu_specs = [
+        ("gpu_train", ["train_cpu_percent"], "Train CPU%", "#8c564b"),
+        ("cpu_shadow", ["shadow_cpu_percent"], "Shadow CPU%", "#e377c2"),
+    ]
+    for panel, keys, label, color in cpu_specs:
+        xs, ys, _ = _extract_series_any(records, "resource_sample", keys, panel=panel)
+        if not xs:
+            continue
+        ax_cpu.plot([_ns_to_s(x, origin_ns) for x in xs], ys, label=label, color=color)
+
+    ax_cpu.set_ylabel("CPU %")
+    ax_cpu.grid(axis="x", linestyle="--", alpha=0.35)
+    lines1, labels1 = ax_cpu.get_legend_handles_labels()
+    if lines1:
+        ax_cpu.legend(lines1, labels1, loc="upper left", ncol=3)
+
+    lag_specs = [
+        ("shadow_apply_backlog", "Shadow apply backlog", "#1f77b4"),
+        ("shadow_durable_lag", "Shadow durable lag", "#ff7f0e"),
+        ("anchor_lag", "Anchor lag", "#2ca02c"),
+        ("update_history_len", "Update history len", "#d62728"),
+    ]
+    lag_ax2 = ax_lag.twinx()
+    for key, label, color in lag_specs:
+        xs, ys = _extract_series(records, "train_progress", key, panel="gpu_train")
+        if not xs:
+            continue
+        axis = lag_ax2 if key == "update_history_len" else ax_lag
+        axis.plot([_ns_to_s(x, origin_ns) for x in xs], ys, label=label, color=color)
+
+    ax_lag.set_ylabel("Lag / Backlog")
+    lag_ax2.set_ylabel("Log Length")
+    ax_lag.grid(axis="x", linestyle="--", alpha=0.35)
+    lines1, labels1 = ax_lag.get_legend_handles_labels()
+    lines2, labels2 = lag_ax2.get_legend_handles_labels()
+    if lines1 or lines2:
+        ax_lag.legend(lines1 + lines2, labels1 + labels2, loc="upper left", ncol=2)
+    ax_lag.set_xlabel("Wall Time Since Trace Start (s)")
+
+    fig_mem.tight_layout()
+    fig_gpu.tight_layout()
+    fig_cpu.tight_layout()
+    fig_lag.tight_layout()
+    return (
+        {
+            "memory": fig_mem,
+            "gpu": fig_gpu,
+            "cpu": fig_cpu,
+            "lag": fig_lag,
+        },
+        {
+            "memory": ax_mem,
+            "gpu": ax_gpu,
+            "cpu": ax_cpu,
+            "lag": ax_lag,
+            "lag_aux": lag_ax2,
+        },
+    )
+
+
+def plot_loss(trace_or_records, *, figsize=(18, 4)):
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to plot loss figures") from exc
+
+    if isinstance(trace_or_records, dict):
+        records = trace_or_records["records"]
+    else:
+        records = trace_or_records
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    loss_xs, loss_ys = _extract_step_series(records, "train_scalar", "loss", panel="gpu_train")
+    if loss_xs:
+        ax.plot(loss_xs, loss_ys, color="#1f77b4", label="Loss")
+    lr_xs, lr_ys = _extract_step_series(records, "train_scalar", "learning_rate", panel="gpu_train")
+    if lr_xs:
+        ax_lr = ax.twinx()
+        ax_lr.plot(lr_xs, lr_ys, color="#ff7f0e", linestyle="--", label="Learning rate")
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax_lr.get_legend_handles_labels()
+        if lines1 or lines2:
+            ax.legend(lines1 + lines2, labels1 + labels2, loc="upper right", ncol=2)
+        ax_lr.set_ylabel("Learning Rate")
+    else:
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(handles, labels, loc="upper right")
+    ax.set_xlabel("Global Step")
+    ax.set_ylabel("Loss")
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
+    fig.tight_layout()
+    return fig, ax
+
+
+def plot_interactive(trace_or_records, spans=None, instants=None, *, height=1000, width=1500):
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError as exc:
+        raise RuntimeError("plotly is required to plot interactive figures") from exc
+
+    if isinstance(trace_or_records, dict):
+        records = trace_or_records["records"]
+        spans = trace_or_records["spans"]
+        instants = trace_or_records["instants"]
+    else:
+        records = trace_or_records
+        if spans is None or instants is None:
+            spans, instants = build_spans(records)
+
+    origin_ns = _origin_ns(records, spans, instants)
+    fig = make_subplots(
+        rows=3,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.04,
+        subplot_titles=("GPU / Train Timeline", "CPU / Shadow Timeline", "Resources / Lag"),
+    )
+
+    for row, panel in ((1, "gpu_train"), (2, "cpu_shadow")):
+        panel_spans = [item for item in spans if item["panel"] == panel]
+        row_keys = sorted({item["event"] for item in panel_spans})
+        y_positions = {key: idx for idx, key in enumerate(row_keys)}
+        for item in panel_spans:
+            start_s = _ns_to_s(item["start_ns"], origin_ns)
+            end_s = _ns_to_s(item["end_ns"], origin_ns)
+            y = y_positions[item["event"]]
+            fig.add_trace(
+                go.Scatter(
+                    x=[start_s, end_s],
+                    y=[y, y],
+                    mode="lines",
+                    line={"width": 12},
+                    name=item["event"],
+                    hovertemplate=(
+                        f"{item['event']}<br>step={item.get('step')}"
+                        f"<br>start={start_s:.3f}s<br>end={end_s:.3f}s"
+                    ),
+                    showlegend=False,
+                ),
+                row=row,
+                col=1,
+            )
+        fig.update_yaxes(
+            tickmode="array",
+            tickvals=list(y_positions.values()),
+            ticktext=list(y_positions.keys()),
+            row=row,
+            col=1,
+        )
+
+    series_specs = [
+        ("gpu_train", "resource_sample", ["gpu0_alloc_mb", "gpu_alloc_mb"], "GPU alloc"),
+        ("gpu_train", "resource_sample", ["gpu0_reserved_mb", "gpu_reserved_mb"], "GPU reserved"),
+        ("gpu_train", "resource_sample", ["gpu0_peak_mb", "gpu_peak_mb"], "GPU peak"),
+        ("gpu_train", "resource_sample", "train_rss_mb", "Train RSS"),
+        ("cpu_shadow", "resource_sample", "shadow_rss_mb", "Shadow RSS"),
+        (None, "resource_sample", "zo_shm_used_mb", "DRAM"),
+        ("gpu_train", "train_progress", "shadow_apply_backlog", "Shadow apply backlog"),
+        ("gpu_train", "train_progress", "shadow_durable_lag", "Shadow durable lag"),
+        ("gpu_train", "train_progress", "anchor_lag", "Anchor lag"),
+        ("gpu_train", "train_progress", "update_history_len", "Update history len"),
+    ]
+    for panel, event_name, key, label in series_specs:
+        if isinstance(key, list):
+            xs, ys, _ = _extract_series_any(records, event_name, key, panel=panel)
+        else:
+            xs, ys = _extract_series(records, event_name, key, panel=panel)
+        if not xs:
+            continue
+        if event_name == "resource_sample" and (
+            (isinstance(key, list) and any(k in _GB_KEYS for k in key)) or key in _GB_KEYS
+        ):
+            ys = [y / 1024.0 for y in ys]
+        fig.add_trace(
+            go.Scatter(
+                x=[_ns_to_s(x, origin_ns) for x in xs],
+                y=ys,
+                mode="lines",
+                name=label,
+            ),
+            row=3,
+            col=1,
+        )
+
+    fig.update_xaxes(title_text="Wall Time Since Trace Start (s)", row=3, col=1)
+    fig.update_layout(height=height, width=width, legend={"orientation": "h"})
+    return fig
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Visualize NonStopZO2 structured trace JSONL output.")
+    parser.add_argument("trace_jsonl", help="Path to zo_trace.jsonl")
+    parser.add_argument("--html", action="store_true", help="Also show an interactive plotly figure")
+    args = parser.parse_args()
+
+    trace = load_trace(args.trace_jsonl)
+    summary = summarize_trace(trace)
+    print_summary(summary)
+    timeline_fig, _ = plot_timeline(trace)
+    resource_figs, _ = plot_resources(trace)
+    loss_fig, _ = plot_loss(trace)
+    timeline_fig.show()
+    for fig in resource_figs.values():
+        fig.show()
+    loss_fig.show()
+    if args.html:
+        plot_interactive(trace).show()
+
+
+if __name__ == "__main__":
+    main()
