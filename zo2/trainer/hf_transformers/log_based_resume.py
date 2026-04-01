@@ -32,6 +32,7 @@ from .log_based_shadow import (
 from .log_based_utils import (
     _DTYPE_MAP,
     _detect_tied_weights,
+    _get_zo_shm_dir,
     _log_adam_checksums,
     _log_adam_exact_fingerprint,
     _log_memory,
@@ -53,6 +54,7 @@ class LogBasedRecoveryBundle:
     pending_grad: float | None
     base_pending_seed: int | None
     shadow_used: bool
+    inplace: bool = False
 
 
 def _tensor_exact_hash(tensor: torch.Tensor) -> str:
@@ -290,6 +292,7 @@ def resume_from_log_based_bundle(
     rng_device: str = "native",
     zo2_mode: bool = False,
     shadow_path: str = None,
+    inplace_model=None,
 ) -> LogBasedRecoveryBundle:
     """Resume from log-based checkpoints and return a structured recovery bundle."""
     if trace_enabled() and output_dir is not None:
@@ -318,12 +321,26 @@ def resume_from_log_based_bundle(
     optimizer_path = os.path.join(ckpt_dir, "optimizer.pt")
     metadata_path = os.path.join(ckpt_dir, LOG_METADATA_NAME)
 
+    # Compute shm metadata path (same hash logic as LogBasedCheckpointCallback)
+    _shm_dir = _get_zo_shm_dir() if output_dir else None
+    _shm_meta_path = None
+    if _shm_dir and output_dir:
+        import hashlib as _hl
+        _run_hash = _hl.md5(output_dir.encode()).hexdigest()[:8]
+        _shm_meta_path = os.path.join(_shm_dir, f"zo_log_metadata_{_run_hash}.pt")
+
     redo_source = None
 
     if cached_optimizer_state is not None and isinstance(cached_optimizer_state, dict) and 'zo_update_history' in cached_optimizer_state:
         optimizer_state = cached_optimizer_state
         redo_source = "cached_optimizer_state"
         logger.info("[Resume] Using cached redo state (source=cached_optimizer_state, skipped disk I/O)")
+    elif _shm_meta_path and os.path.exists(_shm_meta_path):
+        optimizer_state = torch.load(_shm_meta_path, map_location='cpu', weights_only=False)
+        if not isinstance(optimizer_state, dict):
+            raise RuntimeError(f"shm log_metadata is not a dict: {_shm_meta_path}")
+        redo_source = "shm_metadata"
+        logger.info(f"[Resume] Found log metadata in shm (SSD-free): {_shm_meta_path}")
     elif os.path.exists(metadata_path):
         optimizer_state = torch.load(metadata_path, map_location='cpu', weights_only=False)
         if not isinstance(optimizer_state, dict):
@@ -608,7 +625,26 @@ def resume_from_log_based_bundle(
                 updates = [u for u in updates if u['step'] > shadow_step]
                 logger.info(f"[Resume] Soft recovery: shadow at step {shadow_step}, replaying {len(updates)} lag updates")
                 shadow_used = True
-    if reconstructed is None and base_state_dict is not None and base_checkpoint_ref == "__initial__":
+    # In-place replay: for batch_size=0, self.model IS the initial model.
+    # Use direct parameter references so replay modifies the model in-place
+    # without allocating a second copy on GPU.
+    _inplace_used = False
+    if (
+        reconstructed is None
+        and inplace_model is not None
+        and batch_size == 0
+        and base_checkpoint_ref == "__initial__"
+    ):
+        reconstructed = OrderedDict()
+        for name, param in inplace_model.named_parameters():
+            reconstructed[name] = param.data
+        for name, buf in inplace_model.named_buffers():
+            reconstructed[name] = buf.data
+        _inplace_used = True
+        model_source = "inplace:__initial__"
+        model_source_step = 0
+        logger.info("[Resume] In-place replay: using live model parameters directly (zero extra GPU memory)")
+    elif reconstructed is None and base_state_dict is not None and base_checkpoint_ref == "__initial__":
         if consistency_log_enabled():
             logger.info("[Resume] Using pre-loaded base state dict in-place (no clone)")
         reconstructed = base_state_dict
@@ -661,9 +697,22 @@ def resume_from_log_based_bundle(
             logger.info(f"[Resume] pending_grad={pending_grad} (will be restored to opt.projected_grad)")
 
     if device == 'cuda' and torch.cuda.is_available():
-        for key in reconstructed:
-            if reconstructed[key].device.type != 'cuda':
-                reconstructed[key] = reconstructed[key].cuda()
+        if inplace_model is not None and not _inplace_used:
+            # Copy shadow/recovered state into model parameters in-place to avoid 2x GPU memory
+            _param_map = {n: p for n, p in inplace_model.named_parameters()}
+            _param_map.update({n: b for n, b in inplace_model.named_buffers()})
+            for key in reconstructed:
+                if key in _param_map:
+                    _param_map[key].data.copy_(reconstructed[key])
+                    reconstructed[key] = _param_map[key].data
+                elif reconstructed[key].device.type != 'cuda':
+                    reconstructed[key] = reconstructed[key].cuda()
+            _inplace_used = True
+            logger.info("[Resume] In-place shadow load: copied into live model (zero extra GPU memory)")
+        else:
+            for key in reconstructed:
+                if reconstructed[key].device.type != 'cuda':
+                    reconstructed[key] = reconstructed[key].cuda()
         torch.cuda.synchronize()
 
     if tied_groups:
@@ -762,6 +811,7 @@ def resume_from_log_based_bundle(
         pending_grad=pending_grad,
         base_pending_seed=base_pending_seed,
         shadow_used=shadow_used,
+        inplace=_inplace_used,
     )
 
 

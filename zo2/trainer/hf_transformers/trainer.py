@@ -509,6 +509,72 @@ class ZOTrainer(Trainer):
             f"| CPU RSS={cpu_rss_mb:.0f}MB"
         )
 
+    def _emit_loading_phase_breakdown(self, step, total_s, source="fresh"):
+        """Emit trace instant + logger output for L_disk/L_cpu phase breakdown."""
+        pt = getattr(self, '_loading_phase_times', None) or {}
+        program_start = getattr(self, '_t_program_start', 0.0)
+        import_end = pt.get("import_end", program_start)
+
+        phases = {
+            "T_import": import_end - program_start,
+            "T_main_setup": pt.get("T_main_setup", 0.0),
+            "T_config": pt.get("T_config", 0.0),
+            "T_from_pretrained": pt.get("T_from_pretrained", 0.0),
+            "T_zo_init": pt.get("T_zo_init", 0.0),
+            "T_tokenizer": pt.get("T_tokenizer", 0.0),
+            "T_tokenize_data": pt.get("T_tokenize_data", 0.0),
+            "T_trainer_init": pt.get("T_trainer_init", 0.0),
+            "T_callback_setup": pt.get("T_callback_setup", 0.0),
+        }
+        if source == "recovery":
+            phases["T_resume_total"] = pt.get("T_resume_total", 0.0)
+            phases["T_cpu_to_gpu"] = pt.get("T_cpu_to_gpu", 0.0)
+            phases["T_diag"] = pt.get("T_diag", 0.0)
+
+        accounted = sum(phases.values())
+        phases["T_hf_inner"] = max(0.0, total_s - accounted)
+
+        # Annotations
+        annotations = {}
+        weight_source = pt.get("weight_source", "unknown")
+        annotations["T_from_pretrained"] = weight_source
+        if source == "recovery":
+            resume_source = pt.get("resume_source", "unknown")
+            annotations["T_resume_total"] = resume_source
+            if pt.get("cpu_to_gpu_inplace", False):
+                annotations["T_cpu_to_gpu"] = "inplace"
+
+        # Log
+        from .log_based_utils import _loading_phase_log_enabled
+        if _loading_phase_log_enabled():
+            parts = []
+            for name, val in phases.items():
+                pct = val / total_s * 100.0 if total_s > 0 else 0.0
+                ann = annotations.get(name, "")
+                ann_str = f" [{ann}]" if ann else ""
+                parts.append(f"{name}={val:.3f}s ({pct:.1f}%){ann_str}")
+            label = "L_cpu" if source == "recovery" else "L_disk"
+            logger.info(
+                f"[{label} Breakdown] total={total_s:.3f}s | " + " ".join(parts)
+            )
+
+        # Trace instant
+        if trace_enabled():
+            counters = {f"{k}_ms": v * 1000.0 for k, v in phases.items()}
+            counters["total_ms"] = total_s * 1000.0
+            extra = {"source": source, "weight_source": weight_source}
+            if source == "recovery":
+                extra["resume_source"] = pt.get("resume_source", "unknown")
+                extra["inplace"] = pt.get("cpu_to_gpu_inplace", False)
+            trace_instant(
+                panel="gpu_train",
+                lane="counters",
+                event="loading_phase_breakdown",
+                step=int(step),
+                counters=counters,
+                extra=extra,
+            )
+
     def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
         """
         Override: skip model weight loading when log-based resume is active,
@@ -687,7 +753,7 @@ class ZOTrainer(Trainer):
             t_save_breakdown_start = time.time()
 
             # Async anchor: check if a background persist completed and update base
-            async_anchor = getattr(self, '_async_anchor', None)
+            async_anchor = None  # Legacy async-anchor removed
             if async_anchor is not None and batch_size >= 1:
                 completed_step = async_anchor.get_latest_completed_anchor_step()
                 if completed_step > log_based_callback.base_checkpoint_step:
@@ -724,7 +790,7 @@ class ZOTrainer(Trainer):
             else:
                 run_dir = self._get_output_dir(trial=trial)
             output_dir = os.path.join(run_dir, checkpoint_folder)
-            if (not shadow_keeps_log_only) or is_full_step or persist_lightweight_redo:
+            if (not shadow_keeps_log_only) or is_full_step:
                 os.makedirs(output_dir, exist_ok=True)
 
             sync_full_uses_sidecar = bool(is_full_step and async_anchor is None)
@@ -865,16 +931,18 @@ class ZOTrainer(Trainer):
                     log_metadata['adam_betas'] = model.opt.betas
                     log_metadata['adam_eps_value'] = model.opt.adam_eps
             elif persist_lightweight_redo:
+                # Save scheduler and RNG state to shm (not SSD)
+                shm_dir = log_based_callback.shm_dir
                 if self.lr_scheduler is not None:
                     t0 = time.time()
-                    scheduler_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
-                    torch.save(self.lr_scheduler.state_dict(), os.path.join(output_dir, SCHEDULER_NAME))
+                    scheduler_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_shm_persist", step=int(self.state.global_step))
+                    torch.save(self.lr_scheduler.state_dict(), os.path.join(shm_dir, SCHEDULER_NAME))
                     t_scheduler = time.time() - t0
                     trace_end(scheduler_token, step=int(self.state.global_step), counters={"duration_ms": t_scheduler * 1000.0})
 
                 t0 = time.time()
-                rng_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_rng_save", step=int(self.state.global_step))
-                self._save_rng_state(output_dir)
+                rng_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_shm_persist", step=int(self.state.global_step))
+                self._save_rng_state(shm_dir)
                 t_rng = time.time() - t0
                 trace_end(rng_token, step=int(self.state.global_step), counters={"duration_ms": t_rng * 1000.0})
 
@@ -911,17 +979,20 @@ class ZOTrainer(Trainer):
                 t_opt_build = time.time() - t0
                 trace_end(meta_build_token, step=int(self.state.global_step), counters={"duration_ms": t_opt_build * 1000.0})
 
-                meta_path = os.path.join(output_dir, LOG_METADATA_NAME)
+                # Save lightweight redo metadata to shm (tmpfs) instead of SSD.
+                # Soft recovery reads from shm; hard recovery uses full checkpoint on SSD.
+                shm_meta_path = log_based_callback._shm_log_metadata_path()
+                shm_step_path = log_based_callback._shm_log_metadata_step_path()
                 t0 = time.time()
-                meta_save_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
-                torch.save(log_metadata, meta_path)
-                from .log_based_utils import _fsync_file
-                _fsync_file(meta_path)
+                meta_save_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_shm_persist", step=int(self.state.global_step))
+                torch.save(log_metadata, shm_meta_path)
+                with open(shm_step_path, "w") as _f:
+                    _f.write(str(int(self.state.global_step)))
                 t_meta_save = time.time() - t0
                 trace_end(meta_save_token, step=int(self.state.global_step), counters={"duration_ms": t_meta_save * 1000.0})
                 log_based_callback.disk_log_save_count += 1
                 logger.info(
-                    f"[ZOTrainer] Saved lightweight scalar redo metadata to {LOG_METADATA_NAME}, "
+                    f"[ZOTrainer] Saved lightweight scalar redo metadata to shm, "
                     f"updates={len(updates)}, pending_grad={log_metadata['pending_grad']:.6e}, "
                     f"is_full_step={is_full_step}"
                 )
@@ -955,14 +1026,6 @@ class ZOTrainer(Trainer):
                     # Sync path: save model files via Trainer, then clear history
                     t0 = time.time()
                     full_model_token = trace_begin(panel="gpu_train", lane="blocking", event="checkpoint_disk_persist", step=int(self.state.global_step))
-                    pending_d2h_token = trace_begin(
-                        panel="gpu_train",
-                        lane="blocking",
-                        event="checkpoint_d2h_copy",
-                        step=int(self.state.global_step),
-                    )
-                    self._pending_checkpoint_d2h_token = pending_d2h_token
-                    self._pending_checkpoint_d2h_step = int(self.state.global_step)
                     full_model_error = None
                     try:
                         super()._save_checkpoint(model, trial)
@@ -971,14 +1034,6 @@ class ZOTrainer(Trainer):
                         raise
                     finally:
                         t_super_full = time.time() - t0
-                        if getattr(self, "_pending_checkpoint_d2h_token", None) is not None:
-                            trace_end(
-                                self._pending_checkpoint_d2h_token,
-                                step=getattr(self, "_pending_checkpoint_d2h_step", int(self.state.global_step)),
-                                extra={"error": full_model_error} if full_model_error else None,
-                            )
-                            self._pending_checkpoint_d2h_token = None
-                            self._pending_checkpoint_d2h_step = None
                         trace_end(
                             full_model_token,
                             step=int(self.state.global_step),
@@ -1025,29 +1080,7 @@ class ZOTrainer(Trainer):
             return
 
         # Default behavior: save full checkpoint when log-based checkpointing is disabled
-        pending_d2h_token = trace_begin(
-            panel="gpu_train",
-            lane="blocking",
-            event="checkpoint_d2h_copy",
-            step=int(self.state.global_step),
-        )
-        self._pending_checkpoint_d2h_token = pending_d2h_token
-        self._pending_checkpoint_d2h_step = int(self.state.global_step)
-        checkpoint_error = None
-        try:
-            super()._save_checkpoint(model, trial)
-        except Exception as exc:
-            checkpoint_error = f"{type(exc).__name__}: {exc}"
-            raise
-        finally:
-            if getattr(self, "_pending_checkpoint_d2h_token", None) is not None:
-                trace_end(
-                    self._pending_checkpoint_d2h_token,
-                    step=getattr(self, "_pending_checkpoint_d2h_step", int(self.state.global_step)),
-                    extra={"error": checkpoint_error} if checkpoint_error else None,
-                )
-                self._pending_checkpoint_d2h_token = None
-                self._pending_checkpoint_d2h_step = None
+        super()._save_checkpoint(model, trial)
         # Fsync full checkpoint directory for L0 baseline
         from .log_based_utils import _fsync_directory
         run_dir = self._get_output_dir(trial=trial)
@@ -1059,20 +1092,15 @@ class ZOTrainer(Trainer):
         if not trace_enabled():
             return super()._save(output_dir, state_dict=state_dict)
 
-        pending_d2h_token = getattr(self, "_pending_checkpoint_d2h_token", None)
-        closed_pending_d2h = False
-        if pending_d2h_token is not None:
-            trace_end(
-                pending_d2h_token,
-                step=getattr(self, "_pending_checkpoint_d2h_step", checkpoint_step),
-                counters={"num_tensors": len(state_dict) if state_dict is not None else 0},
-            )
-            self._pending_checkpoint_d2h_token = None
-            self._pending_checkpoint_d2h_step = None
-            closed_pending_d2h = True
+        # Resolve state_dict: if None, get from model
+        source_state = state_dict if state_dict is not None else self.model.state_dict()
 
-        effective_state_dict = state_dict
-        if effective_state_dict is None and not closed_pending_d2h:
+        # Check if any tensor lives on GPU
+        has_gpu = any(
+            torch.is_tensor(v) and v.is_cuda for v in source_state.values()
+        )
+
+        if has_gpu:
             d2h_token = trace_begin(
                 panel="gpu_train",
                 lane="blocking",
@@ -1082,7 +1110,6 @@ class ZOTrainer(Trainer):
             d2h_error = None
             effective_state_dict = OrderedDict()
             try:
-                source_state = self.model.state_dict()
                 for key, value in source_state.items():
                     if torch.is_tensor(value):
                         effective_state_dict[key] = value.detach().cpu()
@@ -1098,6 +1125,8 @@ class ZOTrainer(Trainer):
                     counters={"num_tensors": len(effective_state_dict)},
                     extra={"error": d2h_error} if d2h_error else None,
                 )
+        else:
+            effective_state_dict = source_state
 
         persist_token = trace_begin(
             panel="gpu_train",
@@ -1122,24 +1151,24 @@ class ZOTrainer(Trainer):
             effective_resume_checkpoint = self._log_based_resume_checkpoint
 
         rng_state_available = False
+        # Check both the checkpoint dir (SSD) and shm for rng_state
+        _rng_search_dirs = []
         if effective_resume_checkpoint is not None:
-            rng_state_available = (
-                os.path.isfile(os.path.join(effective_resume_checkpoint, "rng_state.pth"))
-                or os.path.isfile(os.path.join(effective_resume_checkpoint, f"rng_state_{self.args.process_index}.pth"))
-            )
+            _rng_search_dirs.append(effective_resume_checkpoint)
+        from .log_based_utils import _get_zo_shm_dir
+        _rng_search_dirs.append(_get_zo_shm_dir())
+        self._rng_state_dir = None  # will be set to the dir containing rng_state
+        for _rng_dir in _rng_search_dirs:
+            if (os.path.isfile(os.path.join(_rng_dir, "rng_state.pth"))
+                    or os.path.isfile(os.path.join(_rng_dir, f"rng_state_{self.args.process_index}.pth"))):
+                rng_state_available = True
+                self._rng_state_dir = _rng_dir
+                break
 
-        # Restore checkpoint RNG before creating the train dataloader. Some sampler
-        # implementations derive their internal generator state when the dataloader
-        # is constructed, so restoring only before the epoch iterator is too late.
-        if rng_state_available:
-            self._load_rng_state(effective_resume_checkpoint)
-            logger.info(
-                "[LogBased Resume] Restored RNG before creating train dataloader "
-                f"from {effective_resume_checkpoint}"
-            )
-        else:
-            # Fresh runs still need a deterministic starting point.
-            set_seed(self.args.seed)
+        # Always use args.seed before creating the dataloader so the sampler
+        # shuffle order matches the original training run.  Checkpoint RNG is
+        # restored later — after epoch/step skipping — for ZO perturbation seeds.
+        set_seed(self.args.seed)
 
         self.accelerator.free_memory()
         self._train_batch_size = batch_size
@@ -1449,7 +1478,7 @@ class ZOTrainer(Trainer):
             if epoch == epochs_trained and effective_resume_checkpoint is not None and rng_state_available:
                 # Restore RNG before building the iterator so samplers/batch samplers
                 # for the resumed epoch consume the correct RNG stream.
-                self._load_rng_state(effective_resume_checkpoint)
+                self._load_rng_state(self._rng_state_dir or effective_resume_checkpoint)
                 resume_epoch_rng_restored = True
                 logger.info(
                     f"[LogBased Resume] Restored RNG before building epoch iterator "
@@ -1497,7 +1526,7 @@ class ZOTrainer(Trainer):
                             input_tokens = torch.tensor(input_tokens, device=self.args.device, dtype=torch.int64)
                             self.state.num_input_tokens_seen += self.accelerator.gather(input_tokens).sum().item()
                     if rng_to_sync and rng_state_available:
-                        self._load_rng_state(effective_resume_checkpoint)
+                        self._load_rng_state(self._rng_state_dir or effective_resume_checkpoint)
                         rng_to_sync = False
 
                     # Skip past any already trained steps if resuming training
@@ -1506,7 +1535,7 @@ class ZOTrainer(Trainer):
                         if steps_trained_progress_bar is not None:
                             steps_trained_progress_bar.update(1)
                         if steps_trained_in_current_epoch == 0 and rng_state_available:
-                            self._load_rng_state(effective_resume_checkpoint)
+                            self._load_rng_state(self._rng_state_dir or effective_resume_checkpoint)
                         continue
                     elif steps_trained_progress_bar is not None:
                         steps_trained_progress_bar.close()
@@ -1555,7 +1584,10 @@ class ZOTrainer(Trainer):
                                         "program_to_first_step_ms": t_from_program * 1000.0,
                                         "resume_to_first_step_ms": t_full_resume * 1000.0,
                                     },
+                                    extra={"source": "recovery"},
                                 )
+                            self._emit_loading_phase_breakdown(
+                                expected_step, t_from_program, source="recovery")
                             del self._t_program_start
                     elif hasattr(self, '_t_program_start'):
                         t_from_program = time.time() - self._t_program_start
@@ -1568,7 +1600,10 @@ class ZOTrainer(Trainer):
                                 event="first_step_latency",
                                 step=int(expected_step),
                                 counters={"program_to_first_step_ms": t_from_program * 1000.0},
+                                extra={"source": "fresh"},
                             )
+                        self._emit_loading_phase_breakdown(
+                            expected_step, t_from_program, source="fresh")
                         del self._t_program_start
 
                     train_compute_token = trace_begin(

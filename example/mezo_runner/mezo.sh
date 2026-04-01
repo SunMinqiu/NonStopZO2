@@ -308,9 +308,17 @@ _run_training "$@"; EXIT_CODE=$?
 # Retry loop: auto-resume after SIGKILL (exit code 137)
 while [ $EXIT_CODE -eq 137 ] && [ "$INSTANT_RECOVER" == "1" ]; do
     echo "===== SIGKILL detected (exit $EXIT_CODE), auto-resuming ($FAILURE_TYPE) ====="
-    LATEST=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -1)
-    [ -z "$LATEST" ] && { echo "No checkpoint found in $OUTPUT_DIR"; exit 137; }
-    echo "Latest checkpoint: $LATEST"
+    # Prefer shm metadata (SSD-free) for soft failure; fall back to SSD for hard failure
+    SHM_STEP_FILE="$SHM_ROOT/zo_log_metadata_${RUN_HASH}.step"
+    if [ "$FAILURE_TYPE" != "hard" ] && [ -f "$SHM_STEP_FILE" ]; then
+        SHM_STEP=$(cat "$SHM_STEP_FILE")
+        LATEST="$OUTPUT_DIR/checkpoint-${SHM_STEP}"
+        echo "Latest checkpoint (from shm): $LATEST"
+    else
+        LATEST=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null | sort -V | tail -1)
+        [ -z "$LATEST" ] && { echo "No checkpoint found in $OUTPUT_DIR"; exit 137; }
+        echo "Latest checkpoint (from SSD): $LATEST"
+    fi
 
     NEXT_GPU_FAIL_STEP=$(_remaining_fail_steps_after_first "$GPU_FAIL_STEP")
     export GPU_FAIL_STEP="$NEXT_GPU_FAIL_STEP"

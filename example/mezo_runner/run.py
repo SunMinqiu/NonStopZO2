@@ -6,6 +6,7 @@ Modified from https://github.com/princeton-nlp/MeZO/blob/main/large_models/run.p
 """
 import time as _time
 _PROGRAM_START = _time.time()
+_PHASE_TIMES = {}  # Collect loading phase timings for L_disk/L_cpu breakdown
 
 import os
 # GPU 选择: 只使用 GPU 0 (在导入 torch 之前设置)
@@ -79,6 +80,7 @@ from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataP
 from metrics import calculate_metric
 from utils import *
 from zo2.utils.trace import trace_enabled, trace_instant
+from zo2.utils.logging_controls import loading_phase_log_enabled
 import random
 
 from zo2.trainer.hf_transformers.trainer import ZOTrainer
@@ -91,6 +93,7 @@ from zo2.trainer.hf_transformers.log_based_resume import resume_from_log_based_b
 from zo2 import zo_hf_init, ZOConfig
 if THREAD_DEBUG:
     logger.info(f"[THR] after all imports: {_tc()}")
+_PHASE_TIMES["import_end"] = _time.time()
 
 @dataclass
 class OurArguments(TrainingArguments):
@@ -252,7 +255,10 @@ class Framework:
         """
         with count_time("Loading model with FP%d" % (16 if self.args.load_float16 else 32)):
             free_in_GB = int(torch.cuda.mem_get_info()[0]/1024**3)
+            _t0_config = _time.perf_counter()
             config = AutoConfig.from_pretrained(self.args.model_name)
+            _PHASE_TIMES["config_end"] = _time.perf_counter()
+            _PHASE_TIMES["T_config"] = _PHASE_TIMES["config_end"] - _t0_config
             if self.args.untie_emb:
                 # Untie embeddings/LM head
                 logger.warn("Untie embeddings and LM head")
@@ -312,25 +318,56 @@ class Framework:
             model_load_path = self.args.model_name
 
             # Initialize model within zo_hf_init context
+            _skip_weights = bool(self.args.log_based_resume)
+            _t0_from_pretrained = _time.perf_counter()
             with zo_hf_init(self.zo_config):
-                if "opt" in self.args.model_name:
-                    from transformers import OPTForCausalLM
-                    model = OPTForCausalLM.from_pretrained(
-                        model_load_path,
-                        config=config,
-                        torch_dtype=torch_dtype,
-                        max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
-                        load_in_8bit=self.args.load_int8,
-                    )
-                elif "Qwen3" in self.args.model_name:
-                    from transformers import Qwen3ForCausalLM
-                    model = Qwen3ForCausalLM.from_pretrained(
-                        model_load_path,
-                        config=config,
-                        torch_dtype=torch_dtype,
-                        max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
-                        load_in_8bit=self.args.load_int8,
-                    )
+                if _skip_weights:
+                    # from_config: only create model skeleton (no random init), resume will fill weights
+                    from transformers import modeling_utils
+                    with modeling_utils.no_init_weights():
+                        if "opt" in self.args.model_name:
+                            from transformers import OPTForCausalLM
+                            model = OPTForCausalLM(config).to(
+                                dtype=torch_dtype, device=self.args.working_device)
+                        elif "Qwen3" in self.args.model_name:
+                            from transformers import Qwen3ForCausalLM
+                            model = Qwen3ForCausalLM(config).to(
+                                dtype=torch_dtype, device=self.args.working_device)
+                    _PHASE_TIMES["T_from_pretrained"] = _time.perf_counter() - _t0_from_pretrained
+                    _PHASE_TIMES["weight_source"] = "from_config"
+                    if loading_phase_log_enabled():
+                        logger.info(
+                            f"[Weight Source] from_config (skeleton only, "
+                            f"resume will provide weights), "
+                            f"T={_PHASE_TIMES['T_from_pretrained']:.3f}s"
+                        )
+                else:
+                    if "opt" in self.args.model_name:
+                        from transformers import OPTForCausalLM
+                        model = OPTForCausalLM.from_pretrained(
+                            model_load_path,
+                            config=config,
+                            torch_dtype=torch_dtype,
+                            max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
+                            load_in_8bit=self.args.load_int8,
+                        )
+                    elif "Qwen3" in self.args.model_name:
+                        from transformers import Qwen3ForCausalLM
+                        model = Qwen3ForCausalLM.from_pretrained(
+                            model_load_path,
+                            config=config,
+                            torch_dtype=torch_dtype,
+                            max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
+                            load_in_8bit=self.args.load_int8,
+                        )
+                    _PHASE_TIMES["T_from_pretrained"] = _time.perf_counter() - _t0_from_pretrained
+                    _PHASE_TIMES["weight_source"] = f"from_pretrained:{model_load_path}"
+                    if loading_phase_log_enabled():
+                        logger.info(
+                            f"[Weight Source] from_pretrained "
+                            f"(HF cache: {model_load_path}), "
+                            f"T={_PHASE_TIMES['T_from_pretrained']:.3f}s"
+                        )
                 if self.args.log_based_ckpt >= 0 and not self.args.log_based_resume:
                     self.initial_cpu_state_dict = OrderedDict(
                         (name, tensor.detach().to(device="cpu").clone())
@@ -344,7 +381,9 @@ class Framework:
                         f"[LogBased] Captured initial CPU state during model load "
                         f"({len(self.initial_cpu_state_dict)} tensors, {injected_mb:.1f} MB)"
                     )
+                _t0_zo_init = _time.perf_counter()
                 model.zo_init(self.zo_config)
+                _PHASE_TIMES["T_zo_init"] = _time.perf_counter() - _t0_zo_init
             logger.info(f"Check if zo2 init correctly: {hasattr(model, 'zo_training')}")
             # If using a method other than zo2, move model to working device
             if self.args.zo_method != "zo2":
@@ -353,7 +392,9 @@ class Framework:
             model.eval()
 
         # Load tokenizer
+        _t0_tokenizer = _time.perf_counter()
         tokenizer = AutoTokenizer.from_pretrained(self.args.model_name, use_fast=False)
+        _PHASE_TIMES["T_tokenizer"] = _time.perf_counter() - _t0_tokenizer
 
         # HF tokenizer bug fix
         if "opt" in self.args.model_name:
@@ -580,10 +621,12 @@ class Framework:
                     data.append({"input_ids": encoded_candidates[correct_candidate_id], "labels": encoded_candidates[correct_candidate_id]})
             return data
 
+        _t0_tokenize = _time.perf_counter()
         with count_time("Tokenizing training samples"):
             train_dataset = HFDataset(_convert(train_samples))
             eval_dataset = HFDataset(_convert(eval_samples))
-        
+        _PHASE_TIMES["T_tokenize_data"] = _time.perf_counter() - _t0_tokenize
+
         if self.args.only_train_option and not self.args.non_diff:
         #     # If --only_train_option and not with a non-differentiable objective, we wrap the forward function
         #     self.model.original_forward = self.model.forward
@@ -598,14 +641,17 @@ class Framework:
             collator = DataCollatorForTokenClassification
 
         # ZO2 added ->
+        _t0_trainer_init = _time.perf_counter()
         trainer = ZOTrainer(
-            model=self.model, 
+            model=self.model,
             args=self.args,
-            train_dataset=train_dataset, 
+            train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=self.tokenizer,
             data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
         )
+        _PHASE_TIMES["T_trainer_init"] = _time.perf_counter() - _t0_trainer_init
+        _t0_callback_setup = _time.perf_counter()
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
 
@@ -712,6 +758,7 @@ class Framework:
 
         # Handle log-based resume
         # Timer starts here — from_pretrained is before this (same for both paths).
+        _PHASE_TIMES["T_callback_setup"] = _time.perf_counter() - _t0_callback_setup
         t_full_resume_start = time.time()
         if self.args.log_based_resume:
             logger.info(f"[LogBased Resume] Resuming from log-based checkpoint: {self.args.log_based_resume}")
@@ -719,6 +766,7 @@ class Framework:
             # Both full and log-based go through resume_from_log_based.
             # Full: loads checkpoint from disk, returns state_dict
             # Log-based: loads base from _load_base_state (page cache hit) + replay
+            _t0_resume = _time.perf_counter()
             recovery = resume_from_log_based_bundle(
                 checkpoint_path=self.args.log_based_resume,
                 output_dir=self.args.output_dir,
@@ -729,16 +777,42 @@ class Framework:
                 rng_device=self.args.zo_rng_device,
                 zo2_mode=(self.args.zo_mode == "zo2"),
                 shadow_path=self.args.shadow_resume or None,
+                inplace_model=self.model,
             )
+            _PHASE_TIMES["T_resume_total"] = _time.perf_counter() - _t0_resume
             recovered_state = recovery.state_dict
-            recovered_state_on_cuda = any(
-                torch.is_tensor(tensor) and tensor.is_cuda for tensor in recovered_state.values()
-            )
-            from zo2.trainer.hf_transformers.log_based_utils import _restore_tied_weights_for_model
-            _restore_tied_weights_for_model(recovered_state, self.model)
-            _t_recovery_load_start = time.time()
-            self.model.load_state_dict(recovered_state)
-            _t_recovery_load_ms = (time.time() - _t_recovery_load_start) * 1000.0
+
+            # Log where the actual weights came from
+            if recovery.shadow_used:
+                _resume_source = f"shadow:{self.args.shadow_resume or 'tmpfs'}"
+            else:
+                _resume_source = f"checkpoint:{self.args.log_based_resume}"
+            _PHASE_TIMES["resume_source"] = _resume_source
+            if loading_phase_log_enabled():
+                logger.info(
+                    f"[Weight Source] recovery weights from {_resume_source}, "
+                    f"inplace={recovery.inplace}, shadow_used={recovery.shadow_used}, "
+                    f"T_resume_total={_PHASE_TIMES['T_resume_total']:.3f}s"
+                )
+
+            if recovery.inplace:
+                # Model already updated in-place during replay — no load_state_dict needed.
+                _t_recovery_load_ms = 0.0
+                _PHASE_TIMES["T_cpu_to_gpu"] = 0.0
+                _PHASE_TIMES["cpu_to_gpu_inplace"] = True
+                recovered_state_on_cuda = True
+                logger.info("[LogBased Resume] In-place replay: skipped load_state_dict (zero copy)")
+            else:
+                recovered_state_on_cuda = any(
+                    torch.is_tensor(tensor) and tensor.is_cuda for tensor in recovered_state.values()
+                )
+                from zo2.trainer.hf_transformers.log_based_utils import _restore_tied_weights_for_model
+                _restore_tied_weights_for_model(recovered_state, self.model)
+                _t0_cpu_to_gpu = _time.perf_counter()
+                self.model.load_state_dict(recovered_state)
+                _PHASE_TIMES["T_cpu_to_gpu"] = _time.perf_counter() - _t0_cpu_to_gpu
+                _PHASE_TIMES["cpu_to_gpu_inplace"] = False
+                _t_recovery_load_ms = _PHASE_TIMES["T_cpu_to_gpu"] * 1000.0
             if trace_enabled():
                 trace_instant(
                     panel="gpu_train",
@@ -748,6 +822,7 @@ class Framework:
                     extra={
                         "source": "shadow" if recovery.shadow_used else "checkpoint",
                         "state_on_cuda": bool(recovered_state_on_cuda),
+                        "inplace": recovery.inplace,
                     },
                 )
             if recovery.adam_state is not None:
@@ -757,6 +832,7 @@ class Framework:
                 )
 
             # Diagnostic: verify recovered model CKSUM matches original
+            _t0_diag = _time.perf_counter()
             _cksum_recovered = sum(p.data.float().sum().item() for p in self.model.parameters())
             _seen_ptrs = set()
             _cksum_unique = 0.0
@@ -771,6 +847,7 @@ class Framework:
             for name, param in self.model.named_parameters():
                 if name in ("model.embed_tokens.weight", "lm_head.weight"):
                     logger.info(f"[DIAG] post-load {name}={param.data.float().sum().item():.10e}")
+            _PHASE_TIMES["T_diag"] = _time.perf_counter() - _t0_diag
 
             # The replay path can return a full CUDA state_dict. After load_state_dict,
             # drop that temporary copy so resumed training does not keep two model copies on GPU.
@@ -804,6 +881,8 @@ class Framework:
         if self.args.resume_from_checkpoint is not None:
             last_checkpoint = self.args.resume_from_checkpoint
         trainer._t_program_start = _PROGRAM_START
+        trainer._loading_phase_times = _PHASE_TIMES
+        _PHASE_TIMES["pre_train_end"] = _time.time()
         if last_checkpoint is not None:
             trainer._t_full_resume_start = t_full_resume_start
         hf_resume_checkpoint = last_checkpoint
@@ -856,9 +935,11 @@ def result_file_tag(args):
 def main():
     args = parse_args()
 
+    _t0_main_setup = _time.perf_counter()
     set_seed(args.seed, deterministic=args.deterministic)
     task = get_task(args.task_name)
     train_sets = task.sample_train_sets(num_train=args.num_train, num_dev=args.num_dev, num_eval=args.num_eval, num_train_sets=args.num_train_sets, seed=args.train_set_seed)
+    _PHASE_TIMES["T_main_setup"] = _time.perf_counter() - _t0_main_setup
 
     # Initialize trainer and load model
     framework = Framework(args, task)

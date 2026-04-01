@@ -11,6 +11,7 @@ from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from ...utils.logging_controls import (
+    loading_phase_log_enabled as _loading_phase_log_enabled,
     resource_log_enabled,
     state_diag_log_enabled,
     state_exact_log_enabled,

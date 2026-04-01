@@ -18,7 +18,10 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
     """Measure sparse t_gen(c) and t_update(n) curves in a child process."""
     import torch
 
-    from . import log_based_checkpoint as _bdc
+    from .log_based_replay import (
+        _apply_single_update_with_pregenerated_z,
+        _generate_z_for_one_step,
+    )
     from .log_based_utils import _atomic_save_state_dict_safetensors
 
     torch.set_num_interop_threads(1)
@@ -58,7 +61,7 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
         for i in range(n_warmup + n_measure):
             seed = 1000000 + i
             t0 = time.monotonic()
-            z = _bdc._generate_z_for_one_step(seed, param_names, state, rng_device)
+            z = _generate_z_for_one_step(seed, param_names, state, rng_device)
             t1 = time.monotonic()
             if i >= n_warmup:
                 times.append(t1 - t0)
@@ -72,7 +75,7 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
     torch.set_num_threads(C_max)
     if _zo_rng is not None:
         _zo_rng.set_num_threads(C_max)
-    z_pregenerated = _bdc._generate_z_for_one_step(42, param_names, state, rng_device)
+    z_pregenerated = _generate_z_for_one_step(42, param_names, state, rng_device)
     torch.set_num_threads(_prev_aten)
     print(f"[BenchCurves] z pre-generated for t_update measurement", flush=True)
 
@@ -85,7 +88,7 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
         times = []
         for i in range(n_warmup + n_measure):
             t0 = time.monotonic()
-            _bdc._apply_single_update_with_pregenerated_z(
+            _apply_single_update_with_pregenerated_z(
                 state, dummy_update, param_names, z_pregenerated,
                 default_zo_eps=zo_eps,
                 simulate_perturbation=True,
@@ -168,6 +171,22 @@ def _interp_curve(curve_dict, x):
     return curve_dict[keys[-1]]
 
 
+def _normalize_commit_intervals(commit_interval, commit_intervals=None):
+    """Return a de-duplicated ordered list of positive commit intervals."""
+    raw_values = commit_intervals if commit_intervals is not None else [commit_interval]
+    values = []
+    seen = set()
+    for raw in raw_values:
+        interval = max(1, int(raw))
+        if interval in seen:
+            continue
+        seen.add(interval)
+        values.append(interval)
+    if not values:
+        raise ValueError("At least one commit interval is required")
+    return values
+
+
 def optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train,
                                P_max=8, n_sat_range=None,
                                t_commit=0.0, commit_interval=1):
@@ -248,12 +267,14 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
                                 n_warmup=5, n_measure=8,
                                 zo_eps=1e-3, adam_state=None,
                                 core_start=1, core_stop=None, core_step=1,
-                                commit_interval=1, measure_commit=True,
+                                commit_interval=1, commit_intervals=None,
+                                measure_commit=True,
                                 commit_n_warmup=1, commit_n_measure=2,
                                 commit_dir=DEFAULT_ZO_SHM_DIR):
     """Benchmark t_gen/t_update curves and find optimal (c, P, c_cons)."""
     if t_train is None:
         raise ValueError("t_train (GPU step time in seconds) is required")
+    commit_interval_values = _normalize_commit_intervals(commit_interval, commit_intervals)
 
     for k in state:
         if state[k].device.type != 'cpu':
@@ -312,7 +333,7 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
     logger.info(f"[CalibratePC] Spawning benchmark worker: C={C}, t_train={t_train*1000:.0f}ms, "
                 f"points={n_points}, timeout={timeout_s}s, "
                 f"n_warmup={n_warmup}, n_measure={n_measure}, "
-                f"commit_interval={commit_interval}, measure_commit={measure_commit}")
+                f"commit_intervals={commit_interval_values}, measure_commit={measure_commit}")
     p.start()
     p.join(timeout=timeout_s)
 
@@ -344,15 +365,39 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
 
     logger.info(f"[CalibratePC] t_update plateau: n=[{n_low}, {n_high}]")
 
-    opt = optimize_thread_allocation(
-        t_gen_curve,
-        t_update_curve,
-        C,
-        t_train,
-        n_sat_range=(n_low, n_high),
-        t_commit=t_commit,
-        commit_interval=commit_interval,
-    )
+    scan_results = []
+    selected_interval = None
+    selected_opt = None
+    for interval in commit_interval_values:
+        opt = optimize_thread_allocation(
+            t_gen_curve,
+            t_update_curve,
+            C,
+            t_train,
+            n_sat_range=(n_low, n_high),
+            t_commit=t_commit,
+            commit_interval=interval,
+        )
+        scan_entry = {
+            'commit_interval': interval,
+            'recommended': opt['recommended'],
+            'best_c': opt['best_c'],
+            'best_P': opt['best_P'],
+            'best_c_cons': opt['best_c_cons'],
+            'best_t_step': opt['best_t_step'],
+            'best_bottleneck': opt['best_bottleneck'],
+            'best_t_gen_P': opt['best_t_gen_P'],
+            'best_t_update_val': opt['best_t_update_val'],
+            'best_t_commit_val': opt['best_t_commit_val'],
+            'best_t_commit_avg': opt['best_t_commit_avg'],
+            'best_t_consumer_val': opt['best_t_consumer_val'],
+        }
+        scan_results.append(scan_entry)
+        if selected_opt is None or opt['best_t_step'] < selected_opt['best_t_step']:
+            selected_interval = interval
+            selected_opt = opt
+
+    opt = selected_opt
 
     per_slot_bytes = sum(state[nm].numel() * state[nm].element_size() for nm in param_names)
     adam_extra = sum(state[nm].numel() * 4 * 2 for nm in param_names) if adam_state is not None else 0
@@ -362,14 +407,24 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
     print(f"\n{'='*65}")
     print(f"Producer-Consumer Optimization (C={C}, t_train={t_train*1000:.0f}ms)")
     print(f"{'='*65}")
-    print(f"{'P':>3} {'c':>5} {'c_cons':>6} {'t_step':>8} {'bottleneck':>12}")
-    print(f"{'-'*45}")
-    for row in opt['pareto']:
-        marker = ' <--' if row is rec else ''
-        print(f"{row['P']:>3} {row['c']:>5} {row['c_cons']:>6} "
-              f"{row['t_step']*1000:>7.0f}ms {row['bottleneck']:>12}{marker}")
+    if len(scan_results) == 1:
+        print(f"{'P':>3} {'c':>5} {'c_cons':>6} {'t_step':>8} {'bottleneck':>12}")
+        print(f"{'-'*45}")
+        for row in opt['pareto']:
+            marker = ' <--' if row is rec else ''
+            print(f"{row['P']:>3} {row['c']:>5} {row['c_cons']:>6} "
+                  f"{row['t_step']*1000:>7.0f}ms {row['bottleneck']:>12}{marker}")
+    else:
+        print("Commit interval scan:")
+        print(f"{'N':>4} {'P':>3} {'c':>5} {'c_cons':>6} {'t_step':>8} {'commit/N':>10} {'bottleneck':>12}")
+        print(f"{'-'*61}")
+        for row in scan_results:
+            marker = ' <--' if row['commit_interval'] == selected_interval else ''
+            print(f"{row['commit_interval']:>4} {row['best_P']:>3} {row['best_c']:>5} {row['best_c_cons']:>6} "
+                  f"{row['best_t_step']*1000:>7.0f}ms {row['best_t_commit_avg']*1000:>9.0f}ms "
+                  f"{row['best_bottleneck']:>12}{marker}")
     print(f"\n  t_update plateau: n=[{n_low}, {n_high}]")
-    print(f"  t_commit={t_commit*1000:.0f}ms, commit_interval={commit_interval}, "
+    print(f"  t_commit={t_commit*1000:.0f}ms, commit_interval={selected_interval}, "
           f"amortized={rec['t_commit_avg']*1000:.0f}ms/step")
     print(f"  Recommended: P={rec['P']}, c={rec['c']}, c_cons={rec['c_cons']} "
           f"-> t_step={rec['t_step']*1000:.0f}ms")
@@ -379,7 +434,7 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
     print(f"    SHADOW_PIPELINE_WORKERS={rec['P']}")
     print(f"    SHADOW_CONSUMER_THREADS={rec['c_cons']}")
     print(f"    SHADOW_RESERVE_THREADS=1")
-    print(f"    SHADOW_COMMIT_INTERVAL={commit_interval}")
+    print(f"    SHADOW_COMMIT_INTERVAL={selected_interval}")
     print(f"{'='*65}\n")
 
     return {
@@ -388,7 +443,9 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
         'n_low': n_low,
         'n_high': n_high,
         't_commit': t_commit,
-        'commit_interval': commit_interval,
+        'commit_interval': selected_interval,
+        'commit_intervals': commit_interval_values,
+        'scan_results': scan_results,
         'per_slot_bytes': per_slot_bytes,
         'adam_extra_bytes': adam_extra,
         'total_bytes': total_mem,

@@ -82,13 +82,12 @@ from .log_based_shadow import (
     _build_adam_flat_layout,
     _build_shadow_flat_layout,
     _shadow_flat_meta_paths,
-    _cleanup_rebase_payload_flat,
     _init_shadow_bundle_flat_storage,
     _load_shadow_bundle_flat,
     _load_shadow_replica,
     _shadow_process_main,
-    _write_rebase_payload_flat,
 )
+from .legacy_functions import _cleanup_rebase_payload_flat
 from .log_based_utils import (
     _atomic_save_state_dict_safetensors,
     _clone_state_dict_to_cpu,
@@ -112,15 +111,6 @@ from .log_based_utils import (
 
 logger = logging.getLogger(__name__)
 LOG_METADATA_NAME = "log_metadata.pt"
-
-
-@dataclass
-class AnchorPublishTask:
-    step: int
-    base_checkpoint_state: OrderedDict
-    adam_state: dict | None
-    base_pending_seed: int
-    created_at: float
 
 
 class LogBasedCheckpointCallback(TrainerCallback):
@@ -342,6 +332,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def _anchor_latest_path(self):
         return os.path.join(self.shm_dir, f"zo_anchor_latest_{self._run_hash()}.safetensors")
 
+    def _shm_log_metadata_path(self):
+        return os.path.join(self.shm_dir, f"zo_log_metadata_{self._run_hash()}.pt")
+
+    def _shm_log_metadata_step_path(self):
+        return os.path.join(self.shm_dir, f"zo_log_metadata_{self._run_hash()}.step")
+
     def _rebase_payload_dir_path(self):
         return os.path.join(self.shm_dir, f"zo_rebase_payload_{self._run_hash()}")
 
@@ -422,64 +418,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
         except ValueError:
             return 1
 
-    def _publish_anchor_latest(self, state_dict, step, *, adam_state=None):
-        if adam_state is None:
-            adam_state = self.shadow_adam_state
-        if self.use_shadow_flat_commit:
-            os.makedirs(self.rebase_payload_dir, exist_ok=True)
-            payload_path = self._rebase_payload_header_path(step)
-            _write_rebase_payload_flat(
-                state_dict,
-                payload_path,
-                base_step=step,
-                committed_step=step,
-                tied_groups=getattr(self, "_tied_weight_groups", []),
-                adam_state=adam_state,
-                param_names=self._trainable_param_names or list(state_dict.keys()),
-            )
-            with self.anchor_publish_condition:
-                self._staged_rebase_payloads.add(payload_path)
-            return payload_path
-        if not self.anchor_latest_path:
-            return None
-        save_state = OrderedDict(
-            (key, value)
-            for key, value in state_dict.items()
-            if key not in self._shadow_secondary_keys()
-        )
-        _atomic_save_state_dict_safetensors(
-            save_state,
-            self.anchor_latest_path,
-            metadata={
-                "base_step": int(step),
-                "committed_step": int(step),
-            },
-        )
-        return self.anchor_latest_path
-
-    def _queue_shadow_rebase(self, step, path=None):
-        if self.update_queue is None:
-            return
-        try:
-            payload = {
-                "cmd": "rebase",
-                "step": int(step),
-                "path": path or self.anchor_latest_path,
-            }
-            self.update_queue.put_nowait(payload)
-        except Exception as e:
-            if not getattr(self, "_queue_error_logged", False):
-                logger.warning(f"[LogBased] Failed to send rebase to shadow: {e}")
-                self._queue_error_logged = True
-
-    def _use_async_anchor_publisher(self):
-        async_anchor = getattr(self, "_async_anchor", None) or getattr(self.trainer, "_async_anchor", None)
-        return bool(
-            self.enable_shadow and
-            self.batch_size >= 1 and
-            self.use_shadow_flat_commit and
-            async_anchor is None
-        )
+    ## Legacy methods (_publish_anchor_latest, _queue_shadow_rebase, _use_async_anchor_publisher)
+    ## have been moved to legacy_functions.py.
 
     def _clone_shadow_adam_state(self, model):
         opt = getattr(model, 'opt', None)
@@ -502,103 +442,9 @@ class LogBasedCheckpointCallback(TrainerCallback):
             'adam_eps': float(adam_state.get('adam_eps', getattr(opt, 'adam_eps', 1e-8))),
         }
 
-    def _check_anchor_publisher_health(self):
-        if self.anchor_publish_failed is not None:
-            raise RuntimeError(
-                f"anchor publisher failed previously: {self.anchor_publish_failed}"
-            )
-
-    def _start_anchor_publisher(self):
-        if not self._use_async_anchor_publisher():
-            return
-        if self.anchor_publish_thread is not None and self.anchor_publish_thread.is_alive():
-            return
-        self.anchor_publish_stop = False
-        self.anchor_publish_failed = None
-        self.anchor_publish_latest_task = None
-        self.anchor_publish_inflight_step = None
-        self.anchor_publish_completed_step = -1
-        self.anchor_publish_thread = threading.Thread(
-            target=self._anchor_publisher_main,
-            name="anchor-publisher",
-            daemon=True,
-        )
-        self.anchor_publish_thread.start()
-        logger.info("[AnchorPublisher] Started async anchor publisher thread")
-
-    def _stop_anchor_publisher(self, timeout_s=60.0):
-        thread = self.anchor_publish_thread
-        if thread is None:
-            return
-        with self.anchor_publish_condition:
-            self.anchor_publish_stop = True
-            self.anchor_publish_condition.notify_all()
-        thread.join(timeout=timeout_s)
-        if thread.is_alive():
-            logger.warning(
-                f"[AnchorPublisher] Timed out waiting for async anchor publisher to stop after {timeout_s:.1f}s"
-            )
-        else:
-            logger.info(
-                f"[AnchorPublisher] Stopped (completed_step={self.anchor_publish_completed_step})"
-            )
-        self.anchor_publish_thread = None
-        self._check_anchor_publisher_health()
-
-    def _submit_anchor_publish_task(self, task: AnchorPublishTask):
-        self._check_anchor_publisher_health()
-        with self.anchor_publish_condition:
-            previous = self.anchor_publish_latest_task
-            if previous is not None and previous.step != task.step:
-                logger.info(
-                    f"[AnchorPublisher] Dropped stale pending anchor step={previous.step} newer_step={task.step}"
-                )
-            self.anchor_publish_latest_task = task
-            self.anchor_publish_condition.notify_all()
-
-    def _publish_anchor_task(self, task: AnchorPublishTask):
-        t_total = time.time()
-        payload_path = None
-        publish_anchor_s = 0.0
-        queue_rebase_s = 0.0
-        t0 = time.time()
-        payload_path = self._publish_anchor_latest(
-            task.base_checkpoint_state,
-            task.step,
-            adam_state=task.adam_state,
-        )
-        publish_anchor_s = time.time() - t0
-        if payload_path is not None:
-            t0 = time.time()
-            self._queue_shadow_rebase(task.step, path=payload_path)
-            queue_rebase_s = time.time() - t0
-            self._last_shadow_rebased_anchor_step = int(task.step)
-        logger.info(
-            f"[AnchorPublisher] step={task.step} publish_anchor={publish_anchor_s:.3f}s "
-            f"queue_rebase={queue_rebase_s:.3f}s total={time.time() - t_total:.3f}s"
-        )
-
-    def _anchor_publisher_main(self):
-        while True:
-            with self.anchor_publish_condition:
-                while not self.anchor_publish_stop and self.anchor_publish_latest_task is None:
-                    self.anchor_publish_condition.wait()
-                if self.anchor_publish_stop and self.anchor_publish_latest_task is None:
-                    return
-                task = self.anchor_publish_latest_task
-                self.anchor_publish_latest_task = None
-                self.anchor_publish_inflight_step = task.step
-            try:
-                self._publish_anchor_task(task)
-            except Exception as exc:
-                self.anchor_publish_failed = exc
-                logger.exception(f"[AnchorPublisher] step={task.step} failed: {exc}")
-                return
-            finally:
-                with self.anchor_publish_condition:
-                    if self.anchor_publish_inflight_step == task.step:
-                        self.anchor_publish_inflight_step = None
-                    self.anchor_publish_completed_step = max(self.anchor_publish_completed_step, int(task.step))
+    ## Legacy methods (_check_anchor_publisher_health, _start_anchor_publisher,
+    ## _stop_anchor_publisher, _submit_anchor_publish_task, _publish_anchor_task,
+    ## _anchor_publisher_main) have been moved to legacy_functions.py.
 
     def _refresh_shadow_from_base(self, *, step=None, commit_now=True):
         if self.base_checkpoint_state is None:
@@ -693,7 +539,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self.output_dir = args.output_dir
         self.shm_dir = _ensure_zo_shm_dir()
         self.shadow_replica_path = self._shadow_replica_path() if self.enable_shadow else None
-        self.use_shadow_flat_commit = self.enable_shadow and os.environ.get("SHADOW_FLAT_COMMIT", "0") == "1"
+        self.use_shadow_flat_commit = self.enable_shadow and os.environ.get("SHADOW_FLAT_COMMIT", "1") == "1"
         self.shadow_flat_header_path = (
             self._shadow_flat_header_storage_path() if self.use_shadow_flat_commit else None
         )
@@ -810,7 +656,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
             self._start_shadow_process()
             if _step_diag_enabled() or _step_exact_enabled():
                 self._log_shadow_storage_exact_compare(model, self.current_step)
-            self._start_anchor_publisher()
             if self.instant_recover:
                 logger.info("[LogBased] Mode: L3 (Instant Recovery) - shadow tracking + instant recovery")
             else:
@@ -942,10 +787,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
             self._refresh_shadow_from_base(step=0, commit_now=True)
             t_refresh_shadow = time.time() - t0
         t_publish_anchor = 0.0
-        if self.anchor_latest_path:
-            t0 = time.time()
-            self._publish_anchor_latest(self.base_checkpoint_state, 0)
-            t_publish_anchor = time.time() - t0
 
         t_save_initial_model = 0.0
         if self.output_dir:
@@ -1027,11 +868,21 @@ class LogBasedCheckpointCallback(TrainerCallback):
             name for name, p in model.named_parameters() if p.requires_grad
         ]
 
-        # Load log metadata once for all metadata (pending_grad + update_history + base info)
+        # Load log metadata: prefer shm (SSD-free), fall back to SSD checkpoint
         opt_state = None
+        shm_meta_path = self._shm_log_metadata_path() if self.shm_dir else None
+        if shm_meta_path and os.path.exists(shm_meta_path):
+            try:
+                opt_state = torch.load(shm_meta_path, map_location='cpu', weights_only=False)
+                if not isinstance(opt_state, dict):
+                    opt_state = None
+                else:
+                    logger.info(f"[LogBased Resume] Loaded log metadata from shm: {shm_meta_path}")
+            except Exception as e:
+                logger.warning(f"[LogBased Resume] Failed to load shm metadata: {e}")
         meta_path = os.path.join(log_based_resume, LOG_METADATA_NAME)
         opt_path = os.path.join(log_based_resume, "optimizer.pt")
-        if os.path.exists(meta_path):
+        if opt_state is None and os.path.exists(meta_path):
             try:
                 opt_state = torch.load(meta_path, map_location='cpu', weights_only=False)
                 if not isinstance(opt_state, dict):
@@ -1149,10 +1000,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self.shadow_step = int(state.global_step)
         if self.enable_shadow:
             self._refresh_shadow_from_base(step=state.global_step, commit_now=True)
-        if self.anchor_latest_path and self.batch_size >= 1:
-            self._publish_anchor_latest(self.base_checkpoint_state, state.global_step)
-            self._last_shadow_rebased_anchor_step = int(state.global_step)
-
         self.is_first_save = False
         mem_mb = self._get_memory_size()
         t_elapsed = time.time() - t_start
@@ -1466,8 +1313,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
         if model is None:
             return
 
-        self._check_anchor_publisher_health()
-
         if self.failure_simulator.check_and_fail(self.current_step, model):
             self.failure_simulator.trigger_failure(model)
             # Unreachable — SIGKILL kills process
@@ -1477,51 +1322,21 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self.current_step = state.global_step
         self._emit_train_progress_trace(self.current_step)
 
-        async_anchor = getattr(self, "_async_anchor", None) or getattr(self.trainer, "_async_anchor", None)
-        if async_anchor is not None:
-            published = async_anchor.consume_latest_published_snapshot(self.active_base_step)
-            if published is not None:
-                published_step, published_payload = published
-                if isinstance(published_payload, tuple):
-                    published_state, published_adam_state = published_payload
-                else:
-                    published_state, published_adam_state = published_payload, None
-                self._activate_base_state(published_state, published_step, adam_state=published_adam_state)
-                if self.enable_shadow and published_step > self._last_shadow_rebased_anchor_step:
-                    if hasattr(self.trainer.model, 'opt') and hasattr(self.trainer.model.opt, 'betas') and published_adam_state is None:
-                        raise RuntimeError(
-                            f"async anchor step {published_step} published model state without Adam state"
-                        )
-                    path = self._publish_anchor_latest(
-                        published_state,
-                        published_step,
-                        adam_state=published_adam_state,
-                    )
-                    self._queue_shadow_rebase(
-                        published_step,
-                        path=path,
-                    )
-                    self._last_shadow_rebased_anchor_step = published_step
-
         if self.current_step % 10 == 0:
             num_updates = len(self.update_history)
+            if self.enable_shadow:
+                shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
+                # Health check: detect dead shadow process (log once)
+                if self.shadow_process is not None and not self.shadow_process.is_alive():
+                    if not getattr(self, '_shadow_death_logged', False):
+                        logger.error(f"[LogBased] Shadow process DEAD (exitcode={self.shadow_process.exitcode})")
+                        self._shadow_death_logged = True
+                logger.info(f"[LogBased] step={self.current_step} shadow={shadow_step} updates={num_updates}")
             if train_step_resource_log_enabled():
                 cpu_pct, mem_gb, mem_total, gpu_alloc, gpu_rsv = _system_stats()
-                if self.enable_shadow:
-                    shadow_step = self.shadow_step_val.value if self.shadow_step_val else self.shadow_step
-                    # Health check: detect dead shadow process (log once)
-                    if self.shadow_process is not None and not self.shadow_process.is_alive():
-                        if not getattr(self, '_shadow_death_logged', False):
-                            logger.error(f"[LogBased] Shadow process DEAD (exitcode={self.shadow_process.exitcode})")
-                            self._shadow_death_logged = True
-                    logger.info(f"[LogBased] step={self.current_step} shadow={shadow_step} "
-                               f"updates={num_updates} "
-                               f"| CPU={cpu_pct:.0f}% MEM={mem_gb:.0f}/{mem_total:.0f}GB "
-                               f"| GPU alloc={gpu_alloc:.0f}MB rsv={gpu_rsv:.0f}MB")
-                else:
-                    logger.info(f"[LogBased] step={self.current_step} updates={num_updates} "
-                               f"| CPU={cpu_pct:.0f}% MEM={mem_gb:.0f}/{mem_total:.0f}GB "
-                               f"| GPU alloc={gpu_alloc:.0f}MB rsv={gpu_rsv:.0f}MB")
+                logger.info(f"[LogBased] step={self.current_step} "
+                           f"| CPU={cpu_pct:.0f}% MEM={mem_gb:.0f}/{mem_total:.0f}GB "
+                           f"| GPU alloc={gpu_alloc:.0f}MB rsv={gpu_rsv:.0f}MB")
 
     def recover_from_shadow(self) -> OrderedDict:
         """Recover from the latest committed shadow replica in the configured tmpfs directory."""
@@ -1688,133 +1503,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
         updates internal state (shadow model, base checkpoint) if needed."""
         if model is None or self.batch_size < 0:
             return
-
         self.save_count += 1
-
-        if self.batch_size == 0:
-            # batch_size=0: base is always initial model, never changes. Nothing to do.
-            self.last_saved_step = state.global_step
-            return
-
-        # batch_size >= 1: update base_checkpoint_state only on full steps
-        # (trainer already set base_checkpoint_step = global_step on full steps)
-        is_full_step = (self.base_checkpoint_step == state.global_step)
-        if is_full_step:
-            # Full step: history was cleared, base must be updated to current model.
-            # Shadow (if enabled) is refreshed from new base.
-            self._update_base_and_shadow(model, state.global_step)
-        # Log steps: shadow worker catches up asynchronously, no action needed.
-
         self.last_saved_step = state.global_step
         self.is_first_save = False
 
-    def _update_base_and_shadow(self, model, step):
-        """Update base_checkpoint_state from current model (full step only for batch_size>=1).
-        GPU → CPU clone, then publish anchor latest / notify shadow to rebase."""
-        self._check_anchor_publisher_health()
-        trace_token = trace_begin(
-            panel="gpu_train",
-            lane="blocking",
-            event="full_checkpoint_refresh",
-            step=int(step),
-        )
-        t0_total = time.time()
-        t0 = time.time()
-        base_checkpoint_state = _clone_state_dict_to_cpu(model.state_dict())
-        clone_model_s = time.time() - t0
-
-        clone_adam_s = 0.0
-        shadow_adam_state = None
-        live_adam_state = None
-        if self.enable_shadow:
-            t0 = time.time()
-            opt = getattr(model, "opt", None)
-            if opt is not None and hasattr(opt, "get_adam_state"):
-                live_adam_state = opt.get_adam_state()
-            shadow_adam_state = self._clone_shadow_adam_state(model)
-            clone_adam_s = time.time() - t0
-        self.base_checkpoint_state = base_checkpoint_state
-        self.shadow_adam_state = shadow_adam_state
-        self.active_base_step = int(step)
-        self.base_checkpoint_step = int(step)
-        self._active_base_pending_seed = self._pending_seed
-        self._base_pending_seed = self._pending_seed
-
-        submit_anchor_s = 0.0
-        publish_anchor_s = 0.0
-        queue_rebase_s = 0.0
-        if self.batch_size >= 1 and self.enable_shadow:
-            if self._use_async_anchor_publisher():
-                t0 = time.time()
-                self._submit_anchor_publish_task(
-                    AnchorPublishTask(
-                        step=int(step),
-                        base_checkpoint_state=base_checkpoint_state,
-                        adam_state=shadow_adam_state,
-                        base_pending_seed=int(self._base_pending_seed),
-                        created_at=time.time(),
-                    )
-                )
-                submit_anchor_s = time.time() - t0
-            else:
-                t0 = time.time()
-                anchor_path = self._publish_anchor_latest(self.base_checkpoint_state, step)
-                publish_anchor_s = time.time() - t0
-                if anchor_path is not None:
-                    t0 = time.time()
-                    self._queue_shadow_rebase(step, path=anchor_path)
-                    queue_rebase_s = time.time() - t0
-                    self._last_shadow_rebased_anchor_step = int(step)
-
-        if time_log_enabled():
-            logger.info(
-                f"[LogBased FullCkpt] step={step} "
-                f"clone_model={clone_model_s:.3f}s clone_adam={clone_adam_s:.3f}s "
-                f"submit_anchor={submit_anchor_s:.3f}s "
-                f"publish_anchor={publish_anchor_s:.3f}s queue_rebase={queue_rebase_s:.3f}s "
-                f"total={time.time() - t0_total:.3f}s"
-            )
-        trace_end(
-            trace_token,
-            step=int(step),
-            counters={
-                "clone_model_ms": clone_model_s * 1000.0,
-                "clone_adam_ms": clone_adam_s * 1000.0,
-                "submit_anchor_ms": submit_anchor_s * 1000.0,
-                "publish_anchor_ms": publish_anchor_s * 1000.0,
-                "queue_rebase_ms": queue_rebase_s * 1000.0,
-            },
-        )
-        if _step_diag_enabled() or _step_exact_enabled():
-            if live_adam_state is not None:
-                _log_adam_checksums(f"train_snapshot step={step}", live_adam_state)
-                if _step_exact_enabled():
-                    _log_adam_exact_fingerprint(f"train_snapshot step={step}", live_adam_state)
-            if shadow_adam_state is not None:
-                _log_adam_checksums(f"shadow_snapshot step={step}", shadow_adam_state)
-                if _step_exact_enabled():
-                    _log_adam_exact_fingerprint(f"shadow_snapshot step={step}", shadow_adam_state)
-            if _step_exact_enabled() and live_adam_state is not None and shadow_adam_state is not None:
-                _log_adam_exact_compare(
-                    f"train_vs_shadow_snapshot step={step}",
-                    live_adam_state,
-                    shadow_adam_state,
-                )
-
-    def on_async_anchor_persisted(self, step, checkpoint_path):
-        self.base_checkpoint_path = checkpoint_path
-        self.base_checkpoint_step = int(step)
-        if self.shadow_adam_state is not None:
-            logger.info(
-                f"[AsyncAnchor] Base updated to step {step} with Adam base "
-                f"(t={int(self.shadow_adam_state.get('t', 0))})"
-            )
-        with self.update_lock:
-            for u in reversed(self.update_history):
-                if u['step'] <= step:
-                    self._base_pending_seed = u['seed']
-                    break
-            self.update_history = [u for u in self.update_history if u['step'] > step]
+    ## Legacy methods (_update_base_and_shadow, on_async_anchor_persisted)
+    ## have been moved to legacy_functions.py.
 
     def _get_memory_size(self):
         if self.base_checkpoint_state is None:
@@ -1848,29 +1542,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
             event="train_end_cleanup",
             step=int(state.global_step),
         )
-
-        # Shutdown async anchor checkpointer (wait for last persist to finish)
-        async_anchor = getattr(self, '_async_anchor', None)
-        if async_anchor is not None:
-            logger.info("[AsyncAnchor] Waiting for last anchor persist to complete...")
-            async_anchor.shutdown()
-            completed_step = async_anchor.get_latest_completed_anchor_step()
-            if completed_step > self.base_checkpoint_step:
-                self.on_async_anchor_persisted(
-                    completed_step,
-                    async_anchor.get_latest_completed_anchor_path(),
-                )
-            async_stats = async_anchor.stats
-            if time_log_enabled():
-                logger.info(
-                    "[AsyncAnchor] Summary: "
-                    f"enqueue_cpu count={async_stats['enqueue_cpu_count']} avg={async_stats['avg_enqueue_cpu_time']:.3f}s | "
-                    f"d2h count={async_stats['d2h_count']} avg={async_stats['avg_d2h_time']:.3f}s | "
-                    f"cpu_total count={async_stats['cpu_persist_total_count']} "
-                    f"avg={async_stats['avg_cpu_persist_total_time']:.3f}s"
-                )
-
-        self._stop_anchor_publisher()
 
         if self.enable_shadow:
             if self.update_queue is not None:

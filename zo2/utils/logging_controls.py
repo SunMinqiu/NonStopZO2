@@ -70,3 +70,7 @@ def z_exact_log_enabled() -> bool:
 
 def opt_step_log_enabled() -> bool:
     return os.environ.get("ZO_LOG_OPT_STEP", "0") == "1"
+
+
+def loading_phase_log_enabled() -> bool:
+    return os.environ.get("ZO_LOG_LOADING_PHASE", "0") == "1"

@@ -58,7 +58,7 @@ class MeZOSGD(BaseOptimizer):
         self.max_zo_random_seed = config.max_zo_random_seed
         self.debug_mode = config.debug_mode
         self.rng_device = getattr(config, 'rng_device', 'native')  # "native" or "cpu"
-        self.use_fma = os.environ.get('ZO_FMA', '0') == '1'
+        self.use_fma = os.environ.get('ZO_FMA', '1') == '1'
         defaults = dict(
             lr=self.lr,
             weight_decay=self.weight_decay,

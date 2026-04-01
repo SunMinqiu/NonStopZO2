@@ -13,6 +13,7 @@ import psutil
 import torch
 
 from ...utils.logging_controls import (
+    loading_phase_log_enabled,
     resource_log_enabled,
     shadow_step_resource_log_enabled,
     shadow_step_time_log_enabled,
@@ -690,7 +691,14 @@ def _commit_shadow_state_flat(state_dict, flat_writer, base_step, committed_step
 
 
 def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
+    import time as _time
+    _t0_total = _time.perf_counter()
+
+    # --- Phase 1: Read header JSON ---
+    _t0 = _time.perf_counter()
     header = _read_shadow_flat_header(flat_storage["header_path"])
+    _t_read_header = _time.perf_counter() - _t0
+
     if header.get("snapshot_state", "ready") != "ready":
         raise RuntimeError(
             f"shadow flat snapshot {flat_storage['header_path']} is incomplete "
@@ -707,10 +715,16 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
             f"(expected_generation={expected_generation}, snapshot_generation={generation})"
         )
     integrity_mode = _normalize_shadow_integrity_mode(header.get("integrity_mode"), header)
+
+    # --- Phase 2: Deserialize layout ---
+    _t0 = _time.perf_counter()
     layout = (
         _deserialize_flat_layout(header["layout"])
         if "layout" in header else flat_storage["layout"]
     )
+    _t_deserialize_layout = _time.perf_counter() - _t0
+
+    # --- Phase 3: Read state metadata JSON ---
     state_meta_path = flat_storage.get("state_meta_path")
     if not state_meta_path or not os.path.exists(state_meta_path):
         raise RuntimeError(
@@ -719,7 +733,10 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
             "from the old protocol. Delete the existing zo_shadow_latest_*.flat* files and rerun "
             "so shadow can be reinitialized with the new state/adam/header metadata format."
         )
+    _t0 = _time.perf_counter()
     state_meta = _read_shadow_flat_header(state_meta_path)
+    _t_read_state_meta = _time.perf_counter() - _t0
+
     if (
         state_meta.get("snapshot_state") != "ready"
         or int(state_meta.get("generation", -2)) != generation
@@ -733,26 +750,54 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
             f"state_snapshot={state_meta.get('snapshot_state')}, "
             f"header_integrity={integrity_mode}, state_integrity={state_meta.get('integrity_mode')})"
         )
+
+    # --- Phase 4: mmap open + view creation for state ---
+    _t0 = _time.perf_counter()
     fd, mm, views = _open_shadow_flat_views(layout, flat_storage["buffer_paths"][0])
+    _t_mmap_open_state = _time.perf_counter() - _t0
+
+    # --- Phase 5: Clone state tensors from mmap ---
     try:
+        _t0 = _time.perf_counter()
         state_dict = OrderedDict(
             (name, tensor.clone()) for name, tensor in views.items()
         )
+        _t_clone_state = _time.perf_counter() - _t0
+
+        # --- Phase 6: SHA256 verification (state) ---
+        _t0 = _time.perf_counter()
         loaded_state_sha256 = None
         if integrity_mode == _SHADOW_INTEGRITY_FULL_SHA256:
             loaded_state_sha256, _ = _hash_named_tensors(state_dict.items())
+        _t_sha256_state = _time.perf_counter() - _t0
     finally:
+        _t0 = _time.perf_counter()
         _close_shadow_flat_views(fd, mm, views)
+        _t_mmap_close_state = _time.perf_counter() - _t0
+
     expected_state_sha256 = state_meta.get("state_sha256")
     if integrity_mode == _SHADOW_INTEGRITY_FULL_SHA256 and loaded_state_sha256 != expected_state_sha256:
         raise RuntimeError(
             f"shadow flat snapshot {flat_storage['header_path']} failed state content verification "
             f"(expected_state_sha256={expected_state_sha256}, loaded_state_sha256={loaded_state_sha256})"
         )
+
+    # --- Phase 7: Tie weights ---
+    _t0 = _time.perf_counter()
     if tied_groups:
         _tie_state_dict_inplace(state_dict, tied_groups)
+    _t_tie_weights = _time.perf_counter() - _t0
+
+    # Compute state buffer size for bandwidth calculation
+    _state_bytes = sum(t.nelement() * t.element_size() for t in state_dict.values())
 
     adam_state = None
+    _t_read_adam_meta = 0.0
+    _t_mmap_open_adam = 0.0
+    _t_clone_adam = 0.0
+    _t_sha256_adam = 0.0
+    _t_mmap_close_adam = 0.0
+    _adam_bytes = 0
     if bool(header.get("has_adam", flat_storage.get("has_adam", False))):
         adam_layout = (
             _deserialize_flat_layout(header["adam_layout"])
@@ -766,7 +811,12 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
                 "from the old protocol. Delete the existing zo_shadow_latest_*.flat* files and rerun "
                 "so shadow can be reinitialized with the new state/adam/header metadata format."
             )
+
+        # --- Phase 8: Read adam metadata JSON ---
+        _t0 = _time.perf_counter()
         adam_meta = _read_shadow_flat_header(adam_meta_path)
+        _t_read_adam_meta = _time.perf_counter() - _t0
+
         if (
             adam_meta.get("snapshot_state") != "ready"
             or int(adam_meta.get("generation", -2)) != generation
@@ -782,6 +832,9 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
                 f"adam_snapshot={adam_meta.get('snapshot_state')}, "
                 f"header_integrity={integrity_mode}, adam_integrity={adam_meta.get('integrity_mode')})"
             )
+
+        # --- Phase 9: mmap open adam_m + adam_v ---
+        _t0 = _time.perf_counter()
         adam_m_fd, adam_m_mm, adam_m_views = _open_shadow_flat_views(
             adam_layout,
             flat_storage["adam_m_buffer_paths"][0],
@@ -790,7 +843,11 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
             adam_layout,
             flat_storage["adam_v_buffer_paths"][0],
         )
+        _t_mmap_open_adam = _time.perf_counter() - _t0
+
+        # --- Phase 10: Clone adam tensors ---
         try:
+            _t0 = _time.perf_counter()
             adam_state = {
                 "m": OrderedDict((name, tensor.clone()) for name, tensor in adam_m_views.items()),
                 "v": OrderedDict((name, tensor.clone()) for name, tensor in adam_v_views.items()),
@@ -801,14 +858,25 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
                 ),
                 "adam_eps": float(header.get("adam_eps", 1e-8)),
             }
+            _t_clone_adam = _time.perf_counter() - _t0
+
+            _adam_bytes = sum(t.nelement() * t.element_size() for t in adam_state["m"].values()) + \
+                          sum(t.nelement() * t.element_size() for t in adam_state["v"].values())
+
+            # --- Phase 11: SHA256 verification (adam) ---
+            _t0 = _time.perf_counter()
             loaded_adam_m_sha256 = None
             loaded_adam_v_sha256 = None
             if integrity_mode == _SHADOW_INTEGRITY_FULL_SHA256:
                 loaded_adam_m_sha256, _ = _hash_named_tensors(adam_state["m"].items())
                 loaded_adam_v_sha256, _ = _hash_named_tensors(adam_state["v"].items())
+            _t_sha256_adam = _time.perf_counter() - _t0
         finally:
+            _t0 = _time.perf_counter()
             _close_shadow_flat_views(adam_m_fd, adam_m_mm, adam_m_views)
             _close_shadow_flat_views(adam_v_fd, adam_v_mm, adam_v_views)
+            _t_mmap_close_adam = _time.perf_counter() - _t0
+
         expected_adam_m_sha256 = adam_meta.get("adam_m_sha256")
         expected_adam_v_sha256 = adam_meta.get("adam_v_sha256")
         if integrity_mode == _SHADOW_INTEGRITY_FULL_SHA256 and loaded_adam_m_sha256 != expected_adam_m_sha256:
@@ -824,6 +892,40 @@ def _load_shadow_bundle_flat(flat_storage, tied_groups=None):
 
     base_step = int(header.get("base_step", "0"))
     committed_step = int(header.get("committed_step", "0"))
+
+    _t_total = _time.perf_counter() - _t0_total
+    _total_bytes = _state_bytes + _adam_bytes
+    _clone_total = _t_clone_state + _t_clone_adam
+    _sha256_total = _t_sha256_state + _t_sha256_adam
+    _bw_clone = (_total_bytes / _clone_total / 1e9) if _clone_total > 0 else 0.0
+    if loading_phase_log_enabled():
+        logger.info(
+            f"[Shadow Load Timing] total={_t_total:.4f}s "
+            f"| read_header={_t_read_header:.4f}s "
+            f"deserialize_layout={_t_deserialize_layout:.4f}s "
+            f"read_state_meta={_t_read_state_meta:.4f}s "
+            f"| mmap_open_state={_t_mmap_open_state:.4f}s "
+            f"clone_state={_t_clone_state:.4f}s ({_state_bytes/1e6:.1f}MB) "
+            f"sha256_state={_t_sha256_state:.4f}s "
+            f"mmap_close_state={_t_mmap_close_state:.4f}s "
+            f"| tie_weights={_t_tie_weights:.4f}s"
+        )
+        if adam_state is not None:
+            logger.info(
+                f"[Shadow Load Timing] adam: "
+                f"read_adam_meta={_t_read_adam_meta:.4f}s "
+                f"mmap_open_adam={_t_mmap_open_adam:.4f}s "
+                f"clone_adam={_t_clone_adam:.4f}s ({_adam_bytes/1e6:.1f}MB) "
+                f"sha256_adam={_t_sha256_adam:.4f}s "
+                f"mmap_close_adam={_t_mmap_close_adam:.4f}s"
+            )
+        logger.info(
+            f"[Shadow Load Timing] summary: "
+            f"clone_total={_clone_total:.4f}s sha256_total={_sha256_total:.4f}s "
+            f"data={_total_bytes/1e6:.1f}MB clone_bw={_bw_clone:.1f}GB/s "
+            f"num_tensors={len(state_dict)} integrity={integrity_mode}"
+        )
+
     logger.info(
         f"[Shadow Recovery] Loaded {len(state_dict)} tensors from flat storage, "
         f"base_step={base_step} committed_step={committed_step}"
@@ -839,119 +941,8 @@ def _load_shadow_flat_replica(flat_storage, tied_groups=None):
     return state_dict, base_step, committed_step
 
 
-def _write_rebase_payload_flat(
-    state_dict,
-    header_path,
-    *,
-    base_step,
-    committed_step,
-    tied_groups=None,
-    adam_state=None,
-    param_names=None,
-):
-    save_state = OrderedDict(
-        (key, value)
-        for key, value in state_dict.items()
-        if key not in _secondary_tied_keys(tied_groups)
-    )
-    layout = _build_shadow_flat_layout(save_state)
-    payload_paths = _rebase_payload_paths(header_path)
-    _ensure_shadow_flat_files((payload_paths["state_path"],), int(layout["total_bytes"]))
-    fd, mm, views = _open_shadow_flat_views(layout, payload_paths["state_path"])
-    try:
-        _copy_shadow_flat_views_from_state(views, save_state)
-        mm.flush()
-    finally:
-        _close_shadow_flat_views(fd, mm, views)
-
-    has_adam = bool(adam_state is not None)
-    adam_layout = {"entries": [], "total_bytes": 0}
-    if has_adam:
-        adam_layout = _build_adam_flat_layout(save_state, param_names or list(save_state.keys()))
-        _ensure_shadow_flat_files((payload_paths["adam_m_path"],), int(adam_layout["total_bytes"]))
-        _ensure_shadow_flat_files((payload_paths["adam_v_path"],), int(adam_layout["total_bytes"]))
-        adam_m_fd, adam_m_mm, adam_m_views = _open_shadow_flat_views(adam_layout, payload_paths["adam_m_path"])
-        adam_v_fd, adam_v_mm, adam_v_views = _open_shadow_flat_views(adam_layout, payload_paths["adam_v_path"])
-        try:
-            _copy_shadow_flat_views_from_adam(adam_m_views, (adam_state or {}).get("m"))
-            _copy_shadow_flat_views_from_adam(adam_v_views, (adam_state or {}).get("v"))
-            adam_m_mm.flush()
-            adam_v_mm.flush()
-        finally:
-            _close_shadow_flat_views(adam_m_fd, adam_m_mm, adam_m_views)
-            _close_shadow_flat_views(adam_v_fd, adam_v_mm, adam_v_views)
-
-    _write_shadow_flat_header(
-        header_path,
-        {
-            "kind": "rebase_payload_flat",
-            "base_step": int(base_step),
-            "committed_step": int(committed_step),
-            "has_adam": has_adam,
-            "adam_t": int((adam_state or {}).get("t", 0)) if has_adam else 0,
-            "adam_beta1": float((adam_state or {}).get("betas", (0.0, 0.0))[0]) if has_adam else 0.0,
-            "adam_beta2": float((adam_state or {}).get("betas", (0.0, 0.0))[1]) if has_adam else 0.0,
-            "adam_eps": float((adam_state or {}).get("adam_eps", 0.0)) if has_adam else 0.0,
-            "layout": _serialize_flat_layout(layout),
-            "adam_layout": _serialize_flat_layout(adam_layout),
-            "state_path": payload_paths["state_path"],
-            "adam_m_path": payload_paths["adam_m_path"] if has_adam else "",
-            "adam_v_path": payload_paths["adam_v_path"] if has_adam else "",
-        },
-    )
-    return header_path
-
-
-def _cleanup_rebase_payload_flat(header_path):
-    if not header_path:
-        return
-    payload_paths = _rebase_payload_paths(header_path)
-    for path in (
-        payload_paths["state_path"],
-        payload_paths["adam_m_path"],
-        payload_paths["adam_v_path"],
-        header_path,
-    ):
-        if path and os.path.exists(path):
-            os.unlink(path)
-
-
-def _load_rebase_payload_flat(header_path, tied_groups=None, cleanup=False):
-    header = _read_shadow_flat_header(header_path)
-    layout = _deserialize_flat_layout(header["layout"])
-    fd, mm, views = _open_shadow_flat_views(layout, header["state_path"])
-    try:
-        state_dict = OrderedDict((name, tensor.clone()) for name, tensor in views.items())
-    finally:
-        _close_shadow_flat_views(fd, mm, views)
-    if tied_groups:
-        _tie_state_dict_inplace(state_dict, tied_groups)
-
-    adam_state = None
-    if bool(header.get("has_adam", False)):
-        adam_layout = _deserialize_flat_layout(header["adam_layout"])
-        adam_m_fd, adam_m_mm, adam_m_views = _open_shadow_flat_views(adam_layout, header["adam_m_path"])
-        adam_v_fd, adam_v_mm, adam_v_views = _open_shadow_flat_views(adam_layout, header["adam_v_path"])
-        try:
-            adam_state = {
-                "m": OrderedDict((name, tensor.clone()) for name, tensor in adam_m_views.items()),
-                "v": OrderedDict((name, tensor.clone()) for name, tensor in adam_v_views.items()),
-                "t": int(header.get("adam_t", 0)),
-                "betas": (
-                    float(header.get("adam_beta1", 0.9)),
-                    float(header.get("adam_beta2", 0.999)),
-                ),
-                "adam_eps": float(header.get("adam_eps", 1e-8)),
-            }
-        finally:
-            _close_shadow_flat_views(adam_m_fd, adam_m_mm, adam_m_views)
-            _close_shadow_flat_views(adam_v_fd, adam_v_mm, adam_v_views)
-
-    base_step = int(header.get("base_step", 0))
-    committed_step = int(header.get("committed_step", 0))
-    if cleanup:
-        _cleanup_rebase_payload_flat(header_path)
-    return state_dict, adam_state, base_step, committed_step
+## Legacy rebase payload functions (_write_rebase_payload_flat, _cleanup_rebase_payload_flat,
+## _load_rebase_payload_flat) have been moved to legacy_functions.py.
 
 
 def _close_shadow_flat_writer(flat_writer):
@@ -1031,72 +1022,8 @@ def _clone_working_state(initial_state, tied_groups):
     return working
 
 
-def _rebase_working_state(anchor_ref, tied_groups, _logger):
-    if isinstance(anchor_ref, dict):
-        rebased, adam_state, base_step, committed_step = _load_shadow_bundle_flat(
-            anchor_ref,
-            tied_groups=tied_groups,
-        )
-    elif isinstance(anchor_ref, str) and anchor_ref.endswith(".json"):
-        rebased, adam_state, base_step, committed_step = _load_rebase_payload_flat(
-            anchor_ref,
-            tied_groups=tied_groups,
-            cleanup=True,
-        )
-    else:
-        rebased, base_step, committed_step = _load_shadow_replica(anchor_ref, tied_groups=tied_groups)
-        adam_state = None
-    if tied_groups:
-        _tie_state_dict_inplace(rebased, tied_groups)
-    _logger.info(f"[Shadow] Rebased from {anchor_ref} at step {committed_step}")
-    return rebased, adam_state, base_step, committed_step
-
-
-def _trim_retained_updates(retained_updates, floor_step):
-    stale_steps = [step for step in retained_updates if step <= floor_step]
-    for step in stale_steps:
-        retained_updates.pop(step, None)
-
-
-def _replay_retained_suffix(
-    retained_updates,
-    rebase_step,
-    working_state,
-    param_names,
-    rng_device,
-    simulate_perturbation,
-    default_zo_eps,
-    adam_state,
-    _bdc,
-    _logger,
-):
-    replayed_steps = []
-    for step in sorted(retained_updates):
-        if step <= rebase_step:
-            continue
-        update = retained_updates[step]
-        z_dict = _bdc._generate_z_for_one_step(update["seed"], param_names, working_state, rng_device)
-        try:
-            _bdc._apply_single_update_with_pregenerated_z(
-                working_state,
-                update,
-                param_names,
-                z_dict,
-                default_zo_eps=default_zo_eps,
-                simulate_perturbation=simulate_perturbation,
-                adam_state=adam_state,
-                _diag_logger=_logger,
-            )
-        finally:
-            del z_dict
-        replayed_steps.append(step)
-    if replayed_steps:
-        _logger.info(
-            f"[Shadow] Replay-after-rebase: base={rebase_step} "
-            f"replayed={len(replayed_steps)} last={replayed_steps[-1]}"
-        )
-        return replayed_steps[-1]
-    return rebase_step
+## Legacy functions (_rebase_working_state, _trim_retained_updates, _replay_retained_suffix)
+## have been moved to legacy_functions.py.
 
 
 def _shadow_process_main(
@@ -1330,7 +1257,7 @@ def _shadow_process_serial(
     ready_event=None,
     boot_trace_token=None,
 ):
-    from . import log_based_checkpoint as _bdc
+    from . import log_based_replay as _bdc
 
     t0_clone = time.perf_counter()
     working_state = _clone_working_state(initial_state, tied_groups)
@@ -1349,7 +1276,6 @@ def _shadow_process_serial(
     last_applied_step = durable_step
     desired_commit_step = durable_step
     pending_since_commit = 0
-    retained_updates = {}
 
     def _commit_if_needed(target_step, reason):
         nonlocal durable_step, desired_commit_step, pending_since_commit
@@ -1404,65 +1330,6 @@ def _shadow_process_serial(
         if kind == "stop":
             trace_instant(panel="cpu_shadow", lane="shadow_main", event="shadow_stop", step=int(durable_step))
             break
-        if kind == "rebase":
-            rebase_token = trace_begin(
-                panel="cpu_shadow",
-                lane="shadow_main",
-                event="shadow_rebase",
-                step=int(durable_step),
-            )
-            anchor_ref = cmd.get("flat_storage") if isinstance(cmd, dict) else None
-            if anchor_ref is None:
-                anchor_ref = cmd["path"]
-            working_state, rebased_adam_state, base_step, durable_step = _rebase_working_state(
-                anchor_ref, tied_groups, _logger
-            )
-            if flat_writer is not None:
-                _reserve_shadow_epoch(flat_writer, reason="rebase")
-            if rebased_adam_state is not None:
-                adam_state = rebased_adam_state
-                if _step_diag_enabled() or _step_exact_enabled():
-                    _log_adam_checksums(
-                        f"shadow_rebase base_step={base_step} committed_step={durable_step}",
-                        adam_state,
-                        _logger=_logger,
-                    )
-                    if _step_exact_enabled():
-                        _log_adam_exact_fingerprint(
-                            f"shadow_rebase base_step={base_step} committed_step={durable_step}",
-                            adam_state,
-                            _logger=_logger,
-                        )
-            elif adam_state is not None:
-                raise RuntimeError("[Shadow] Rebase source has no Adam state for MeZO-Adam")
-            last_applied_step = _replay_retained_suffix(
-                retained_updates,
-                durable_step,
-                working_state,
-                param_names,
-                rng_device,
-                simulate_perturbation,
-                default_zo_eps,
-                adam_state,
-                _bdc,
-                _logger,
-            )
-            desired_commit_step = int(last_applied_step)
-            pending_since_commit = max(0, desired_commit_step - durable_step)
-            _commit_if_needed(desired_commit_step, "Rebase")
-            _trim_retained_updates(retained_updates, durable_step)
-            trace_end(
-                rebase_token,
-                step=int(durable_step),
-                counters={"base_step": int(base_step), "durable_step": int(durable_step)},
-            )
-            wait_token = trace_begin(
-                panel="cpu_shadow",
-                lane="shadow_main",
-                event="shadow_wait_update",
-                step=int(durable_step),
-            )
-            continue
         if kind != "update":
             wait_token = trace_begin(
                 panel="cpu_shadow",
@@ -1474,7 +1341,6 @@ def _shadow_process_serial(
 
         update = cmd["update"]
         step = int(update["step"])
-        retained_updates[step] = update
         if step <= last_applied_step:
             wait_token = trace_begin(
                 panel="cpu_shadow",
@@ -1580,7 +1446,7 @@ def _shadow_process_pipelined(
     ready_event=None,
     boot_trace_token=None,
 ):
-    from . import log_based_checkpoint as _bdc
+    from . import log_based_replay as _bdc
 
     shadow_bytes = sum(initial_state[nm].numel() * initial_state[nm].element_size() for nm in param_names)
     t0_clone = time.perf_counter()
@@ -1612,7 +1478,6 @@ def _shadow_process_pipelined(
     next_step_to_assign = [consumer_step]
 
     producer_timing = {"duration_ms": 0.0}
-    retained_updates = {}
     generation = [0]
 
     def producer():
@@ -1677,14 +1542,8 @@ def _shadow_process_pipelined(
     def _reseed_internal_updates():
         with internal_lock:
             internal_updates.clear()
-            for step_idx, update in retained_updates.items():
-                if int(step_idx) >= int(consumer_step):
-                    internal_updates[int(step_idx)] = update
         next_step_to_assign[0] = consumer_step
-        if internal_updates:
-            update_available_event.set()
-        else:
-            update_available_event.clear()
+        update_available_event.clear()
 
     def _pause_and_commit(target_step, reason):
         nonlocal threads, durable_step, desired_commit_step, pending_since_commit
@@ -1767,76 +1626,8 @@ def _shadow_process_pipelined(
                         _log_durable_publish(durable_step, working_state, adam_state, _logger)
                     _logger.info("[Shadow Pipeline] Stopped")
                     return
-                if kind == "rebase":
-                    rebase_token = trace_begin(
-                        panel="cpu_shadow",
-                        lane="shadow_main",
-                        event="shadow_rebase",
-                        step=int(durable_step),
-                    )
-                    _stop_producers(threads)
-                    generation[0] += 1
-                    with internal_lock:
-                        internal_updates.clear()
-                    pending_results.clear()
-                    _drain_result_queue()
-                    update_available_event.clear()
-                    anchor_ref = cmd.get("flat_storage") if isinstance(cmd, dict) else None
-                    if anchor_ref is None:
-                        anchor_ref = cmd["path"]
-                    working_state, rebased_adam_state, base_step, durable_step = _rebase_working_state(
-                        anchor_ref, tied_groups, _logger
-                    )
-                    if flat_writer is not None:
-                        _reserve_shadow_epoch(flat_writer, reason="rebase")
-                    if rebased_adam_state is not None:
-                        adam_state = rebased_adam_state
-                        if _step_diag_enabled() or _step_exact_enabled():
-                            _log_adam_checksums(
-                                f"shadow_rebase base_step={base_step} committed_step={durable_step}",
-                                adam_state,
-                                _logger=_logger,
-                            )
-                            if _step_exact_enabled():
-                                _log_adam_exact_fingerprint(
-                                    f"shadow_rebase base_step={base_step} committed_step={durable_step}",
-                                    adam_state,
-                                    _logger=_logger,
-                                )
-                    elif adam_state is not None:
-                        raise RuntimeError("[Shadow] Rebase source has no Adam state for MeZO-Adam")
-                    last_applied_step = _replay_retained_suffix(
-                        retained_updates,
-                        durable_step,
-                        working_state,
-                        param_names,
-                        rng_device,
-                        simulate_perturbation,
-                        default_zo_eps,
-                        adam_state,
-                        _bdc,
-                        _logger,
-                    )
-                    desired_commit_step = int(last_applied_step)
-                    consumer_step = desired_commit_step + 1
-                    pending_since_commit = max(0, desired_commit_step - durable_step)
-                    _pause_and_commit(desired_commit_step, "Rebase")
-                    _trim_retained_updates(retained_updates, durable_step)
-                    trace_end(
-                        rebase_token,
-                        step=int(durable_step),
-                        counters={"base_step": int(base_step), "durable_step": int(durable_step)},
-                    )
-                    wait_token = trace_begin(
-                        panel="cpu_shadow",
-                        lane="shadow_main",
-                        event="shadow_wait_update",
-                        step=int(durable_step),
-                    )
-                    continue
                 if kind == "update":
                     update = cmd["update"]
-                    retained_updates[int(update["step"])] = update
                     with internal_lock:
                         internal_updates[int(update["step"])] = update
                     update_available_event.set()

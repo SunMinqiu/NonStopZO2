@@ -33,18 +33,14 @@ _DISPLAY_NAMES = {
 _TIMELINE_VISIBLE = {
     "framework_overhead",
     "train_step",
-    "checkpoint_d2h_copy",
     "checkpoint_cpu_serialize",
     "checkpoint_rng_save",
     "checkpoint_disk_persist",
     "checkpoint_model_persist",
     "checkpoint_save",
     "wait_shadow_ready",
-    "wait_anchor_persist",
-    "wait_anchor_buffer",
     "recover_shadow",
     "replay_updates",
-    "full_checkpoint_refresh",
     "train_end_cleanup",
     "resume_begin",
     "resume_end",
@@ -52,22 +48,15 @@ _TIMELINE_VISIBLE = {
     "shadow_wait_update",
     "shadow_apply",
     "shadow_commit",
-    "shadow_rebase",
     "shadow_stop",
-    "anchor_d2h_copy",
-    "anchor_publish_latest",
-    "anchor_persist",
 }
 
 _TOPLEVEL_TIMELINE_EVENTS = {
     "framework_overhead",
     "train_step",
     "wait_shadow_ready",
-    "wait_anchor_persist",
-    "wait_anchor_buffer",
     "recover_shadow",
     "replay_updates",
-    "full_checkpoint_refresh",
     "train_end_cleanup",
     "resume_begin",
     "resume_end",
@@ -75,19 +64,26 @@ _TOPLEVEL_TIMELINE_EVENTS = {
     "shadow_wait_update",
     "shadow_apply",
     "shadow_commit",
-    "shadow_rebase",
     "shadow_stop",
 }
 
 _SHADOW_BLOCK_EVENTS = {
     "wait_shadow_ready",
-    "wait_anchor_persist",
-    "wait_anchor_buffer",
     "recover_shadow",
     "replay_updates",
-    "full_checkpoint_refresh",
     "resume_begin",
     "resume_end",
+}
+
+_LEGACY_TIMELINE_VISIBLE = {
+    "checkpoint_d2h_copy",
+    "wait_anchor_persist",
+    "wait_anchor_buffer",
+    "full_checkpoint_refresh",
+    "shadow_rebase",
+    "anchor_d2h_copy",
+    "anchor_publish_latest",
+    "anchor_persist",
 }
 
 
@@ -148,6 +144,7 @@ def build_spans(records):
                     "pid": record.get("pid"),
                     "tid": record.get("tid"),
                     "triggered_by": begin.get("triggered_by"),
+                    "counters": record.get("counters"),
                 }
             )
         elif phase == "I":
@@ -240,9 +237,15 @@ def _extract_step_series(records, event_name, key, panel=None):
 def _group_span_durations_by_event(spans):
     grouped = defaultdict(list)
     for span in spans:
-        duration_ms = span.get("duration_ms")
-        if duration_ms is None:
-            duration_ms = (span["end_ns"] - span["start_ns"]) / 1_000_000.0
+        # For async d2h spans, prefer the accurate d2h_ms counter over
+        # the wall-clock span duration (which includes queue wait + synchronize).
+        counters = span.get("counters") or {}
+        if span["event"] == "anchor_d2h_copy" and "d2h_ms" in counters:
+            duration_ms = counters["d2h_ms"]
+        else:
+            duration_ms = span.get("duration_ms")
+            if duration_ms is None:
+                duration_ms = (span["end_ns"] - span["start_ns"]) / 1_000_000.0
         grouped[span["event"]].append(float(duration_ms))
     return grouped
 
@@ -252,6 +255,24 @@ def _collect_event_samples(grouped, event_names):
     for event_name in event_names:
         samples.extend(grouped.get(event_name, []))
     return samples
+
+
+def _extract_loading_phase_breakdown(records, source):
+    """Extract the latest loading_phase_breakdown instant for a given source (fresh/recovery).
+    Returns a dict of {phase_name: ms, ..., _extra: {...}} or None."""
+    for record in reversed(records):
+        if record.get("phase") != "I":
+            continue
+        if record.get("event") != "loading_phase_breakdown":
+            continue
+        extra = record.get("extra") or {}
+        if extra.get("source") != source:
+            continue
+        counters = record.get("counters") or {}
+        result = {k: float(v) for k, v in counters.items()}
+        result["_extra"] = extra
+        return result
+    return None
 
 
 def _extract_instant_counter(records, event_name, key, panel=None, extra_key=None, extra_value=None):
@@ -412,8 +433,20 @@ def summarize_trace(trace_or_records, spans=None, instants=None):
 
     replay_cuda = _extract_instant_counter(records, "replay_step", "replay_total_ms", panel="gpu_train", extra_key="device", extra_value="cuda")
     replay_cpu = _extract_instant_counter(records, "replay_step", "replay_total_ms", panel="gpu_train", extra_key="device", extra_value="cpu")
-    first_step_latency = _extract_instant_counter(records, "first_step_latency", "program_to_first_step_ms", panel="gpu_train")
+    first_step_latency_fresh = _extract_instant_counter(records, "first_step_latency", "program_to_first_step_ms", panel="gpu_train", extra_key="source", extra_value="fresh")
+    _recovery_program_to_first = _extract_instant_counter(records, "first_step_latency", "program_to_first_step_ms", panel="gpu_train", extra_key="source", extra_value="recovery")
+    _recovery_replay_ms = _extract_instant_counter(records, "replay_step", "replay_total_ms", panel="gpu_train", extra_key="device", extra_value="cuda")
+    # L_cpu = program_to_first_step minus replay time (replay is accounted separately as t_r * D)
+    _replay_total_for_recovery = sum(_recovery_replay_ms) if _recovery_replay_ms else 0.0
+    first_step_latency_recovery = [p - _replay_total_for_recovery / max(1, len(_recovery_program_to_first)) for p in _recovery_program_to_first] if _recovery_program_to_first else []
+    # Backwards compat: if no source tag found, fall back to untagged instants
+    if not first_step_latency_fresh and not first_step_latency_recovery:
+        first_step_latency_fresh = _extract_instant_counter(records, "first_step_latency", "program_to_first_step_ms", panel="gpu_train")
     recovery_load_shadow = _extract_instant_counter(records, "recovery_load", "load_cpu_to_gpu_ms", panel="gpu_train", extra_key="source", extra_value="shadow")
+
+    # Extract loading phase breakdowns (emitted by _emit_loading_phase_breakdown)
+    _loading_breakdown_fresh = _extract_loading_phase_breakdown(records, source="fresh")
+    _loading_breakdown_recovery = _extract_loading_phase_breakdown(records, source="recovery")
 
     replay_cuda_stats = _derive_replay_steady(replay_cuda)
     replay_cpu_stats = _derive_replay_steady(replay_cpu)
@@ -464,27 +497,27 @@ def summarize_trace(trace_or_records, spans=None, instants=None):
             **(_stat_block(checkpoint_persist_samples) or {}),
             "status": "exact",
         } if checkpoint_persist_samples else None,
-        "t_cp": {**(_stat_block(span_by_event.get("shadow_commit", [])) or {}), "status": "exact"} if span_by_event.get("shadow_commit") else None,
+        "t_cp": None,  # derived below: commit_avg / commit_interval
         "t_r": {**replay_cuda_stats, "status": "derived"} if replay_cuda_stats is not None else None,
-        "t_rc": {**replay_cpu_stats, "status": "derived"} if replay_cpu_stats is not None else None,
+        "t_rc": {**(_stat_block(span_by_event.get("shadow_apply", [])) or {}), "status": "exact"} if span_by_event.get("shadow_apply") else None,
         "L_disk": {
-            "count": len(first_step_latency),
-            "total_ms": float(sum(first_step_latency)),
-            "avg_ms": float(statistics.mean(first_step_latency)),
-            "p50_ms": float(_percentile(first_step_latency, 0.50)),
-            "p95_ms": float(_percentile(first_step_latency, 0.95)),
-            "max_ms": float(max(first_step_latency)),
+            "count": len(first_step_latency_fresh),
+            "total_ms": float(sum(first_step_latency_fresh)),
+            "avg_ms": float(statistics.mean(first_step_latency_fresh)),
+            "p50_ms": float(_percentile(first_step_latency_fresh, 0.50)),
+            "p95_ms": float(_percentile(first_step_latency_fresh, 0.95)),
+            "max_ms": float(max(first_step_latency_fresh)),
             "status": "exact",
-        } if first_step_latency else None,
+        } if first_step_latency_fresh else None,
         "L_cpu": {
-            "count": len(recovery_load_shadow),
-            "total_ms": float(sum(recovery_load_shadow) + replay_cold_ms),
-            "avg_ms": float((statistics.mean(recovery_load_shadow) if recovery_load_shadow else 0.0) + replay_cold_ms),
-            "p50_ms": float((_percentile(recovery_load_shadow, 0.50) if recovery_load_shadow else 0.0) + replay_cold_ms),
-            "p95_ms": float((_percentile(recovery_load_shadow, 0.95) if recovery_load_shadow else 0.0) + replay_cold_ms),
-            "max_ms": float((max(recovery_load_shadow) if recovery_load_shadow else 0.0) + replay_cold_ms),
-            "status": "derived",
-        } if (recovery_load_shadow or replay_cold_ms > 0.0) else None,
+            "count": len(first_step_latency_recovery),
+            "total_ms": float(sum(first_step_latency_recovery)),
+            "avg_ms": float(statistics.mean(first_step_latency_recovery)),
+            "p50_ms": float(_percentile(first_step_latency_recovery, 0.50)),
+            "p95_ms": float(_percentile(first_step_latency_recovery, 0.95)),
+            "max_ms": float(max(first_step_latency_recovery)),
+            "status": "exact",
+        } if first_step_latency_recovery else None,
         "L_cpu_cold": {
             "count": 1,
             "total_ms": float(replay_cold_ms),
@@ -494,7 +527,25 @@ def summarize_trace(trace_or_records, spans=None, instants=None):
             "max_ms": float(replay_cold_ms),
             "status": "derived",
         } if replay_cold_ms > 0.0 else None,
+        "L_disk_breakdown": _loading_breakdown_fresh,
+        "L_cpu_breakdown": _loading_breakdown_recovery,
     }
+
+    # Derive t_cp = amortised shadow commit cost per training step
+    shadow_commit_spans = span_by_event.get("shadow_commit", [])
+    shadow_apply_spans = span_by_event.get("shadow_apply", [])
+    raw_commit_stats = _stat_block(shadow_commit_spans)
+    if raw_commit_stats and shadow_commit_spans and shadow_apply_spans:
+        commit_count = len(shadow_commit_spans)
+        apply_count = len(shadow_apply_spans)
+        commit_interval = max(1, apply_count // commit_count) if commit_count > 0 else 1
+        named_time_metrics["t_cp"] = {
+            "count": apply_count,
+            "total_ms": raw_commit_stats["total_ms"],
+            "avg_ms": raw_commit_stats["avg_ms"] / commit_interval,
+            "commit_interval": commit_interval,
+            "status": "derived",
+        }
 
     return {
         "overview": {
@@ -552,6 +603,34 @@ def print_summary(summary, *, top_n=20):
             line += f" cold_start_s={stats['cold_start_ms'] / 1000.0:.3f}"
         line += f" count={stats['count']}"
         print(line)
+        # Print phase breakdown under L_disk / L_cpu
+        breakdown_key = f"{name}_breakdown" if name in ("L_disk", "L_cpu") else None
+        breakdown = summary["named_time_metrics"].get(breakdown_key) if breakdown_key else None
+        if breakdown:
+            total_ms = breakdown.get("total_ms", 0.0)
+            _phase_order = [
+                "T_import", "T_main_setup", "T_config", "T_from_pretrained",
+                "T_zo_init", "T_tokenizer", "T_tokenize_data", "T_trainer_init",
+                "T_callback_setup", "T_resume_total", "T_cpu_to_gpu",
+                "T_diag", "T_hf_inner",
+            ]
+            _extra = breakdown.get("_extra") or {}
+            _weight_source = _extra.get("weight_source", "")
+            _resume_source = _extra.get("resume_source", "")
+            _inplace = _extra.get("inplace", False)
+            for phase in _phase_order:
+                phase_ms = breakdown.get(f"{phase}_ms")
+                if phase_ms is None:
+                    continue
+                pct = phase_ms / total_ms * 100.0 if total_ms > 0 else 0.0
+                ann = ""
+                if phase == "T_from_pretrained" and _weight_source:
+                    ann = f" [{_weight_source}]"
+                elif phase == "T_resume_total" and _resume_source:
+                    ann = f" [{_resume_source}]"
+                elif phase == "T_cpu_to_gpu" and _inplace:
+                    ann = " [inplace]"
+                print(f"  {phase:22s} = {phase_ms / 1000.0:7.3f}s ({pct:5.1f}%){ann}")
     print()
 
     print("=== Resource Stats ===")
@@ -658,11 +737,11 @@ def plot_timeline(trace_or_records, spans=None, instants=None, *, figsize=(18, 1
     for ax, panel in zip(axes, panel_order):
         panel_spans = [
             item for item in spans
-            if item["panel"] == panel and item["event"] in _TIMELINE_VISIBLE
+            if item["panel"] == panel and item["event"] in (_TIMELINE_VISIBLE | _LEGACY_TIMELINE_VISIBLE)
         ]
         panel_instants = [
             item for item in instants
-            if item["panel"] == panel and item["event"] in _TIMELINE_VISIBLE
+            if item["panel"] == panel and item["event"] in (_TIMELINE_VISIBLE | _LEGACY_TIMELINE_VISIBLE)
         ]
         row_keys = []
         present = {item["event"] for item in panel_spans}
