@@ -53,6 +53,8 @@ SHADOW_PIPELINE_WORKERS=${SHADOW_PIPELINE_WORKERS:-2}
 ASYNC_ANCHOR=${ASYNC_ANCHOR:-0}
 OUTPUT_LOG=${OUTPUT_LOG:-""}
 LOG_BASED_RESUME=${LOG_BASED_RESUME:-""}
+SHADOW_ANCHOR_RESUME=${SHADOW_ANCHOR_RESUME:-""}
+export SHADOW_ANCHOR_RESUME
 LOG_BASED_REPLAY_DEVICE=${LOG_BASED_REPLAY_DEVICE:-cuda}
 LOG_BASED_SIMULATE_PERTURBATION=${LOG_BASED_SIMULATE_PERTURBATION:-1}
 # 确定性随机数: DETERMINISTIC=1 启用 torch.use_deterministic_algorithms (跨进程/跨GPU可复现)
@@ -111,6 +113,11 @@ if [ "$GPU_FAIL_STEP" != "-1" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --gpu_fail_step $GPU_FAIL_STEP"
 fi
 
+# Shadow anchor resume (highest priority for log-based mode)
+if [ -n "$SHADOW_ANCHOR_RESUME" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --shadow_anchor_resume $SHADOW_ANCHOR_RESUME"
+fi
+
 # Log-Based Resume (优先于 RESUME_CKPT)
 if [ -n "$LOG_BASED_RESUME" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --log_based_resume $LOG_BASED_RESUME --log_based_replay_device $LOG_BASED_REPLAY_DEVICE"
@@ -159,8 +166,8 @@ export WANDB_RUN_ID WANDB_RESUME=allow
 
 # Validate reset/resume behavior before any cleanup
 if [ "$RESET_OUTPUT_DIR" = "1" ]; then
-    if [ -n "$LOG_BASED_RESUME" ] || [ -n "$RESUME_CKPT" ]; then
-        echo "ERROR: RESET_OUTPUT_DIR=1 cannot be used with LOG_BASED_RESUME or RESUME_CKPT" >&2
+    if [ -n "$LOG_BASED_RESUME" ] || [ -n "$RESUME_CKPT" ] || [ -n "$SHADOW_ANCHOR_RESUME" ]; then
+        echo "ERROR: RESET_OUTPUT_DIR=1 cannot be used with LOG_BASED_RESUME or RESUME_CKPT or SHADOW_ANCHOR_RESUME" >&2
         exit 2
     elif [ "$INSTANT_RECOVER" = "1" ]; then
         echo "INSTANT_RECOVER=1, ignoring RESET_OUTPUT_DIR and keeping OUTPUT_DIR: $OUTPUT_DIR"

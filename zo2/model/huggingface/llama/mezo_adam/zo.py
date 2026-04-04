@@ -3,12 +3,14 @@
 
 import torch
 import torch.nn as nn
-from ....base import BaseZOModel
-from .....optimizer.mezo_sgd.zo import MeZOSGD
-from transformers.models.llama.modeling_llama import LlamaForCausalLM as _LlamaForCausalLM
+from ..mezo_sgd.zo import (
+    LlamaForCausalLM as SGDLlamaForCausalLM,
+)
+from .....optimizer.mezo_adam.zo import MeZOAdam
 
 
-class OptimizerLlamaForCausalLM(MeZOSGD):
+class OptimizerLlamaForCausalLM(MeZOAdam):
+    """Adam variant with same inner_zo_forward as SGD version."""
 
     @torch.inference_mode()
     def inner_zo_forward(self, input_ids=None, attention_mask=None,
@@ -17,11 +19,6 @@ class OptimizerLlamaForCausalLM(MeZOSGD):
                          use_cache=None, output_attentions=None,
                          output_hidden_states=None, return_dict=None,
                          cache_position=None, **kwargs):
-        """
-        Forward pass through the wrapped LLaMA model with custom loss support.
-        Mirrors OPT's inner_zo_forward: get logits, then apply zo hooks/custom loss.
-        """
-        # Forward through the LLaMA backbone (self.model.model is the LlamaModel)
         outputs = self.model.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -37,12 +34,10 @@ class OptimizerLlamaForCausalLM(MeZOSGD):
 
         logits = self.model.lm_head(outputs[0]).contiguous()
 
-        # Pre-hooks
         if self.model.zo_train_loss_fn_pre_hooks:
             for pre_hook_fn in self.model.zo_train_loss_fn_pre_hooks:
                 input_ids, logits, labels = pre_hook_fn(self.model, input_ids, logits, labels)
 
-        # Loss computation
         loss = None
         if self.model.zo_custom_train_loss_fn:
             loss = self.model.zo_custom_train_loss_fn(self.model, input_ids, logits, labels, **kwargs)
@@ -52,7 +47,6 @@ class OptimizerLlamaForCausalLM(MeZOSGD):
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(shift_logits.view(-1, self.model.config.vocab_size), shift_labels.view(-1))
 
-        # Post-hooks
         if self.model.zo_train_loss_fn_post_hooks:
             for post_hook_fn in self.model.zo_train_loss_fn_post_hooks:
                 loss, input_ids, logits, labels = post_hook_fn(self.model, loss, input_ids, logits, labels)
@@ -60,36 +54,6 @@ class OptimizerLlamaForCausalLM(MeZOSGD):
         return loss.detach()
 
 
-class LlamaForCausalLM(_LlamaForCausalLM, BaseZOModel):
-    _tied_weights_keys = ["lm_head.weight"]
-
-    def __init__(self, config):
-        config.use_cache = False
-        # _LlamaForCausalLM.__init__ uses cooperative super() which
-        # traverses the MRO: ... → BaseZOModel.__init__ → nn.Module.__init__
-        # So BaseZOModel is already initialized — do NOT call it again,
-        # as a second nn.Module.__init__() would wipe all submodules.
-        _LlamaForCausalLM.__init__(self, config)
-
+class LlamaForCausalLM(SGDLlamaForCausalLM):
     def zo_init(self, zo_config):
         self.opt = OptimizerLlamaForCausalLM(model=self, config=zo_config)
-
-    def forward(self, input_ids=None, attention_mask=None,
-                position_ids=None, past_key_values=None,
-                inputs_embeds=None, labels=None,
-                use_cache=None, output_attentions=None,
-                output_hidden_states=None, return_dict=None,
-                cache_position=None, **kwargs):
-        if self.zo_training:
-            return self.opt.zo_forward(
-                input_ids, attention_mask, position_ids,
-                past_key_values, inputs_embeds, labels, use_cache,
-                output_attentions, output_hidden_states, return_dict,
-                cache_position, **kwargs)
-        else:
-            return self.opt.zo_eval_forward(
-                super().forward,
-                input_ids, attention_mask, position_ids,
-                past_key_values, inputs_embeds, labels, use_cache,
-                output_attentions, output_hidden_states, return_dict,
-                cache_position, **kwargs)

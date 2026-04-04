@@ -73,4 +73,4 @@ def opt_step_log_enabled() -> bool:
 
 
 def loading_phase_log_enabled() -> bool:
-    return os.environ.get("ZO_LOG_LOADING_PHASE", "0") == "1"
+    return os.environ.get("ZO_TRACE", "0") == "1"

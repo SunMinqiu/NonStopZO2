@@ -4,6 +4,7 @@ import hashlib
 import mmap
 import os
 import queue as queue_module
+import shutil
 import tempfile
 import threading
 import time
@@ -1026,6 +1027,92 @@ def _clone_working_state(initial_state, tied_groups):
 ## have been moved to legacy_functions.py.
 
 
+def _collect_flat_files(flat_storage):
+    """Collect all flat file paths from a flat_storage descriptor."""
+    if not flat_storage:
+        return []
+    files = []
+    if flat_storage.get("header_path"):
+        files.append(flat_storage["header_path"])
+    if flat_storage.get("state_meta_path"):
+        files.append(flat_storage["state_meta_path"])
+    if flat_storage.get("adam_meta_path"):
+        files.append(flat_storage["adam_meta_path"])
+    if flat_storage.get("expected_generation_path"):
+        files.append(flat_storage["expected_generation_path"])
+    for path in flat_storage.get("buffer_paths", ()) or ():
+        files.append(path)
+    for path in flat_storage.get("adam_m_buffer_paths", ()) or ():
+        files.append(path)
+    for path in flat_storage.get("adam_v_buffer_paths", ()) or ():
+        files.append(path)
+    return [f for f in files if f and os.path.exists(f)]
+
+
+def _disk_anchor_thread_main(
+    flat_storage,
+    output_dir,
+    persist_trigger,
+    persist_done,
+    stop_event,
+    disk_anchor_step_val,
+    shadow_step_val,
+    _logger,
+):
+    """Daemon thread: after each shadow commit, copy flat files to shadow_anchor-<step>/."""
+    while not stop_event.is_set():
+        if not persist_trigger.wait(timeout=0.1):
+            continue
+        persist_trigger.clear()
+
+        flat_files = _collect_flat_files(flat_storage)
+        step = int(shadow_step_val.value)
+        final_dir = os.path.join(output_dir, f"shadow_anchor-{step}")
+        tmp_dir = final_dir + ".tmp"
+
+        trace_token = trace_begin(
+            panel="cpu_shadow", lane="disk_anchor",
+            event="disk_anchor_persist", step=step,
+        )
+        t0 = time.perf_counter()
+        total_bytes = 0
+        elapsed_ms = 0.0
+        try:
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            os.makedirs(tmp_dir, exist_ok=True)
+
+            for src in flat_files:
+                dst = os.path.join(tmp_dir, os.path.basename(src))
+                shutil.copy2(src, dst)
+                total_bytes += os.path.getsize(dst)
+                fd = os.open(dst, os.O_RDONLY)
+                try:
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+
+            if os.path.isdir(final_dir):
+                shutil.rmtree(final_dir)
+            os.rename(tmp_dir, final_dir)
+
+            disk_anchor_step_val.value = step
+        except Exception as exc:
+            _logger.exception(f"[DiskAnchor] step={step} failed: {exc}")
+            if os.path.isdir(tmp_dir):
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+        finally:
+            elapsed_ms = (time.perf_counter() - t0) * 1000
+            trace_end(trace_token, step=step, counters={
+                "duration_ms": elapsed_ms,
+                "total_bytes": total_bytes,
+            })
+            persist_done.set()
+
+        if time_log_enabled():
+            _logger.info(f"[DiskAnchor] step={step} persist={elapsed_ms:.0f}ms bytes={total_bytes}")
+
+
 def _shadow_process_main(
     update_queue,
     initial_state,
@@ -1044,6 +1131,8 @@ def _shadow_process_main(
     commit_interval,
     flat_storage,
     ready_event=None,
+    output_dir=None,
+    disk_anchor_step_val=None,
 ):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     _logger = logging.getLogger(__name__ + ".shadow_process")
@@ -1209,6 +1298,9 @@ def _shadow_process_main(
                 boot_started_at,
                 ready_event,
                 shadow_boot_token,
+                flat_storage,
+                output_dir,
+                disk_anchor_step_val,
             )
         else:
             _shadow_process_serial(
@@ -1230,6 +1322,9 @@ def _shadow_process_main(
                 boot_started_at,
                 ready_event,
                 shadow_boot_token,
+                flat_storage,
+                output_dir,
+                disk_anchor_step_val,
             )
     finally:
         stop_resource_sampler()
@@ -1256,6 +1351,9 @@ def _shadow_process_serial(
     boot_started_at=None,
     ready_event=None,
     boot_trace_token=None,
+    flat_storage=None,
+    output_dir=None,
+    disk_anchor_step_val=None,
 ):
     from . import log_based_replay as _bdc
 
@@ -1277,11 +1375,49 @@ def _shadow_process_serial(
     desired_commit_step = durable_step
     pending_since_commit = 0
 
+    disk_anchor_enabled = (
+        output_dir is not None
+        and flat_writer is not None
+        and flat_storage is not None
+        and disk_anchor_step_val is not None
+    )
+    persist_trigger = None
+    persist_done = None
+    disk_anchor_stop = None
+    disk_anchor_thread = None
+    if disk_anchor_enabled:
+        persist_trigger = threading.Event()
+        persist_done = threading.Event()
+        persist_done.set()
+        disk_anchor_stop = threading.Event()
+        disk_anchor_thread = threading.Thread(
+            target=_disk_anchor_thread_main,
+            args=(flat_storage, output_dir,
+                  persist_trigger, persist_done, disk_anchor_stop,
+                  disk_anchor_step_val, shadow_step_val, _logger),
+            daemon=True, name="disk-anchor",
+        )
+        disk_anchor_thread.start()
+
     def _commit_if_needed(target_step, reason):
         nonlocal durable_step, desired_commit_step, pending_since_commit
         if int(target_step) <= int(durable_step):
             return 0.0
         t0_commit = time.time()
+        if disk_anchor_enabled:
+            # Only emit a trace span when the wait would actually block; if
+            # persist_done is already set, the wait is a no-op and producing
+            # a zero-duration span just adds visual noise to the plot.
+            if not persist_done.is_set():
+                wait_token = trace_begin(
+                    panel="cpu_shadow",
+                    lane="shadow_main",
+                    event="wait_disk_anchor",
+                    step=int(target_step),
+                )
+                persist_done.wait()
+                trace_end(wait_token, step=int(target_step))
+            persist_done.clear()
         commit_token = trace_begin(
             panel="cpu_shadow",
             lane="shadow_main",
@@ -1299,6 +1435,8 @@ def _shadow_process_serial(
             adam_state=adam_state,
         )
         if not _commit_shadow_succeeded(commit_result, require_adam=adam_state is not None):
+            if disk_anchor_enabled:
+                persist_done.set()
             raise RuntimeError(f"[Shadow] {reason} commit failed: {commit_result}")
         durable_step = int(commit_result["committed_step"])
         desired_commit_step = durable_step
@@ -1311,6 +1449,8 @@ def _shadow_process_serial(
             counters={"durable_step": int(durable_step)},
             extra={"reason": reason},
         )
+        if disk_anchor_enabled:
+            persist_trigger.set()
         return time.time() - t0_commit
 
     wait_token = trace_begin(
@@ -1422,6 +1562,16 @@ def _shadow_process_serial(
     if last_applied_step > durable_step:
         desired_commit_step = int(last_applied_step)
         _commit_if_needed(desired_commit_step, "Final")
+    if disk_anchor_enabled:
+        try:
+            persist_done.wait(timeout=30)
+        except Exception:
+            pass
+        disk_anchor_stop.set()
+        try:
+            disk_anchor_thread.join(timeout=5)
+        except Exception:
+            pass
     _logger.info("[Shadow Process] Stopped (serial)")
 
 
@@ -1445,6 +1595,9 @@ def _shadow_process_pipelined(
     boot_started_at=None,
     ready_event=None,
     boot_trace_token=None,
+    flat_storage=None,
+    output_dir=None,
+    disk_anchor_step_val=None,
 ):
     from . import log_based_replay as _bdc
 
@@ -1468,6 +1621,30 @@ def _shadow_process_pipelined(
     desired_commit_step = durable_step
     pending_since_commit = 0
 
+    disk_anchor_enabled = (
+        output_dir is not None
+        and flat_writer is not None
+        and flat_storage is not None
+        and disk_anchor_step_val is not None
+    )
+    persist_trigger = None
+    persist_done = None
+    disk_anchor_stop = None
+    disk_anchor_thread = None
+    if disk_anchor_enabled:
+        persist_trigger = threading.Event()
+        persist_done = threading.Event()
+        persist_done.set()
+        disk_anchor_stop = threading.Event()
+        disk_anchor_thread = threading.Thread(
+            target=_disk_anchor_thread_main,
+            args=(flat_storage, output_dir,
+                  persist_trigger, persist_done, disk_anchor_stop,
+                  disk_anchor_step_val, shadow_step_val, _logger),
+            daemon=True, name="disk-anchor",
+        )
+        disk_anchor_thread.start()
+
     result_queue = queue_module.Queue(maxsize=max(1, P))
     producer_stop = threading.Event()
     producer_error = [None]
@@ -1480,7 +1657,7 @@ def _shadow_process_pipelined(
     producer_timing = {"duration_ms": 0.0}
     generation = [0]
 
-    def producer():
+    def producer(worker_id=0):
         try:
             local_generation = generation[0]
             while not producer_stop.is_set():
@@ -1503,7 +1680,13 @@ def _shadow_process_pipelined(
                     continue
 
                 t0_zgen = time.monotonic()
-                z_dict = _bdc._generate_z_for_one_step(update["seed"], param_names, working_state, rng_device)
+                with trace_span(
+                    panel="cpu_shadow",
+                    lane=f"producer_{worker_id}",
+                    event="shadow_generate",
+                    step=step_idx,
+                ):
+                    z_dict = _bdc._generate_z_for_one_step(update["seed"], param_names, working_state, rng_device)
                 producer_timing["duration_ms"] = (time.monotonic() - t0_zgen) * 1000
 
                 while not producer_stop.is_set():
@@ -1520,8 +1703,8 @@ def _shadow_process_pipelined(
         producer_stop.clear()
         producer_error[0] = None
         threads = []
-        for _ in range(P):
-            t = threading.Thread(target=producer, daemon=True)
+        for wid in range(P):
+            t = threading.Thread(target=producer, args=(wid,), daemon=True)
             t.start()
             threads.append(t)
         return threads
@@ -1550,6 +1733,18 @@ def _shadow_process_pipelined(
         if int(target_step) <= int(durable_step):
             return 0.0
         t0_commit = time.monotonic()
+        if disk_anchor_enabled:
+            # Only emit a trace span when the wait would actually block.
+            if not persist_done.is_set():
+                wait_token = trace_begin(
+                    panel="cpu_shadow",
+                    lane="shadow_main",
+                    event="wait_disk_anchor",
+                    step=int(target_step),
+                )
+                persist_done.wait()
+                trace_end(wait_token, step=int(target_step))
+            persist_done.clear()
         commit_token = trace_begin(
             panel="cpu_shadow",
             lane="shadow_main",
@@ -1574,6 +1769,8 @@ def _shadow_process_pipelined(
             adam_state=adam_state,
         )
         if not _commit_shadow_succeeded(commit_result, require_adam=adam_state is not None):
+            if disk_anchor_enabled:
+                persist_done.set()
             raise RuntimeError(f"[Shadow Pipeline] {reason} commit failed: {commit_result}")
         durable_step = int(commit_result["committed_step"])
         desired_commit_step = durable_step
@@ -1588,6 +1785,8 @@ def _shadow_process_pipelined(
             counters={"durable_step": int(durable_step)},
             extra={"reason": reason, "mode": "pipeline"},
         )
+        if disk_anchor_enabled:
+            persist_trigger.set()
         return (time.monotonic() - t0_commit) * 1000
 
     threads = _restart_producers()
@@ -1609,6 +1808,9 @@ def _shadow_process_pipelined(
                     trace_instant(panel="cpu_shadow", lane="shadow_main", event="shadow_stop", step=int(durable_step))
                     _stop_producers(threads)
                     if last_applied_step > durable_step:
+                        if disk_anchor_enabled:
+                            persist_done.wait()
+                            persist_done.clear()
                         commit_result = _commit_shadow_state(
                             working_state,
                             replica_path,
@@ -1619,11 +1821,25 @@ def _shadow_process_pipelined(
                             adam_state=adam_state,
                         )
                         if not _commit_shadow_succeeded(commit_result, require_adam=adam_state is not None):
+                            if disk_anchor_enabled:
+                                persist_done.set()
                             raise RuntimeError(f"[Shadow Pipeline] Final stop commit failed: {commit_result}")
                         durable_step = int(commit_result["committed_step"])
                         desired_commit_step = durable_step
                         shadow_step_val.value = durable_step
                         _log_durable_publish(durable_step, working_state, adam_state, _logger)
+                        if disk_anchor_enabled:
+                            persist_trigger.set()
+                    if disk_anchor_enabled:
+                        try:
+                            persist_done.wait(timeout=30)
+                        except Exception:
+                            pass
+                        disk_anchor_stop.set()
+                        try:
+                            disk_anchor_thread.join(timeout=5)
+                        except Exception:
+                            pass
                     _logger.info("[Shadow Pipeline] Stopped")
                     return
                 if kind == "update":

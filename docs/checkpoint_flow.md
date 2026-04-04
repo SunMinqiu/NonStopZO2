@@ -87,7 +87,8 @@
 | `log_based_replay_device` / `LOG_BASED_REPLAY_DEVICE` | `cuda` | `OurArguments` / env | replay 执行设备 |
 | `log_based_simulate_perturbation` / `LOG_BASED_SIMULATE_PERTURBATION` | `1` | `OurArguments` / env | replay 是否模拟 perturbation-restore |
 | `log_based_replay_fp32` / `LOG_BASED_REPLAY_FP32` | `0` | `OurArguments` / env | CPU replay 时临时 upcast 到 fp32 |
-| `async_anchor` / `ASYNC_ANCHOR` | `0` | `OurArguments` / env | 启用 async anchor |
+| `async_anchor` / `ASYNC_ANCHOR` | `0` | `OurArguments` / env | 启用 async anchor（**已废弃**，代码见 [`legacy_functions.py`](../zo2/trainer/hf_transformers/legacy_functions.py)；trainer.py 中 `async_anchor = None`，所有分支死代码化） |
+| `shadow_anchor_resume` / `SHADOW_ANCHOR_RESUME` | `""` | `OurArguments` / env | 指定一个 `shadow_anchor-<step>/` 目录用于手动恢复；优先级高于 `LOG_BASED_RESUME` 和 `RESUME_CKPT`，详见 [§ Recovery 扩展](#recovery-扩展) |
 | `SHADOW_WAIT_READY` | `1` | env | 训练启动时是否等待 shadow ready |
 | `SHADOW_PIPELINE` | `0` | env | 是否启用 pipelined shadow |
 | `SHADOW_PIPELINE_WORKERS` | `2` | env | shadow pipeline producer 数 |
@@ -104,7 +105,7 @@
 | `ZO_RNG_TRAIN_THREADS` | unset | env | 训练进程 zo_rng 线程数 |
 | `ZO_RNG_NUM_THREADS` | 环境决定 | env | zo_rng 线程池初始大小 |
 | `deterministic` | `False` | `OurArguments` | 是否开启 deterministic algorithms |
-| `FORCE_FSYNC` | `0` | env | 对 initial model、optimizer.pt、full checkpoint 启用 fsync |
+| `FORCE_FSYNC` | `0` | env | 对 initial model、`optimizer.pt`、full checkpoint 启用 fsync；同时控制 `update_log.jsonl` 每步是否 `fdatasync`（开启时 ~1ms/step，关闭时 ~15μs/step） |
 | `PARALLEL_RECOVERY` | `0` | env | legacy pipelined replay 开关 |
 | `PARALLEL_RECOVERY_WORKERS` | `1` | env | legacy pipelined replay worker 数 |
 | `CLOSEDFORM_RECOVERY` | `0` | env | legacy closed-form replay 开关 |
@@ -160,11 +161,18 @@
 
 ## 0. 当前实现说明
 
-当前实现已经切到 `flat single-buffer shadow + async anchor disk checkpoint`：
+当前实现：`flat single-buffer shadow + shadow-side disk anchor thread + update_log.jsonl`：
+
+- shadow 子进程维护一份普通 CPU working copy，每 N 步 commit 到 `/dev/shm/zo_ckpt/zo_shadow_latest_<hash>.flat*`
+- shadow 进程内 daemon 线程在每次 commit 后把 flat 文件 copy 到 `$OUTPUT_DIR/shadow_anchor-<step>/`（持久化到磁盘，见 [§ Shadow Disk Anchor Thread](#shadow-disk-anchor-thread)）
+- trainer 侧每步在 `_zo_update_hook` 内联写 `update_log.jsonl` 一行 JSON（可选 `fdatasync`，见 [§ Update Log](#update-log-update_logjsonl)）
+- `ASYNC_ANCHOR` / rebase / `_refresh_shadow_from_base` / anchor publisher / pinned buffer 等 legacy 路径已移到 [`legacy_functions.py`](../zo2/trainer/hf_transformers/legacy_functions.py)，不再默认启用
+
+历史背景（仅作参考）：早期版本曾走 `flat single-buffer shadow + async anchor disk checkpoint`，相关逻辑保留在 `legacy_functions.py` 中供回滚。
 
 - shadow 子进程维护一份普通 CPU working copy
 - committed shadow 写到 `/dev/shm/zo_ckpt/zo_shadow_latest_<hash>.flat*`
-- async anchor / full checkpoint 仍然写磁盘 `checkpoint-N/model.safetensors`
+- full checkpoint 仍然写磁盘 `checkpoint-N/model.safetensors`（由 HF Trainer 路径触发）
 - shadow flat snapshot 现在由三部分 metadata 约束：
   - `*.flat.header.json`
   - `*.flat.state.meta.json`
@@ -193,14 +201,15 @@
 
 | 文件 | 主要职责 | 关键函数 / 方法 |
 |------|----------|-----------------|
-| `zo2/trainer/hf_transformers/log_based_checkpoint.py` | 训练期 callback、运行期状态、shadow orchestration、兼容别名 | `LogBasedCheckpointCallback.on_train_begin` / `_cache_initial_model` / `_init_for_resume` / `_start_shadow_process` / `_zo_update_hook` / `recover_from_shadow` / `_reconstruct_on_demand` / `get_recovery_status` / `on_save` / `on_train_end` |
+| `zo2/trainer/hf_transformers/log_based_checkpoint.py` | 训练期 callback、运行期状态、shadow orchestration、`update_log.jsonl`、disk anchor 恢复胶水、兼容别名 | `LogBasedCheckpointCallback.on_train_begin` / `_cache_initial_model` / `_init_for_resume` / `_start_shadow_process` / `_zo_update_hook`（内联写 `update_log.jsonl`） / `_restore_tmpfs_from_disk_anchor` / `_find_latest_disk_anchor` / `_load_update_log_jsonl` / `recover_from_shadow` / `_reconstruct_on_demand` / `get_recovery_status` / `on_save` / `on_train_end` |
 | `zo2/trainer/hf_transformers/log_based_resume.py` | checkpoint 读取、base model 选择、replay 恢复入口 | `load_log_based_checkpoint` / `_load_base_state` / `resume_from_log_based` |
 | `zo2/trainer/hf_transformers/log_based_replay.py` | 当前仍在使用的串行 replay 主路径；按环境变量分发到 legacy replay | `_generate_z_for_replay` / `_generate_z_for_one_step` / `_apply_single_update` / `_apply_single_update_with_pregenerated_z` / `_replay_updates_on_state` |
 | `zo2/trainer/hf_transformers/legacy_pipeline_closed_form_replay.py` | 已废弃但暂留的 pipelined replay 和 closed-form replay | `_parallel_replay_updates_on_state` / `_closedform_replay_on_state` / `validate_closedform_replay` |
-| `zo2/trainer/hf_transformers/log_based_shadow.py` | shadow 子进程入口、串行/pipelined shadow、shadow safetensors 读写 | `_shadow_process_main` / `_shadow_process_serial` / `_shadow_process_pipelined` / `_commit_shadow_state` / `_load_shadow_replica` |
+| `zo2/trainer/hf_transformers/log_based_shadow.py` | shadow 子进程入口、串行/pipelined shadow、shadow flat 读写、shadow-side disk anchor daemon 线程 | `_shadow_process_main` / `_shadow_process_serial` / `_shadow_process_pipelined` / `_commit_shadow_state` / `_commit_shadow_bundle_flat` / `_load_shadow_replica` / `_disk_anchor_thread_main` / `_collect_flat_files` |
 | `zo2/trainer/hf_transformers/log_based_failure_injection.py` | GPU 故障注入、`SIGKILL` 顺序控制 | `GPUFailureSimulator.set_fail_step` / `check_and_fail` / `trigger_failure` |
 | `zo2/trainer/hf_transformers/log_based_utils.py` | tied weights、fsync、内存统计、线程快照 | `_detect_tied_weights` / `_tie_state_dict_inplace` / `_restore_tied_weights` / `_fsync_file` / `_fsync_directory` / `_log_memory` / `_thread_snapshot` |
-| `zo2/trainer/hf_transformers/async_anchor_checkpoint.py` | async anchor 的 GPU→CPU→`/dev/shm/zo_ckpt latest`→disk 两阶段异步落盘 | `AsyncAnchorCheckpointer.try_save_full_checkpoint` / `_persist_worker` / `get_latest_published_anchor_step` / `get_latest_completed_anchor_step` / `shutdown` |
+| `zo2/trainer/hf_transformers/async_anchor_checkpoint.py` | **deprecation redirect**；实际代码已移到 `legacy_functions.py`。保留空 stub 仅为向后兼容 import | — |
+| `zo2/trainer/hf_transformers/legacy_functions.py` | legacy 路径汇总：旧的 pipelined / closed-form replay + async anchor（`AsyncAnchorCheckpointer` / `_persist_worker`） + rebase payload + `_refresh_shadow_from_base` + anchor publisher + pinned buffer 管理 | `AsyncAnchorCheckpointer` / `_persist_worker` / `_rebase_working_state` / `_replay_retained_suffix` / `_refresh_shadow_from_base` / `AnchorPublishTask` |
 | `zo2/trainer/hf_transformers/log_based_tuning.py` | shadow / replay 的 benchmark 和线程分配标定 | `calibrate_producer_consumer` / `optimize_thread_allocation` |
 | `zo2/trainer/hf_transformers/trainer.py` | HF Trainer 接线、保存 `optimizer.pt` 元数据、恢复优化器状态 | `ZOTrainer._load_from_checkpoint` / `_save_checkpoint` / `_load_optimizer_and_scheduler` |
 
@@ -233,8 +242,14 @@ LOG_BASED_CKPT >= 1   -> L1/L2/L3: Full + Log, 每 N 步更新 base
 ENABLE_SHADOW=1       -> L2: 维护 CPU shadow
 INSTANT_RECOVER=1     -> L3: 配置上启用即时恢复
 GPU_FAIL_STEP>0       -> 配置故障注入，触发 SIGKILL
-ASYNC_ANCHOR=1        -> full checkpoint 改成 async anchor 语义
+
+ENABLE_SHADOW=1 + SHADOW_FLAT_COMMIT=1
+                      -> 自动启用 shadow-side disk anchor thread,
+                         按 SHADOW_COMMIT_INTERVAL 频率落盘到
+                         $OUTPUT_DIR/shadow_anchor-<step>/
 ```
+
+> 注：`ASYNC_ANCHOR=1` 已废弃，代码已移至 `legacy_functions.py`，保留仅为 API 兼容。
 
 注意：
 
@@ -606,22 +621,26 @@ resume 入口分三类：
 
 - `zo2/trainer/hf_transformers/log_based_checkpoint.py`
   - `_init_shadow_adam_state`
-  - `_refresh_shadow_from_base`
+  - `_refresh_shadow_from_base`（**legacy**，已移到 `legacy_functions.py`）
   - `_manifest_path`
   - `_step_file_path`
   - `_unregister_shm`
   - `_save_shadow_manifest`
   - `_start_shadow_process`
+  - `_restore_tmpfs_from_disk_anchor` / `_find_latest_disk_anchor` / `_load_update_log_jsonl`（Phase 2 新增）
   - `recover_from_shadow`
   - `get_recovery_status`
   - `on_train_end`
 - `zo2/trainer/hf_transformers/log_based_shadow.py`
   - `_shadow_process_main`
-  - `_shadow_process_serial`
-  - `_shadow_process_pipelined`
+  - `_shadow_process_serial`（集成 `persist_trigger` / `persist_done` + 启动 disk anchor thread）
+  - `_shadow_process_pipelined`（同上）
+  - `_disk_anchor_thread_main` / `_collect_flat_files`（Phase 2 新增）
   - `_load_shadow_from_manifest`
 
-### 12.2 建立 shadow
+### 12.2 建立 shadow（legacy 路径）
+
+> 注：`_refresh_shadow_from_base()` 是 legacy 路径（已移到 [`legacy_functions.py`](../zo2/trainer/hf_transformers/legacy_functions.py)）。当前实现中，shadow 通过直接读 tmpfs flat 文件初始化（`use_shadow_flat_commit=True`, `spawn_initial_state=None`），不再走 shared-memory + manifest。下面的描述仅供历史参考。
 
 `_refresh_shadow_from_base()` 会：
 
@@ -683,7 +702,9 @@ resume 入口分三类：
    - tied weights 健康检查
    - Adam state reset
 
-### 12.5 Shadow refresh
+### 12.5 Shadow refresh（legacy）
+
+> 注：`refresh` 命令是 legacy 路径（已移到 [`legacy_functions.py`](../zo2/trainer/hf_transformers/legacy_functions.py)）。当前 shadow 主循环只处理 `update` / `stop`。下面描述仅供历史参考。
 
 full checkpoint / resume 后，shadow 不是“自己推断新 base”，而是显式 `refresh`：
 
@@ -703,6 +724,133 @@ shadow 收到后会：
 2. 更新 `shadow_step_val`
 3. 清空 pipeline 内部缓存
 4. 如果是 Adam，清空 `m/v/t`
+
+> 说明：`refresh` / `_refresh_shadow_from_base` 现在是 legacy 路径（已移到 [`legacy_functions.py`](../zo2/trainer/hf_transformers/legacy_functions.py)）。当前默认实现中，shadow 主循环只处理 `update` / `stop` 两种命令，rebase 被 shadow-side disk anchor 替代。
+
+## 12.6 Shadow Disk Anchor Thread {#shadow-disk-anchor-thread}
+
+### 动机
+
+shadow flat storage 在 tmpfs (`/dev/shm/zo_ckpt/`) 上，属于 RAM backing。hard failure（主机重启、OOM kill、tmpfs 被清理）会丢失这份 snapshot。为了让 shadow 的 durable snapshot 真正 survive 到磁盘，shadow 进程内新增一个 daemon 线程，在每次 commit 之后把 flat 文件持久化到 `$OUTPUT_DIR/shadow_anchor-<step>/`。
+
+### 架构
+
+- shadow 进程内 daemon 线程（由 `_shadow_process_serial` / `_shadow_process_pipelined` 启动）
+- 每次 `_commit_shadow_bundle_flat()` 写完 mmap 后触发一次 persist
+- 频率 = `SHADOW_COMMIT_INTERVAL`（每次 commit 都触发一次）
+- 对应函数：[`log_based_shadow.py`](../zo2/trainer/hf_transformers/log_based_shadow.py) `_disk_anchor_thread_main` / `_collect_flat_files`
+
+### 触发机制（两个 `threading.Event`）
+
+| Event | set by | wait by |
+|-------|--------|---------|
+| `persist_trigger` | shadow main（commit 后） | persist 线程（循环开头） |
+| `persist_done` | persist 线程（落盘完成） | shadow main（commit 前） |
+
+```
+Shadow main loop:                              Disk anchor thread:
+  apply update → working_state
+  ...                                            persist_trigger.wait()
+  [到 commit 点]                                  persist_trigger.clear()
+  persist_done.wait()   ← 确保上次 persist 完  persist_done.clear()
+  _commit_shadow_bundle_flat() (写 mmap)          shutil.copy2(flat_files → disk)
+  persist_trigger.set() ← 触发新一轮 persist      fsync + os.rename
+                                                  persist_done.set()
+```
+
+只要 `persist_ms < (N * t_apply)`，`persist_done.wait()` 零阻塞；超时时 shadow 最多等 `persist_ms - interval_ms`，不影响 apply 吞吐。
+
+### 落盘路径与目录结构
+
+根目录就是 `$OUTPUT_DIR`（即 `args.output_dir`），每次 persist 建一个 `shadow_anchor-<step>/` 子目录，与 HF Trainer 的 `checkpoint-<step>/` **平级**：
+
+```
+$OUTPUT_DIR/
+├── checkpoint-100/                  ← HF Trainer 的 log checkpoint
+├── shadow_anchor-100.tmp/           ← 正在写入的临时目录
+├── shadow_anchor-100/               ← 完成的 anchor
+│   ├── zo_shadow_latest_<hash>.flat.bin
+│   ├── zo_shadow_latest_<hash>.flat.adam_m.bin
+│   ├── zo_shadow_latest_<hash>.flat.adam_v.bin
+│   ├── zo_shadow_latest_<hash>.flat.header.json
+│   ├── zo_shadow_latest_<hash>.flat.state.meta.json
+│   ├── zo_shadow_latest_<hash>.flat.adam.meta.json
+│   └── zo_shadow_latest_<hash>.flat.generation.meta.json
+├── shadow_anchor-116/
+├── shadow_anchor-132/
+├── update_log.jsonl
+└── ...
+```
+
+### 原子性
+
+1. 先写到 `shadow_anchor-<step>.tmp/`
+2. 每个文件 `shutil.copy2` 完后单独 `os.fsync`
+3. 全部写完后 `os.rename(tmp_dir, final_dir)`
+
+崩溃时看到 `.tmp` 目录即可判定该次 persist 未完成，recovery 扫描会自动忽略。
+
+### 保留策略
+
+全部保留，**不 rotate**。磁盘空间充足，保留多代 anchor 有利于调试和多点恢复。
+
+### CPU 开销
+
+- `shutil.copy2` 和 `os.fsync` 是 CPython 中 `Py_BEGIN_ALLOW_THREADS` 的 syscall：**期间 GIL 释放**，线程进入内核态 `D` 状态等 NVMe 返回
+- OS 调度器不给 `D` 状态线程分配 CPU cycle，shadow apply 主线程与 ATen worker 照常跑满核
+- Linux 上 `shutil.copy2` 优先走 `os.sendfile()` 零拷贝，连 user-space memcpy 都没有
+- 净效果：persist 线程 sub-core CPU 占用，不占 `SHADOW_RESERVE_THREADS` 预算
+
+### 追踪
+
+- `mp.Value` `disk_anchor_step_val`：暴露最新已完成的 persist step 给训练进程
+- trace 事件：`disk_anchor_persist`（`panel=cpu_shadow`, `lane=disk_anchor`），`wait_disk_anchor`（`panel=cpu_shadow`, `lane=shadow_main`）—— 见 [§ Trace 时序事件](#204-时序事件)
+
+### Recovery 集成
+
+详见 [§ 13.4 Recovery 扩展](#recovery-扩展)。
+
+## 12.7 Update Log (`update_log.jsonl`) {#update-log-update_logjsonl}
+
+### 动机
+
+`optimizer.pt` 里的 `zo_update_history` 只在 `save_steps` 间隔落盘，hard failure 会丢失**最近 save 之后的所有步**。`update_log.jsonl` 每步落盘，实现对 update log 的零丢失。
+
+### 文件位置
+
+```
+$OUTPUT_DIR/update_log.jsonl
+```
+
+### 格式
+
+JSONL —— 每行一条 JSON：
+
+```json
+{"step": 123, "seed": 456789, "grad": 0.0012, "lr": 1e-6, "wd": 0.0, "zo_eps": 1e-3}
+```
+
+### 写入位置
+
+在训练主线程的 `_zo_update_hook`（[`log_based_checkpoint.py`](../zo2/trainer/hf_transformers/log_based_checkpoint.py)）**内联** `write()`，不新开线程；
+`on_train_begin` 打开 file handle，`on_train_end` 关闭。
+
+### 写盘策略
+
+| `FORCE_FSYNC` | 行为 | 开销 |
+|---------------|------|------|
+| `1` | 每步 `write()` + `os.fdatasync()` | ~1ms/step |
+| `0` | 每步只 `write()`（依赖 page cache） | ~15μs/step |
+
+### 与 `optimizer.pt` 的关系
+
+- `update_log.jsonl` **优先** —— 当存在时，resume 从 JSONL 恢复 update history
+- `optimizer.pt` 里的 `zo_update_history` 作为**回退**，保证向后兼容旧 checkpoint
+- 加载函数：`_load_update_log_jsonl`（[`log_based_checkpoint.py`](../zo2/trainer/hf_transformers/log_based_checkpoint.py)）
+
+### Recovery
+
+加载 base 后读 JSONL，过滤 `step > base_step`，走现有 `_replay_updates_on_state` replay 路径。无需额外 replay 逻辑。
 
 ## 13. soft recovery 与 instant recovery
 
@@ -738,6 +886,37 @@ shadow 收到后会：
 3. 只 replay `updates[shadow_step:]`
 
 这就是“DRAM survives”的 soft recovery 路径。
+
+### 13.4 Recovery 扩展：三种统一场景 {#recovery-扩展}
+
+Phase 2 之后，恢复入口由统一胶水函数 `_restore_tmpfs_from_disk_anchor()`（[`log_based_checkpoint.py`](../zo2/trainer/hf_transformers/log_based_checkpoint.py)）处理三种场景：
+
+| 场景 | 触发条件 | 行为 |
+|------|----------|------|
+| **Soft failure** | tmpfs `/dev/shm/zo_ckpt/*.flat*` 仍然有效 | no-op；走现有 soft recovery 路径 |
+| **Hard failure** | tmpfs 已丢失（机器重启、OOM、tmpfs cleanup） | 调用 `_find_latest_disk_anchor()` 扫描 `$OUTPUT_DIR/shadow_anchor-*/`（忽略 `.tmp`），取 step 最大的目录，把 flat 文件 copy 回 tmpfs |
+| **Manual** | 用户设置 `SHADOW_ANCHOR_RESUME=$OUTPUT_DIR/shadow_anchor-132` | 从指定目录 copy flat 文件回 tmpfs |
+
+恢复 tmpfs 之后，下游逻辑完全复用现有路径：
+
+1. `_load_shadow_bundle_flat()` 读回 shadow snapshot
+2. `model.load_state_dict()` 载入 base 权重
+3. 读 `update_log.jsonl`（或 `optimizer.pt.zo_update_history`）过滤 `step > base_step`
+4. `_replay_updates_on_state()` 前向推进到目标 step
+
+### 优先级
+
+```
+SHADOW_ANCHOR_RESUME  >  LOG_BASED_RESUME  >  RESUME_CKPT / resume_from_checkpoint
+```
+
+### GPU 与 CPU shadow 的自动同步
+
+当 `use_shadow_flat_commit=True` 时，shadow 进程启动时 `spawn_initial_state=None`，shadow 直接读 tmpfs flat 文件作为初始状态。因此：
+
+- hard failure 恢复后，tmpfs 已经被 `_restore_tmpfs_from_disk_anchor()` 填回
+- 新 spawn 的 shadow 进程从 tmpfs 读回的就是恢复后的 durable snapshot
+- GPU 训练从 base+replay 恢复，CPU shadow 从 tmpfs 恢复，两者 step 自动对齐，无需额外 refresh
 
 ### 13.3 recovery status
 
@@ -828,11 +1007,13 @@ shadow 收到后会：
 - `shadow` 在 `rng_device="native"` 且训练跑在 CUDA 上时，只是近似 shadow，不是 bitwise exact
 - `pending_seed` 和 `base_pending_seed` 都是为了恢复 seed chain，不是冗余元数据
 
-## 17. async anchor
+## 17. async anchor（legacy，已移到 `legacy_functions.py`）
+
+> **状态**：async anchor 已废弃，代码移到 [`legacy_functions.py`](../zo2/trainer/hf_transformers/legacy_functions.py)。`async_anchor_checkpoint.py` 只剩 deprecation redirect。trainer.py 中 `async_anchor = None`，所有分支死代码化。保留本节仅作历史参考；新路径请看 [§ 12.6 Shadow Disk Anchor Thread](#shadow-disk-anchor-thread)。
 
 ### 17.1 文件 / 函数
 
-- `zo2/trainer/hf_transformers/async_anchor_checkpoint.py`
+- `zo2/trainer/hf_transformers/legacy_functions.py`（原 `async_anchor_checkpoint.py`）
   - `AsyncAnchorCheckpointer.try_save_full_checkpoint`
   - `_persist_worker`
   - `get_latest_completed_anchor_step`
@@ -853,10 +1034,10 @@ shadow 收到后会：
 
 逻辑：
 
-1. 等前一个 persist 完成：`self._persist_done.wait()`
-2. 等 pinned buffer 空闲：`self._buffer_free`
-3. 把 GPU 参数异步 copy 到 pinned CPU buffer
-4. 把 persist job 放到后台线程队列
+1. 等前一个 persist 完成：`self._persist_done.wait()`（legacy）
+2. 等 pinned buffer 空闲：`self._buffer_free`（legacy；pinned buffer 机制已随 async anchor 一起废弃）
+3. 把 GPU 参数异步 copy 到 pinned CPU buffer（legacy）
+4. 把 persist job 放到后台线程队列（legacy）
 
 #### Phase 2: persist 线程
 
@@ -902,8 +1083,9 @@ shadow 收到后会：
 
 训练结束时会：
 
-1. `async_anchor.shutdown()`，等待最后一个 persist 完成
-2. 如有必要，做最终 base trim
+1. `async_anchor.shutdown()`（legacy，`async_anchor = None`，分支不执行）
+2. 关闭 `update_log.jsonl` file handle（Phase 2 新增）
+3. 如有必要，做最终 base trim
 3. 停止 shadow：
    - `shadow_stop_event.set()`
    - `recovery_done.set()` 防止等待死锁
@@ -1240,7 +1422,7 @@ blocking lane：
 - `train_end_cleanup`
 - `resume_begin` / `resume_end`
 
-anchor_thread lane：
+anchor_thread lane（**legacy**，已移到 `legacy_functions.py`；`tools/visualize_trace.py` 中这些事件归在 `_LEGACY_TIMELINE_VISIBLE`，默认不显示）：
 
 - `anchor_d2h_copy`
 - `anchor_enqueue`
@@ -1266,8 +1448,13 @@ shadow_main lane：
 - `shadow_wait_update`
 - `shadow_apply`
 - `shadow_commit`
-- `shadow_rebase`
+- `wait_disk_anchor` —— shadow commit 前等待上次 persist 完成的时间（`0` 表示无阻塞）
 - `shadow_stop`
+- `shadow_rebase`（**legacy**，已移到 `legacy_functions.py`）
+
+disk_anchor lane（新）：
+
+- `disk_anchor_persist` —— 每次 persist 的 begin/end span；counters 包含 `duration_ms`, `total_bytes`
 
 resource lane 的 instant：
 
@@ -1396,7 +1583,8 @@ resource lane 的 instant：
 
 训练结束
 └─ LogBasedCheckpointCallback.on_train_end()
-   ├─ async_anchor.shutdown()
-   ├─ 停止 shadow
+   ├─ async_anchor.shutdown()              # legacy, no-op (async_anchor = None)
+   ├─ 关闭 update_log.jsonl file handle    # Phase 2 新增
+   ├─ 停止 shadow (shadow_stop_event + disk anchor thread join)
    └─ 清理 manifest / shm / 本地状态
 ```

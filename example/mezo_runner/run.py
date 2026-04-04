@@ -205,6 +205,7 @@ class OurArguments(TrainingArguments):
     async_anchor: bool = False  # enable async anchor checkpoint
     log_output_dir: str = ""  # separate directory for log checkpoints when shadow is disabled
     shadow_resume: str = ""  # soft failure: tmpfs shadow safetensors path or flat header path
+    shadow_anchor_resume: str = ""  # path to shadow_anchor-<step>/ for manual disk-anchor recovery
 
     # Deterministic reproducibility
     deterministic: bool = False  # enable torch.use_deterministic_algorithms for cross-process reproducibility
@@ -333,6 +334,18 @@ class Framework:
                             from transformers import Qwen3ForCausalLM
                             model = Qwen3ForCausalLM(config).to(
                                 dtype=torch_dtype, device=self.args.working_device)
+                        elif "llama" in self.args.model_name.lower():
+                            from transformers import LlamaForCausalLM
+                            model = LlamaForCausalLM(config).to(
+                                dtype=torch_dtype, device=self.args.working_device)
+                    # HF's no_init_weights() context gates BOTH random init AND tie_weights()
+                    # behind the same _init_weights flag. So lm_head.weight ends up as a
+                    # separate parameter instead of sharing storage with embed_tokens.weight.
+                    # This causes the resume-path optimizer to have N+1 params while the
+                    # saved optimizer.pt has N → ValueError in optimizer.load_state_dict().
+                    # Explicitly re-tie after the context to restore the expected structure.
+                    if getattr(config, "tie_word_embeddings", False):
+                        model.tie_weights()
                     _PHASE_TIMES["T_from_pretrained"] = _time.perf_counter() - _t0_from_pretrained
                     _PHASE_TIMES["weight_source"] = "from_config"
                     if loading_phase_log_enabled():
@@ -354,6 +367,15 @@ class Framework:
                     elif "Qwen3" in self.args.model_name:
                         from transformers import Qwen3ForCausalLM
                         model = Qwen3ForCausalLM.from_pretrained(
+                            model_load_path,
+                            config=config,
+                            torch_dtype=torch_dtype,
+                            max_memory={i: f'{free_in_GB-5}GB' for i in range(torch.cuda.device_count())},
+                            load_in_8bit=self.args.load_int8,
+                        )
+                    elif "llama" in self.args.model_name.lower():
+                        from transformers import LlamaForCausalLM
+                        model = LlamaForCausalLM.from_pretrained(
                             model_load_path,
                             config=config,
                             torch_dtype=torch_dtype,

@@ -40,10 +40,12 @@ Environment variables:
 
 import glob
 import hashlib
+import json
 import logging
 import multiprocessing as mp
 import os
 import re
+import shutil
 import threading
 import time
 from collections import OrderedDict
@@ -111,6 +113,21 @@ from .log_based_utils import (
 
 logger = logging.getLogger(__name__)
 LOG_METADATA_NAME = "log_metadata.pt"
+
+
+def _find_latest_disk_anchor(output_dir):
+    """Scan $OUTPUT_DIR/shadow_anchor-*/ directories, skip .tmp, return (step, path) with max step."""
+    if not output_dir or not os.path.isdir(output_dir):
+        return None
+    candidates = []
+    for name in os.listdir(output_dir):
+        if name.startswith("shadow_anchor-") and not name.endswith(".tmp"):
+            try:
+                step = int(name[len("shadow_anchor-"):])
+                candidates.append((step, os.path.join(output_dir, name)))
+            except ValueError:
+                continue
+    return max(candidates) if candidates else None
 
 
 class LogBasedCheckpointCallback(TrainerCallback):
@@ -228,6 +245,12 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self._trace_path = None
         self._trace_run_id = None
         self._trace_resource_process = None
+
+        # Disk anchor + update log
+        self.disk_log_file = None
+        self.disk_log_fd = None
+        self.force_fsync = os.environ.get("FORCE_FSYNC", "0") == "1"
+        self.disk_anchor_step_val = None
 
     def _trace_resource_counters(self):
         if self._trace_resource_process is None:
@@ -538,6 +561,19 @@ class LogBasedCheckpointCallback(TrainerCallback):
         """Called at training start"""
         self.output_dir = args.output_dir
         self.shm_dir = _ensure_zo_shm_dir()
+
+        # Open persistent update log for inline per-step writes
+        if self.output_dir and self.batch_size >= 0 and self.disk_log_file is None:
+            try:
+                os.makedirs(self.output_dir, exist_ok=True)
+                log_path = os.path.join(self.output_dir, "update_log.jsonl")
+                self.disk_log_file = open(log_path, "a", buffering=1)
+                self.disk_log_fd = self.disk_log_file.fileno()
+                logger.info(f"[UpdateLog] Opened {log_path} (force_fsync={self.force_fsync})")
+            except Exception as exc:
+                logger.warning(f"[UpdateLog] Failed to open update_log.jsonl: {exc}")
+                self.disk_log_file = None
+                self.disk_log_fd = None
         self.shadow_replica_path = self._shadow_replica_path() if self.enable_shadow else None
         self.use_shadow_flat_commit = self.enable_shadow and os.environ.get("SHADOW_FLAT_COMMIT", "1") == "1"
         self.shadow_flat_header_path = (
@@ -848,6 +884,81 @@ class LogBasedCheckpointCallback(TrainerCallback):
             logger.info(f"[LogBased] Initial model cached ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
         self._log_memory_status()
 
+    def _restore_tmpfs_from_disk_anchor(self, resume_path=None):
+        """
+        Copy disk anchor flat files back to tmpfs for recovery.
+        - resume_path given: copy from specified shadow_anchor-<step>/ directory (manual resume)
+        - resume_path None, tmpfs valid: no-op (soft failure)
+        - resume_path None, tmpfs invalid: find latest shadow_anchor-*/ and copy (hard failure)
+        """
+        source_dir = None
+
+        if resume_path:
+            if (
+                os.path.isdir(resume_path)
+                and os.path.basename(resume_path.rstrip("/")).startswith("shadow_anchor-")
+            ):
+                source_dir = resume_path
+            else:
+                logger.warning(f"[DiskAnchor] SHADOW_ANCHOR_RESUME path invalid: {resume_path}")
+                return None
+        else:
+            flat_storage = getattr(self, "shadow_flat_storage", None)
+            header_path = None
+            if flat_storage:
+                header_path = flat_storage.get("header_path")
+            elif self.shadow_flat_header_path:
+                header_path = self.shadow_flat_header_path
+            if header_path and os.path.isfile(header_path):
+                return None  # soft failure, tmpfs still valid
+            anchor = _find_latest_disk_anchor(self.output_dir)
+            if anchor is None:
+                return None
+            _, source_dir = anchor
+
+        if source_dir is None:
+            return None
+
+        shm_dir = self.shm_dir or _ensure_zo_shm_dir()
+        os.makedirs(shm_dir, exist_ok=True)
+
+        copied = 0
+        for name in os.listdir(source_dir):
+            if ".flat." in name:
+                src = os.path.join(source_dir, name)
+                dst = os.path.join(shm_dir, name)
+                try:
+                    shutil.copy2(src, dst)
+                    copied += 1
+                except Exception as exc:
+                    logger.warning(f"[DiskAnchor] failed to copy {src} -> {dst}: {exc}")
+
+        logger.info(f"[DiskAnchor] Restored tmpfs from {source_dir} ({copied} files)")
+        return source_dir
+
+    def _load_update_log_jsonl(self, log_path, min_step_exclusive=0):
+        """Read JSONL update log, return list of updates with step > min_step_exclusive."""
+        if not os.path.isfile(log_path):
+            return []
+        updates = []
+        with open(log_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    update = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.warning(f"[UpdateLog] skipping corrupted line: {line[:80]}")
+                    continue
+                try:
+                    step = int(update.get("step", -1))
+                except (TypeError, ValueError):
+                    continue
+                if step > int(min_step_exclusive):
+                    updates.append(update)
+        return updates
+
     def _init_for_resume(self, model, state, log_based_resume):
         """Initialize callback state from an already-reconstructed (resumed) model.
         Unlike _cache_initial_model (for fresh training), this:
@@ -857,6 +968,22 @@ class LogBasedCheckpointCallback(TrainerCallback):
         """
         logger.info("[LogBased Resume] Initializing from resumed model...")
         t_start = time.time()
+
+        # Handle SHADOW_ANCHOR_RESUME or auto soft/hard disk-anchor recovery
+        shadow_anchor_resume = os.environ.get("SHADOW_ANCHOR_RESUME", "").strip()
+        if not shadow_anchor_resume:
+            # Also honor args.shadow_anchor_resume if set on trainer args
+            try:
+                shadow_anchor_resume = getattr(self.trainer.args, "shadow_anchor_resume", "") if self.trainer is not None else ""
+            except Exception:
+                shadow_anchor_resume = ""
+        try:
+            if shadow_anchor_resume:
+                self._restore_tmpfs_from_disk_anchor(shadow_anchor_resume)
+            else:
+                self._restore_tmpfs_from_disk_anchor(None)
+        except Exception as exc:
+            logger.warning(f"[DiskAnchor] restore tmpfs failed (non-fatal): {exc}")
 
         # Detect tied weights
         self._tied_weight_groups = _detect_tied_weights(model)
@@ -1063,6 +1190,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
         ctx = mp.get_context('spawn')
         self.update_queue = ctx.Queue()
         self.shadow_step_val = ctx.Value('i', int(self.shadow_step), lock=False)
+        self.disk_anchor_step_val = ctx.Value('i', 0, lock=False)
         self.shadow_ready_event = ctx.Event()
 
         try:
@@ -1115,6 +1243,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 self.shadow_commit_interval,
                 self.shadow_flat_storage,
                 self.shadow_ready_event,
+                self.output_dir,
+                self.disk_anchor_step_val,
             ),
             daemon=True,
         )
@@ -1228,6 +1358,16 @@ class LogBasedCheckpointCallback(TrainerCallback):
                             'zo_eps': float(zo_eps),
                         }
                         self.update_history.append(update)
+                        # Inline write to persistent update log
+                        if self.disk_log_file is not None:
+                            try:
+                                self.disk_log_file.write(
+                                    json.dumps(update, separators=(",", ":")) + "\n"
+                                )
+                                if self.force_fsync:
+                                    os.fdatasync(self.disk_log_fd)
+                            except Exception as exc:
+                                logger.warning(f"[UpdateLog] write failed: {exc}")
                         if self.update_queue is not None:
                             try:
                                 t_shadow_send_start = time.perf_counter()
@@ -1536,6 +1676,18 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         """Called at training end"""
         logger.info("[LogBased] Training ended, cleaning up...")
+        # Flush and close update log
+        if self.disk_log_file is not None:
+            try:
+                os.fdatasync(self.disk_log_fd)
+            except Exception:
+                pass
+            try:
+                self.disk_log_file.close()
+            except Exception:
+                pass
+            self.disk_log_file = None
+            self.disk_log_fd = None
         cleanup_token = trace_begin(
             panel="gpu_train",
             lane="blocking",

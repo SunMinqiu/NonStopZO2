@@ -49,6 +49,10 @@ _TIMELINE_VISIBLE = {
     "shadow_apply",
     "shadow_commit",
     "shadow_stop",
+    "shadow_generate",
+    "shadow_idle",
+    "disk_anchor_persist",
+    "wait_disk_anchor",
 }
 
 _TOPLEVEL_TIMELINE_EVENTS = {
@@ -65,6 +69,7 @@ _TOPLEVEL_TIMELINE_EVENTS = {
     "shadow_apply",
     "shadow_commit",
     "shadow_stop",
+    "disk_anchor_persist",
 }
 
 _SHADOW_BLOCK_EVENTS = {
@@ -152,9 +157,67 @@ def build_spans(records):
     return spans, instants
 
 
+def _derive_idle_spans(spans):
+    """Derive `shadow_idle` = `shadow_wait_update` \\ union(`shadow_generate`).
+
+    Real idle = consumer waiting AND no producer is generating.
+    """
+    wait = [s for s in spans if s["event"] == "shadow_wait_update"]
+    gen = [s for s in spans if s["event"] == "shadow_generate"]
+    if not wait:
+        return []
+    # Sort generators by start for efficient overlap lookup
+    gen_sorted = sorted(gen, key=lambda g: g["start_ns"])
+    idle = []
+    for w in wait:
+        ws, we = w["start_ns"], w["end_ns"]
+        # Collect busy intervals intersecting w
+        busy = []
+        for g in gen_sorted:
+            if g["end_ns"] <= ws:
+                continue
+            if g["start_ns"] >= we:
+                break
+            busy.append((max(ws, g["start_ns"]), min(we, g["end_ns"])))
+        # Merge overlapping busy segments
+        busy.sort()
+        merged = []
+        for s, e in busy:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+        # Subtract merged from [ws, we]
+        cur = ws
+        for s, e in merged:
+            if s > cur:
+                idle.append({
+                    "panel": w["panel"], "lane": w["lane"],
+                    "event": "shadow_idle",
+                    "start_ns": cur, "end_ns": s,
+                    "duration_ms": (s - cur) / 1_000_000.0,
+                    "step": w.get("step"), "pid": w.get("pid"),
+                    "tid": w.get("tid"), "triggered_by": None,
+                    "counters": None,
+                })
+            cur = max(cur, e)
+        if cur < we:
+            idle.append({
+                "panel": w["panel"], "lane": w["lane"],
+                "event": "shadow_idle",
+                "start_ns": cur, "end_ns": we,
+                "duration_ms": (we - cur) / 1_000_000.0,
+                "step": w.get("step"), "pid": w.get("pid"),
+                "tid": w.get("tid"), "triggered_by": None,
+                "counters": None,
+            })
+    return idle
+
+
 def load_trace(path):
     records = load_records(path)
     spans, instants = build_spans(records)
+    spans.extend(_derive_idle_spans(spans))
     return {
         "path": str(Path(path).resolve()),
         "records": records,
@@ -657,11 +720,55 @@ def print_summary(summary, *, top_n=20):
         )
 
 
-def plot_timeline(trace_or_records, spans=None, instants=None, *, figsize=(18, 10)):
+def plot_timeline(
+    trace_or_records,
+    spans=None,
+    instants=None,
+    *,
+    figsize=None,
+    width=16.0,
+    base_fontsize=None,
+    save_path=None,
+):
+    """Plot the merged GPU + CPU timeline.
+
+    Args:
+        figsize: (w, h) tuple. If None, height is derived from `width` using
+            the golden ratio (h = w / 1.618) so the figure has a clean
+            ~1.618:1 aspect.
+        width: used when `figsize` is None. Default 16 inches.
+        base_fontsize: base font size used for lane (ytick) labels. Axis
+            labels are drawn at `base_fontsize + 3`, the GPU/CPU section
+            labels at `base_fontsize + 5`. If None, falls back to matplotlib
+            rcParams["ytick.labelsize"] (which may be a float or a string
+            like "medium" → resolved via FontProperties).
+        save_path: optional path (str or pathlib.Path) to save the figure.
+            If the path ends in a recognized matplotlib extension (e.g.
+            ".pdf", ".png", ".svg") the format is inferred; otherwise PDF
+            is used. Parent directories are created if missing.
+    """
     try:
         import matplotlib.pyplot as plt
+        from matplotlib.font_manager import FontProperties
     except ImportError as exc:
         raise RuntimeError("matplotlib is required to plot timeline figures") from exc
+
+    # Resolve base font size. If the caller passed a number use it directly;
+    # otherwise pull the default from rcParams and resolve symbolic sizes
+    # ("small"/"medium"/"large") into absolute points via FontProperties.
+    if base_fontsize is None:
+        _rc_size = plt.rcParams.get("ytick.labelsize", 10)
+        try:
+            base_fontsize = float(_rc_size)
+        except (TypeError, ValueError):
+            base_fontsize = float(FontProperties(size=_rc_size).get_size_in_points())
+    axis_label_size = base_fontsize + 3
+    section_label_size = base_fontsize + 10
+
+    # Golden-ratio figure by default.
+    if figsize is None:
+        _phi = 1.6180339887
+        figsize = (float(width), float(width) / _phi)
 
     if isinstance(trace_or_records, dict):
         records = trace_or_records["records"]
@@ -674,35 +781,88 @@ def plot_timeline(trace_or_records, spans=None, instants=None, *, figsize=(18, 1
 
     panel_order = ["gpu_train", "cpu_shadow"]
     panel_titles = {"gpu_train": "GPU / Train", "cpu_shadow": "CPU / Shadow"}
-    row_order = [
-        "framework_overhead",
-        "train_step",
+    # Events hidden from the timeline (setup/teardown noise + raw
+    # shadow_wait_update which is replaced by derived shadow_idle).
+    _HIDDEN_EVENTS = {
+        "wait_shadow_ready", "shadow_boot", "shadow_stop",
+        "resume_begin", "resume_end",
+        "train_end_cleanup",
+        "shadow_wait_update",
+    }
+    # Detect LOG_BASED_CKPT mode from trace_config instant event to decide
+    # how to label the merged HF-checkpoint row.
+    _merged_ckpt_mode = "step_log"  # default fallback
+    for item in instants:
+        if item.get("event") == "trace_config":
+            _bs = (item.get("extra") or {}).get("batch_size")
+            if _bs is not None:
+                _merged_ckpt_mode = "step_log" if int(_bs) == 0 else "anchor_checkpoint"
+            break
+    # The 5 HF Trainer save events all happen together in _save_checkpoint
+    # (trainer_state.json + scheduler.pt + rng_state.pth + optimizer.pt +
+    # wrapper span). Merge them into a single row on the plot so it's not
+    # visual noise. Print summary still shows them separately.
+    _MERGED_CKPT_EVENTS = {
         "checkpoint_save",
-        "checkpoint_d2h_copy",
         "checkpoint_cpu_serialize",
         "checkpoint_rng_save",
         "checkpoint_disk_persist",
         "checkpoint_model_persist",
-        "wait_shadow_ready",
+    }
+    _MERGED_CKPT_LABEL = _merged_ckpt_mode  # "step_log" or "anchor_checkpoint"
+    # HF Trainer's "framework_overhead" span covers the bookkeeping between
+    # train_step events (dataloader, callbacks, LR update, ...). For paper
+    # plots, merge it onto the "train" row — they're back-to-back anyway.
+    # Print summary keeps them separate.
+    _MERGE_INTO_TRAIN = {"framework_overhead"}
+    # Display-only rename: keeps underlying trace event names stable.
+    _DISPLAY_NAMES = {
+        "train_step": "train",
+        "replay_updates": "replay",
+        "shadow_apply": "update",
+        "shadow_commit": "snapshot",
+        "shadow_generate": "generate",
+        "shadow_idle": "idle",
+        "disk_anchor_persist": "persist",
+        "wait_disk_anchor": "wait_persist",
+        _MERGED_CKPT_LABEL: _MERGED_CKPT_LABEL,
+    }
+    # Unified row order for both panels. Each panel's rows are the subset
+    # of this list that actually appear in that panel's events, so the
+    # relative order below determines per-panel display order:
+    #   GPU / Train:  loading → train → checkpoint → (recover_shadow) → replay
+    #   CPU / Shadow: loading → generate → update → idle → snapshot
+    #                 → (wait_persist) → persist
+    # Legacy rows appended after so old traces still render.
+    # Note: framework_overhead is merged into train_step (see _MERGE_INTO_TRAIN).
+    row_order = [
+        "loading",                 # both panels
+        # --- GPU / Train rows ---
+        "train_step",              # "train"
+        _MERGED_CKPT_LABEL,        # "step_log" or "anchor_checkpoint"
+        "recover_shadow",          # retry-only, sits between checkpoint and replay
+        "replay_updates",          # "replay"
+        # --- CPU / Shadow rows ---
+        "shadow_generate",         # "generate"
+        "shadow_apply",            # "update"
+        "shadow_idle",             # "idle"
+        "shadow_commit",           # "snapshot"
+        "wait_disk_anchor",        # "wait_persist" (only if real blocking)
+        "disk_anchor_persist",     # "persist"
+        # --- Legacy rows (kept for rendering old traces; empty for new runs) ---
+        "checkpoint_d2h_copy",
         "wait_anchor_persist",
         "wait_anchor_buffer",
-        "recover_shadow",
-        "replay_updates",
         "full_checkpoint_refresh",
-        "train_end_cleanup",
         "anchor_d2h_copy",
         "anchor_publish_latest",
         "anchor_persist",
-        "resume_begin",
-        "resume_end",
-        "shadow_boot",
-        "shadow_wait_update",
-        "shadow_apply",
-        "shadow_commit",
         "shadow_rebase",
-        "shadow_stop",
     ]
     colors = {
+        "loading": "#9467bd",
+        "shadow_generate": "#ff7f0e",
+        "shadow_idle": "#e0e0e0",
         "framework_overhead": "#c7c7c7",
         "train_step": "#1f77b4",
         "zo_update_hook": "#ff7f0e",
@@ -729,61 +889,279 @@ def plot_timeline(trace_or_records, spans=None, instants=None, *, figsize=(18, 1
         "train_end_cleanup": "#c49c94",
         "resume_begin": "#9edae5",
         "resume_end": "#9edae5",
+        # Phase 2: shadow-side disk anchor
+        "disk_anchor_persist": "#17becf",
+        "wait_disk_anchor": "#f7b6d2",
+        # Merged HF checkpoint row (label varies by LOG_BASED_CKPT mode)
+        "step_log": "#2ca02c",
+        "anchor_checkpoint": "#bcbd22",
     }
 
     origin_ns = _origin_ns(records, spans, instants)
-    fig, axes = plt.subplots(2, 1, sharex=True, figsize=figsize)
 
-    for ax, panel in zip(axes, panel_order):
-        panel_spans = [
-            item for item in spans
-            if item["panel"] == panel and item["event"] in (_TIMELINE_VISIBLE | _LEGACY_TIMELINE_VISIBLE)
-        ]
-        panel_instants = [
-            item for item in instants
-            if item["panel"] == panel and item["event"] in (_TIMELINE_VISIBLE | _LEGACY_TIMELINE_VISIBLE)
-        ]
-        row_keys = []
-        present = {item["event"] for item in panel_spans}
-        present.update(
-            item["event"]
-            for item in panel_instants
-            if item["lane"] not in ("resource", "counters", "meta")
+    # Find first train_step start — everything before it is collapsed into "loading".
+    first_train_ns = None
+    for item in spans:
+        if item["event"] == "train_step":
+            if first_train_ns is None or item["start_ns"] < first_train_ns:
+                first_train_ns = item["start_ns"]
+
+    # Detect failure+recovery windows in retry runs. The trace file is
+    # append-mode, so retry runs accumulate in the same jsonl. A retry
+    # produces `resume_begin` → recover_shadow / replay_updates → `resume_end`
+    # → new train_step. The failure itself is the gap between the last
+    # pre-crash train_step end and the first resume_begin.
+    #
+    # For each resume_begin, we derive two windows:
+    #   - failure window  = [last train_step end before resume_begin,
+    #                        resume_begin wall_time]
+    #     → drawn as red axvspan across both panels
+    #   - loading window  = [resume_begin wall_time,
+    #                        first train_step start after the resume_end]
+    #     → emitted as a synthetic "loading" span so it joins the existing
+    #       loading row
+    train_span_bounds = sorted(
+        [(s["start_ns"], s["end_ns"]) for s in spans if s["event"] == "train_step"]
+    )
+    resume_begins = sorted(
+        [int(i["wall_time_ns"]) for i in instants if i.get("event") == "resume_begin"]
+    )
+    # replay_updates is a concrete recovery sub-phase that gets its own row.
+    # Subtract it from the synthetic "loading" window so the loading bar
+    # reflects the REAL wall-clock time spent on other recovery work
+    # (model skeleton build, base checkpoint load, HF Trainer setup, ...),
+    # not the union that includes replay.
+    replay_bounds = sorted(
+        [(s["start_ns"], s["end_ns"]) for s in spans if s["event"] == "replay_updates"]
+    )
+
+    def _subtract_intervals(window_start, window_end, sub_intervals):
+        """Return segments of [window_start, window_end] not covered by any
+        interval in sub_intervals."""
+        clipped = []
+        for s, e in sub_intervals:
+            cs = max(s, window_start)
+            ce = min(e, window_end)
+            if cs < ce:
+                clipped.append((cs, ce))
+        if not clipped:
+            return [(window_start, window_end)]
+        clipped.sort()
+        merged = [list(clipped[0])]
+        for s, e in clipped[1:]:
+            if s <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], e)
+            else:
+                merged.append([s, e])
+        result = []
+        cursor = window_start
+        for s, e in merged:
+            if cursor < s:
+                result.append((cursor, s))
+            cursor = e
+        if cursor < window_end:
+            result.append((cursor, window_end))
+        return result
+
+    failure_windows: list[tuple[int, int]] = []  # (failure_start_ns, failure_end_ns)
+    post_failure_loading: list[tuple[int, int]] = []  # segments not covered by sub-spans
+    for rb_ns in resume_begins:
+        # Failure start = end of last train_step before this resume_begin.
+        prev_train_end = None
+        for s_ns, e_ns in train_span_bounds:
+            if e_ns <= rb_ns:
+                prev_train_end = e_ns
+            else:
+                break
+        if prev_train_end is None:
+            continue  # resume_begin with no preceding train_step — skip
+        failure_windows.append((prev_train_end, rb_ns))
+        # Full recovery window = resume_begin → first train_step after.
+        next_train_start = None
+        for s_ns, e_ns in train_span_bounds:
+            if s_ns >= rb_ns:
+                next_train_start = s_ns
+                break
+        if next_train_start is None:
+            continue
+        # Loading = recovery window minus replay_updates spans within it.
+        # Produces one or two disjoint segments (pre-replay setup + post-replay setup).
+        for seg_start, seg_end in _subtract_intervals(
+            rb_ns, next_train_start, replay_bounds
+        ):
+            post_failure_loading.append((seg_start, seg_end))
+
+    # === Merged single-axis layout ===
+    # Loading is a shared row at top. GPU rows follow (train / checkpoint /
+    # replay / recover), then a horizontal divider, then CPU rows (generate /
+    # update / idle / snapshot / persist / wait_persist). Failure window is
+    # an axvspan across the whole figure so it visually connects both halves.
+    _GPU_PANEL_EVENTS = {
+        "train_step",
+        _MERGED_CKPT_LABEL,
+        "recover_shadow",
+        "replay_updates",
+        # legacy GPU
+        "checkpoint_d2h_copy",
+        "wait_anchor_persist",
+        "wait_anchor_buffer",
+        "full_checkpoint_refresh",
+        "anchor_d2h_copy",
+        "anchor_publish_latest",
+        "anchor_persist",
+    }
+    _CPU_PANEL_EVENTS = {
+        "shadow_generate",
+        "shadow_apply",
+        "shadow_idle",
+        "shadow_commit",
+        "wait_disk_anchor",
+        "disk_anchor_persist",
+        "shadow_rebase",
+    }
+
+    merged_spans = []
+    for item in spans:
+        if item["event"] not in (_TIMELINE_VISIBLE | _LEGACY_TIMELINE_VISIBLE):
+            continue
+        if item["event"] in _HIDDEN_EVENTS:
+            continue
+        if first_train_ns is not None and item["start_ns"] < first_train_ns:
+            continue
+        if item["event"] in _MERGED_CKPT_EVENTS:
+            merged = dict(item)
+            merged["event"] = _MERGED_CKPT_LABEL
+            merged_spans.append(merged)
+        elif item["event"] in _MERGE_INTO_TRAIN:
+            merged = dict(item)
+            merged["event"] = "train_step"
+            merged_spans.append(merged)
+        else:
+            merged_spans.append(item)
+
+    # Synthetic pre-train "loading" span (emit once, not per panel).
+    if first_train_ns is not None and first_train_ns > origin_ns:
+        merged_spans.append({
+            "event": "loading",
+            "start_ns": origin_ns,
+            "end_ns": first_train_ns,
+        })
+    # Post-failure loading (one per retry).
+    for load_start_ns, load_end_ns in post_failure_loading:
+        merged_spans.append({
+            "event": "loading",
+            "start_ns": load_start_ns,
+            "end_ns": load_end_ns,
+        })
+
+    merged_instants = [
+        item for item in instants
+        if item["event"] in (_TIMELINE_VISIBLE | _LEGACY_TIMELINE_VISIBLE)
+        and item["event"] not in _HIDDEN_EVENTS
+        and (first_train_ns is None or item.get("wall_time_ns", 0) >= first_train_ns)
+    ]
+
+    present = {item["event"] for item in merged_spans}
+    present.update(
+        item["event"]
+        for item in merged_instants
+        if item["lane"] not in ("resource", "counters", "meta")
+    )
+    row_keys = [key for key in row_order if key in present]
+    y_positions = {key: idx * 10 for idx, key in enumerate(row_keys)}
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+
+    for item in merged_spans:
+        y = y_positions.get(item["event"])
+        if y is None:
+            continue
+        start_s = _ns_to_s(item["start_ns"], origin_ns)
+        width_s = max(_ns_to_s(item["end_ns"], item["start_ns"]), 1e-6)
+        ax.broken_barh(
+            [(start_s, width_s)],
+            (y, 8),
+            facecolors=colors.get(item["event"], "#4c78a8"),
+            edgecolors="black",
+            linewidth=0.4,
+            alpha=0.9,
         )
-        for key in row_order:
-            if key in present:
-                row_keys.append(key)
-        y_positions = {key: idx * 10 for idx, key in enumerate(row_keys)}
 
-        for item in panel_spans:
-            start_s = _ns_to_s(item["start_ns"], origin_ns)
-            width_s = max(_ns_to_s(item["end_ns"], item["start_ns"]), 1e-6)
-            ax.broken_barh(
-                [(start_s, width_s)],
-                (y_positions[item["event"]], 8),
-                facecolors=colors.get(item["event"], "#4c78a8"),
-                edgecolors="black",
-                linewidth=0.4,
-                alpha=0.9,
+    for item in merged_instants:
+        if item["lane"] in ("resource", "counters", "meta"):
+            continue
+        y = y_positions.get(item["event"])
+        if y is None:
+            continue
+        x = _ns_to_s(item["wall_time_ns"], origin_ns)
+        ax.plot([x], [y + 4], marker="|", markersize=12, color="black")
+
+    # Red failure band: vertical extent = top of the first row ↔ bottom of
+    # the last row (not full axis, so it doesn't go beyond the lanes).
+    if row_keys and failure_windows:
+        _row_top_y = 0
+        _row_bottom_y = (len(row_keys) - 1) * 10 + 8
+        for fail_start_ns, fail_end_ns in failure_windows:
+            fail_start_s = _ns_to_s(fail_start_ns, origin_ns)
+            fail_end_s = _ns_to_s(fail_end_ns, origin_ns)
+            # firebrick (#b22222) — deeper/warmer red than default, not garish.
+            ax.fill_betweenx(
+                [_row_top_y, _row_bottom_y],
+                fail_start_s, fail_end_s,
+                color="#FF0000", alpha=0.6, zorder=0,
             )
 
-        for item in panel_instants:
-            if item["lane"] in ("resource", "counters", "meta"):
-                continue
-            x = _ns_to_s(item["wall_time_ns"], origin_ns)
-            y = y_positions.get(item["event"])
-            if y is None:
-                continue
-            ax.plot([x], [y + 4], marker="|", markersize=12, color="black")
+    # Horizontal divider between GPU and CPU rows.
+    gpu_row_indices = [i for i, k in enumerate(row_keys) if k in _GPU_PANEL_EVENTS]
+    cpu_row_indices = [i for i, k in enumerate(row_keys) if k in _CPU_PANEL_EVENTS]
 
-        ax.set_yticks([y_positions[key] + 4 for key in row_keys] or [0])
-        ax.set_yticklabels(row_keys or ["no_events"])
-        ax.set_title(panel_titles.get(panel, panel))
-        ax.grid(axis="x", linestyle="--", alpha=0.35)
+    ax.set_yticks([y_positions[key] + 4 for key in row_keys] or [0])
+    ax.set_yticklabels(
+        [_DISPLAY_NAMES.get(key, key) for key in row_keys] or ["no_events"],
+        fontsize=base_fontsize,
+        fontweight="bold",
+    )
+    for tick in ax.get_xticklabels():
+        tick.set_fontsize(base_fontsize)
+        tick.set_fontweight("bold")
+    # Flip so row_order reads top-to-bottom.
+    ax.invert_yaxis()
+    ax.set_xlabel("Wall Time (s)", fontsize=axis_label_size, fontweight="bold")
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
 
-    axes[-1].set_xlabel("Wall Time Since Trace Start (s)")
+    # Place GPU/CPU section labels far to the left of the tick labels.
+    # Font size is lane-label size + 3 to make them stand out.
+    if gpu_row_indices and cpu_row_indices:
+        last_gpu = max(gpu_row_indices)
+        first_cpu = min(cpu_row_indices)
+        divider_y = (last_gpu * 10 + 8 + first_cpu * 10) / 2
+        ax.axhline(divider_y, color="black", linewidth=1.2, alpha=0.6)
+
+        gpu_mid = (min(gpu_row_indices) * 10 + last_gpu * 10 + 8) / 2
+        cpu_mid = (first_cpu * 10 + max(cpu_row_indices) * 10 + 8) / 2
+        # Use axes-fraction x, data-coord y (get_yaxis_transform), well to
+        # the left of the y tick labels so they don't overlap.
+        ax.text(-0.12, gpu_mid, "GPU",
+                transform=ax.get_yaxis_transform(),
+                ha="right", va="center",
+                fontsize=section_label_size, fontweight="bold")
+        ax.text(-0.12, cpu_mid, "CPU",
+                transform=ax.get_yaxis_transform(),
+                ha="right", va="center",
+                fontsize=section_label_size, fontweight="bold")
+
     fig.tight_layout()
-    return fig, axes
+
+    if save_path is not None:
+        _save_path = Path(save_path)
+        _save_path.parent.mkdir(parents=True, exist_ok=True)
+        # If no recognized extension, default to .pdf
+        _known_exts = {".pdf", ".png", ".svg", ".jpg", ".jpeg", ".eps", ".ps"}
+        if _save_path.suffix.lower() not in _known_exts:
+            _save_path = _save_path.with_suffix(".pdf")
+        fig.savefig(str(_save_path), bbox_inches="tight")
+
+    return fig, ax
 
 
 def plot_resources(trace_or_records, *, figsize=(18, 10)):

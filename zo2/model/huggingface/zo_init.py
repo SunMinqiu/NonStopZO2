@@ -6,7 +6,7 @@ import transformers
 
 from . import (
     opt,
-    # llama,
+    llama,
     qwen3
 )
 
@@ -15,7 +15,7 @@ _zo2_supported_models = {
     transformers.OPTForSequenceClassification: opt.get_opt_for_sequence_classification,
     transformers.OPTForQuestionAnswering: opt.get_opt_for_question_answering,
 
-    # transformers.LlamaForCausalLM: llama.get_llama_for_causalLM,
+    transformers.LlamaForCausalLM: llama.get_llama_for_causalLM,
 
     transformers.Qwen3ForCausalLM: qwen3.get_qwen3_for_causalLM,
 }

@@ -18,10 +18,13 @@ from .log_based_utils import (
     _step_diag_enabled,
     _step_exact_enabled,
 )
-from .legacy_pipeline_closed_form_replay import (
-    _closedform_replay_on_state,
-    _parallel_replay_updates_on_state,
-)
+def _parallel_replay_updates_on_state(*args, **kwargs):
+    from .legacy_pipeline_closed_form_replay import _parallel_replay_updates_on_state as _fn
+    return _fn(*args, **kwargs)
+
+def _closedform_replay_on_state(*args, **kwargs):
+    from .legacy_pipeline_closed_form_replay import _closedform_replay_on_state as _fn
+    return _fn(*args, **kwargs)
 
 logger = logging.getLogger(__name__)
 

@@ -50,6 +50,10 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
           f"points={len(points)} range=[{points[0]}..{points[-1]}] "
           f"warmup={n_warmup} measure={n_measure}", flush=True)
 
+    # Adaptive measurement: if a single run is slow (>SLOW_THRESHOLD_S),
+    # skip repeat measurements to save time.
+    SLOW_THRESHOLD_S = 20.0
+
     t_gen_curve = {}
     for idx, c in enumerate(points):
         if _zo_rng is not None:
@@ -58,7 +62,8 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
             torch.set_num_threads(c)
 
         times = []
-        for i in range(n_warmup + n_measure):
+        total_iters = n_warmup + n_measure
+        for i in range(total_iters):
             seed = 1000000 + i
             t0 = time.monotonic()
             z = _generate_z_for_one_step(seed, param_names, state, rng_device)
@@ -66,10 +71,13 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
             if i >= n_warmup:
                 times.append(t1 - t0)
             del z
+            # Stop early if the first measured run is slow.
+            if len(times) == 1 and times[0] > SLOW_THRESHOLD_S:
+                break
 
         t_gen_curve[c] = _median(times)
         print(f"[BenchCurves] t_gen(c={c}) = {t_gen_curve[c]*1000:.1f}ms  "
-              f"[{idx+1}/{len(points)}]", flush=True)
+              f"[{idx+1}/{len(points)}] (n={len(times)})", flush=True)
 
     _prev_aten = torch.get_num_threads()
     torch.set_num_threads(C_max)
@@ -86,7 +94,8 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
         torch.set_num_threads(n)
 
         times = []
-        for i in range(n_warmup + n_measure):
+        total_iters = n_warmup + n_measure
+        for i in range(total_iters):
             t0 = time.monotonic()
             _apply_single_update_with_pregenerated_z(
                 state, dummy_update, param_names, z_pregenerated,
@@ -98,10 +107,13 @@ def _benchmark_curves_worker(shared_tensors, param_names, rng_device, C,
             t1 = time.monotonic()
             if i >= n_warmup:
                 times.append(t1 - t0)
+            # Stop early if the first measured run is slow.
+            if len(times) == 1 and times[0] > SLOW_THRESHOLD_S:
+                break
 
         t_update_curve[n] = _median(times)
         print(f"[BenchCurves] t_update(n={n}) = {t_update_curve[n]*1000:.1f}ms  "
-              f"[{idx+1}/{len(points)}]", flush=True)
+              f"[{idx+1}/{len(points)}] (n={len(times)})", flush=True)
 
     del z_pregenerated
 
@@ -196,8 +208,14 @@ def optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train,
     commit_interval = max(1, int(commit_interval))
     t_commit_avg = t_commit / commit_interval
 
+    # Ordering key: primary = t_step (clamped to max(t_cpu, t_train)),
+    # secondary = t_cpu. When multiple configs are GPU-bound (t_cpu < t_train),
+    # this selects the one with the lowest t_cpu (most headroom).
+    def _rank_key(cfg):
+        return (cfg['t_step'], cfg['t_cpu'])
+
     for P in range(1, P_max + 1):
-        best_t = float('inf')
+        best_t = (float('inf'), float('inf'))
         best_cfg = None
 
         for c in range(1, C // P + 1):
@@ -211,14 +229,14 @@ def optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train,
             t_gen_P = _interp_curve(t_gen_curve, c) / P
             t_upd = _interp_curve(t_update_curve, c_cons)
             t_cons = t_upd + t_commit_avg
-            t_step = max(t_gen_P, t_cons, t_train)
+            t_cpu = t_gen_P + t_upd + t_commit_avg  # CPU side total (serial sum)
+            t_step = max(t_cpu, t_train)
 
-            components = {'t_gen/P': t_gen_P, 't_consumer': t_cons, 't_train': t_train}
-            bottleneck = max(components, key=components.get)
+            bottleneck = 't_cpu' if t_cpu >= t_train else 't_train'
 
             cfg = {
                 'c': c, 'P': P, 'c_cons': c_cons,
-                't_step': t_step, 'bottleneck': bottleneck,
+                't_step': t_step, 't_cpu': t_cpu, 'bottleneck': bottleneck,
                 'B': commit_interval, 'lag_frac': 0.0,
                 't_gen_P': t_gen_P, 't_update_val': t_upd,
                 't_commit_val': t_commit,
@@ -227,8 +245,9 @@ def optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train,
             }
             all_configs.append(cfg)
 
-            if t_step < best_t:
-                best_t = t_step
+            key = _rank_key(cfg)
+            if key < best_t:
+                best_t = key
                 best_cfg = cfg
 
         if best_cfg:
@@ -237,9 +256,13 @@ def optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train,
     if not pareto:
         raise ValueError("No valid (c, P) configuration found")
 
-    global_best = min(pareto, key=lambda x: x['t_step'])
+    global_best = min(pareto, key=_rank_key)
     threshold = global_best['t_step'] * 1.05
-    recommended = next(p for p in pareto if p['t_step'] <= threshold)
+    # Among configs within the t_step threshold, pick the one with lowest t_cpu.
+    recommended = min(
+        (p for p in pareto if p['t_step'] <= threshold),
+        key=lambda p: p['t_cpu'],
+    )
 
     return {
         'pareto': pareto,
@@ -251,6 +274,7 @@ def optimize_thread_allocation(t_gen_curve, t_update_curve, C, t_train,
         'best_P': recommended['P'],
         'best_c_cons': recommended['c_cons'],
         'best_t_step': recommended['t_step'],
+        'best_t_cpu': recommended['t_cpu'],
         'best_bottleneck': recommended['bottleneck'],
         'best_B': recommended['B'],
         'best_lag_frac': recommended['lag_frac'],
@@ -408,12 +432,13 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
     print(f"Producer-Consumer Optimization (C={C}, t_train={t_train*1000:.0f}ms)")
     print(f"{'='*65}")
     if len(scan_results) == 1:
-        print(f"{'P':>3} {'c':>5} {'c_cons':>6} {'t_step':>8} {'bottleneck':>12}")
-        print(f"{'-'*45}")
+        print(f"{'P':>3} {'c':>5} {'c_cons':>6} {'t_cpu':>9} {'t_gpu':>9} {'t_step':>9} {'bottleneck':>12}")
+        print(f"{'-'*65}")
         for row in opt['pareto']:
             marker = ' <--' if row is rec else ''
             print(f"{row['P']:>3} {row['c']:>5} {row['c_cons']:>6} "
-                  f"{row['t_step']*1000:>7.0f}ms {row['bottleneck']:>12}{marker}")
+                  f"{row['t_cpu']*1000:>8.0f}ms {t_train*1000:>8.0f}ms "
+                  f"{row['t_step']*1000:>8.0f}ms {row['bottleneck']:>12}{marker}")
     else:
         print("Commit interval scan:")
         print(f"{'N':>4} {'P':>3} {'c':>5} {'c_cons':>6} {'t_step':>8} {'commit/N':>10} {'bottleneck':>12}")
@@ -427,6 +452,7 @@ def calibrate_producer_consumer(state, param_names, rng_device="zo_rng",
     print(f"  t_commit={t_commit*1000:.0f}ms, commit_interval={selected_interval}, "
           f"amortized={rec['t_commit_avg']*1000:.0f}ms/step")
     print(f"  Recommended: P={rec['P']}, c={rec['c']}, c_cons={rec['c_cons']} "
+          f"-> t_cpu={rec['t_cpu']*1000:.0f}ms vs t_gpu={t_train*1000:.0f}ms "
           f"-> t_step={rec['t_step']*1000:.0f}ms")
     print(f"  Memory: shadow={per_slot_bytes/1e9:.2f}GB + "
           f"z_buf=1x{per_slot_bytes/1e9:.2f}GB = {total_mem/1e9:.2f}GB")

@@ -224,7 +224,7 @@ def encode_prompt(task, template, train_samples, eval_sample, tokenizer, max_len
 
     if any([len(encoding) > max_length for encoding in encodings]):
         logger.warn("Exceed max length")
-    if tokenizer.add_bos_token:
+    if getattr(tokenizer, 'add_bos_token', False):
         encodings = [encoding[0:1] + encoding[1:][-(max_length-1):] for encoding in encodings]  
     else:
         encodings = [encoding[-max_length:] for encoding in encodings]  
