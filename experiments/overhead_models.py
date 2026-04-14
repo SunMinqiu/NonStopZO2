@@ -15,20 +15,20 @@ MTBF_range = np.linspace(0.5, 24, 200)
 
 # ====================================================================
 # Model 1: Log-Only (no anchor, no shadow, replay from step 0)
-#   overhead = t_l/t + L_disk/M + t_r/2
+#   overhead = t_l/t + L_disk/(M*t) + t_r/(2*t)
 # ====================================================================
 
 def overhead_logonly(M, p):
     t = p['t_step'] + p['t_l']
-    return p['t_l'] / t + p['L_disk'] / M + p['t_r'] / 2
+    return p['t_l'] / t + p['L_disk'] / (M * t) + p['t_r'] / (2 * t)
 
 def overhead_logonly_decomposed(M, p):
     t = p['t_step'] + p['t_l']
-    return p['t_l'] / t, p['L_disk'] / M, p['t_r'] / 2
+    return p['t_l'] / t, p['L_disk'] / (M * t), p['t_r'] / (2 * t)
 
 # ====================================================================
 # Model 2: Log+Anchor (full checkpoint every K steps, all blocking)
-#   overhead(K) = (K*t_l + t_a)/T_cycle + E[T_recover]/M
+#   overhead(K) = (K*t_l + t_a)/T_cycle + E[T_recover]/(M*t)
 # ====================================================================
 
 def overhead_anchor(K, M, p):
@@ -38,7 +38,7 @@ def overhead_anchor(K, M, p):
     E_train = p['L_disk'] + p['t_r'] * K / 2
     E_ckpt  = p['L_disk'] + p['t_r'] * K
     E_recover = (K * t / T_cycle) * E_train + (t_a / T_cycle) * E_ckpt
-    return (K * p['t_l'] + t_a) / T_cycle + E_recover / M
+    return (K * p['t_l'] + t_a) / T_cycle + E_recover / (M * t)
 
 def solve_anchor(M, p):
     result = minimize_scalar(lambda K: overhead_anchor(K, M, p),
@@ -53,8 +53,8 @@ def overhead_anchor_decomposed(K, M, p):
     E_ckpt  = p['L_disk'] + p['t_r'] * K
     log_cost    = K * p['t_l'] / T_cycle
     ckpt_block  = t_a / T_cycle
-    load_cost   = ((K * t / T_cycle) * p['L_disk'] + (t_a / T_cycle) * p['L_disk']) / M
-    replay_cost = ((K * t / T_cycle) * (p['t_r'] * K / 2) + (t_a / T_cycle) * (p['t_r'] * K)) / M
+    load_cost   = ((K * t / T_cycle) * p['L_disk'] + (t_a / T_cycle) * p['L_disk']) / (M * t)
+    replay_cost = ((K * t / T_cycle) * (p['t_r'] * K / 2) + (t_a / T_cycle) * (p['t_r'] * K)) / (M * t)
     return log_cost, ckpt_block, load_cost, replay_cost
 
 # ====================================================================
@@ -176,14 +176,14 @@ def overhead_cpu_replay(M, p):
     info = compute_N_star(M, p)
     if info['N_star'] == np.inf:
         return np.inf
-    return p['t_l'] / t + (p['L_cpu'] + p['t_r'] * info['d']) / M
+    return p['t_l'] / t + (p['L_cpu'] + p['t_r'] * info['d']) / (M * t)
 
 def overhead_cpu_replay_decomposed(M, p):
     t = p['t_step'] + p['t_l']
     info = compute_N_star(M, p)
     if info['N_star'] == np.inf:
         return np.inf, np.inf, np.inf
-    return p['t_l'] / t, p['L_cpu'] / M, p['t_r'] * info['d'] / M
+    return p['t_l'] / t, p['L_cpu'] / (M * t), p['t_r'] * info['d'] / (M * t)
 
 # ====================================================================
 # Model 4: From CPU Persist (hard failure — load from disk persist)
@@ -207,7 +207,7 @@ def overhead_cpu_persist(M, p):
     if info['N_star'] == np.inf:
         return np.inf
     d_hard = _replay_distance_hard(info['N_star'], M, p)
-    return p['t_l'] / t + (p['L_disk'] + p['t_r'] * d_hard) / M
+    return p['t_l'] / t + (p['L_disk'] + p['t_r'] * d_hard) / (M * t)
 
 def overhead_cpu_persist_decomposed(M, p):
     t = p['t_step'] + p['t_l']
@@ -215,7 +215,7 @@ def overhead_cpu_persist_decomposed(M, p):
     if info['N_star'] == np.inf:
         return np.inf, np.inf, np.inf
     d_hard = _replay_distance_hard(info['N_star'], M, p)
-    return p['t_l'] / t, p['L_disk'] / M, p['t_r'] * d_hard / M
+    return p['t_l'] / t, p['L_disk'] / (M * t), p['t_r'] * d_hard / (M * t)
 
 # ====================================================================
 # Compute & Plot
@@ -246,7 +246,15 @@ def _save_and_show(fig, name):
         fig.savefig(os.path.join(save_dir, f'{name}.pdf'), bbox_inches='tight')
     plt.show()
 
-ALL_MECHANISMS = ['Log-Only', 'Log+Anchor', 'From CPU Persist', 'CPU Replay']
+# anchor_Ks: list of fixed K values for Log+Anchor curves (blue palette)
+if 'anchor_Ks' not in dir():
+    anchor_Ks = [20, 500, 1000]
+
+_ANCHOR_COLORS = ['#6baed6', '#2171b5', '#08306b']  # light → dark blue
+
+ALL_MECHANISMS = (['Log-Only']
+                  + [f'Every {K}' for K in anchor_Ks]
+                  + ['CPU Replay', 'From CPU Persist'])
 
 def _compute_all(p, MTBF_range):
     t = p['t_step'] + p['t_l']
@@ -257,8 +265,12 @@ def _compute_all(p, MTBF_range):
 
     curves['Log-Only']    = np.array([overhead_logonly(M, p) for M in M_arr])
 
+    # Fixed-K anchor curves
+    for K in anchor_Ks:
+        curves[f'Every {K}'] = np.array([overhead_anchor(K, M, p) for M in M_arr])
+
+    # Still compute optimal K* for summary tables
     anchor_results = [solve_anchor(M, p) for M in M_arr]
-    curves['Log+Anchor']  = np.array([r[1] for r in anchor_results])
     K_stars = np.array([r[0] for r in anchor_results])
 
     oh_cr = np.array([overhead_cpu_replay(M, p) for M in M_arr])
@@ -285,10 +297,12 @@ print("=" * 80)
 
 STYLES = {
     'Log-Only':          {'linestyle': '-',  'linewidth': 2.5, 'color': '#2ca02c'},  # green
-    'Log+Anchor':        {'linestyle': '-',  'linewidth': 2.5, 'color': '#1f77b4'},  # blue
     'CPU Replay':        {'linestyle': '-',  'linewidth': 2.5, 'color': '#d62728'},  # red
     'From CPU Persist':  {'linestyle': '--', 'linewidth': 2.5, 'color': '#ff7f0e'},  # orange dashed
 }
+# Add fixed-K anchor styles (blue palette matching E2E plots)
+for _k, _c in zip(anchor_Ks, _ANCHOR_COLORS):
+    STYLES[f'Every {_k}'] = {'linestyle': '-', 'linewidth': 2.5, 'color': _c}
 
 # Global font size — set `font_size` in input cell to control the SMALLEST text.
 # All other elements scale up from this base.
@@ -303,7 +317,7 @@ plt.rcParams.update({
     'font.size':          _fs,
     'axes.titlesize':     _fs + 6,
     'axes.labelsize':     _fs + 6,
-    'xtick.labelsize':    _fs + 3,
+    'xtick.labelsize':    _fs - 1 ,
     'ytick.labelsize':    _fs + 3,
     'legend.fontsize':    _fs + 2,
     'font.weight':        'bold',
@@ -385,13 +399,10 @@ def _add_cut_line(ax):
 # --- Plot 1: Overhead vs MTBF ---
 
 def _mech_label(mech, pname, data, prefix=None):
-    """Build legend label, appending K* at MTBF_CUT for Log+Anchor."""
+    """Build legend label."""
     label = f'{prefix} {mech}' if prefix else mech
     idx = np.argmin(np.abs(MTBF_range - MTBF_CUT))
-    if mech == 'Log+Anchor':
-        K_val = data['K_stars'][idx]
-        label += f' (K*={K_val:.0f})'
-    elif mech in ('CPU Replay', 'From CPU Persist'):
+    if mech in ('CPU Replay', 'From CPU Persist'):
         N_info = data['N_infos'][idx]
         if N_info['N_star'] != np.inf:
             label += f' (N*={N_info["N_star"]:.0f})'
@@ -413,7 +424,7 @@ if plot_mode == "by_model":
         ax.set_ylim(bottom=0)
         plt.tight_layout()
         _annotate_all_at_cut(ax, MTBF_range, curves_colors)
-        # _save_and_show(fig, f'overhead_{pname}')
+        _save_and_show(fig, f'overhead_{pname}')
 
 elif plot_mode == "by_mechanism":
     mechs_present = set()
@@ -458,24 +469,24 @@ else:  # "all"
     _annotate_all_at_cut(ax, MTBF_range, curves_colors)
     _save_and_show(fig, 'overhead_all')
 
-# # --- Plot 2: Log+Anchor optimal K* vs MTBF ---
+# --- Plot 2: Log+Anchor optimal K* vs MTBF ---
 
-# fig, ax = plt.subplots(figsize=(fig_width, _golden))
-# for pname, data in all_data.items():
-#     line, = ax.plot(MTBF_range, data['K_stars'], linewidth=2.0, label=pname)
-#     idx = np.argmin(np.abs(MTBF_range - MTBF_CUT))
-#     val = data['K_stars'][idx]
-#     ax.annotate(f'{val:.0f}', xy=(MTBF_CUT, val), xytext=(8, 0),
-#                 textcoords='offset points', color=line.get_color(), va='center',
-#                 fontsize=_fs, fontweight='bold')
-# _add_cut_line(ax)
-# ax.set_xlabel('MTBF (hours)')
-# ax.set_ylabel('K* (optimal anchor interval, steps)')
-# ax.set_title('Log+Anchor: Optimal K* vs MTBF')
-# ax.legend()
-# ax.grid(True, alpha=0.3)
-# plt.tight_layout()
-# _save_and_show(fig, 'kstar_vs_mtbf')
+fig, ax = plt.subplots(figsize=(fig_width, _golden))
+for pname, data in all_data.items():
+    line, = ax.plot(MTBF_range, data['K_stars'], linewidth=2.0, label=pname)
+    idx = np.argmin(np.abs(MTBF_range - MTBF_CUT))
+    val = data['K_stars'][idx]
+    ax.annotate(f'{val:.0f}', xy=(MTBF_CUT, val), xytext=(8, 0),
+                textcoords='offset points', color=line.get_color(), va='center',
+                fontsize=_fs, fontweight='bold')
+_add_cut_line(ax)
+ax.set_xlabel('MTBF (hours)')
+ax.set_ylabel('K* (optimal anchor interval, steps)')
+ax.set_title('Log+Anchor: Optimal K* vs MTBF')
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+_save_and_show(fig, 'kstar_vs_mtbf')
 
 # --- Plot 3: CPU Replay N* bar chart ---
 
@@ -528,8 +539,8 @@ def _decompose3_at(mech, M, p):
     if mech == 'Log-Only':
         log, load, replay = overhead_logonly_decomposed(M, p)
         return log, load, replay
-    elif mech == 'Log+Anchor':
-        K, _ = solve_anchor(M, p)
+    elif mech.startswith('Every '):
+        K = int(mech.split()[-1])
         log, ckpt_block, load, replay = overhead_anchor_decomposed(K, M, p)
         return log + ckpt_block, load, replay
     elif mech == 'CPU Replay':
@@ -688,7 +699,7 @@ for p in param_sets:
     print(f"\n  Log-Only:")
     print(f"    Log:    {lo_log*100:10.6f} %")
     print(f"    Load:   {lo_load*100:10.6f} %")
-    print(f"    Replay: {lo_replay*100:10.6f} %  (t_r/2 — fixed floor)")
+    print(f"    Replay: {lo_replay*100:10.6f} %  (t_r/(2t) — fixed floor)")
     print(f"    Total:  {(lo_log+lo_load+lo_replay)*100:10.4f} %")
 
     K_anch, _ = solve_anchor(M_val, p)
@@ -724,3 +735,190 @@ for p in param_sets:
     else:
         print(f"\n  CPU Replay: NOT VIABLE")
         print(f"  From CPU Persist: NOT VIABLE")
+
+# --- Plot 5: E2E WASTE Decomposition — all models, fixed anchor K ---
+#
+# Config (set before exec):
+#   decomp_mtbfs   = [3, 9, 15]        — MTBF sample points (hours)
+#   anchor_Ks      = [100, 500, 2000]   — fixed checkpoint intervals for Log+Anchor
+#   decomp_model   = "Qwen3-8B"         — which model to plot
+#
+# Single figure.  X = MTBF points.  Grouped stacked bars = mechanisms.
+
+if 'decomp_mtbfs' not in dir():
+    decomp_mtbfs = []
+if 'anchor_Ks' not in dir():
+    anchor_Ks = []
+if 'decomp_model' not in dir():
+    decomp_model = ''
+
+if decomp_mtbfs and anchor_Ks and decomp_model and decomp_model in all_data:
+    from matplotlib.patches import Patch
+
+    _p5_p = all_data[decomp_model]['params']
+    _p5_t = _p5_p['t_step'] + _p5_p['t_l']
+    _p5_anchor_colors = ['#6baed6', '#2171b5', '#08306b']
+    # curves use internal names; map to display names for legend
+    _p5_zocheck_map = {
+        'From CPU Persist':  'ZOCheck (From Disk)',
+        'CPU Replay':        'ZOCheck (From CPU Memory)',
+    }
+    _p5_zocheck_mechs = [m for m in _p5_zocheck_map
+                         if m in all_data[decomp_model]['curves']]
+
+    _p5_n_bars = 1 + len(anchor_Ks) + len(_p5_zocheck_mechs)
+    _p5_n_mtbfs = len(decomp_mtbfs)
+
+    fig, ax = plt.subplots(figsize=(fig_width, _golden))
+    x = np.arange(_p5_n_mtbfs)
+    width = 0.8 / _p5_n_bars
+
+    def _p5_draw_bars(ax, x, offset, ckpt_v, load_v, replay_v, color, width):
+        bot_l = np.array(ckpt_v)
+        bot_r = bot_l + np.array(load_v)
+        ax.bar(x + offset, ckpt_v,   width, alpha=0.85, color=color)
+        ax.bar(x + offset, load_v,   width, bottom=bot_l, alpha=0.55, color=color, hatch='...')
+        ax.bar(x + offset, replay_v, width, bottom=bot_r, alpha=0.35, color=color, hatch='///')
+
+    bar_idx = 0
+
+    def _p5_to_min(frac, mtbf_h):
+        return frac * mtbf_h * 60 if np.isfinite(frac) else 0
+
+    # --- Log-Only ---
+    ckpt_v, load_v, replay_v = [], [], []
+    for mtbf_h in decomp_mtbfs:
+        M_val = mtbf_h * 3600 / _p5_t
+        c, l, r = _decompose3_at('Log-Only', M_val, _p5_p)
+        ckpt_v.append(_p5_to_min(c, mtbf_h))
+        load_v.append(_p5_to_min(l, mtbf_h))
+        replay_v.append(_p5_to_min(r, mtbf_h))
+    offset = (bar_idx - (_p5_n_bars - 1) / 2) * width
+    _p5_draw_bars(ax, x, offset, ckpt_v, load_v, replay_v, STYLES['Log-Only']['color'], width)
+    bar_idx += 1
+
+    # --- Anchor @ fixed K ---
+    for ki, K_fixed in enumerate(anchor_Ks):
+        ckpt_v, load_v, replay_v = [], [], []
+        for mtbf_h in decomp_mtbfs:
+            M_val = mtbf_h * 3600 / _p5_t
+            log, ckpt_block, load, replay = overhead_anchor_decomposed(K_fixed, M_val, _p5_p)
+            ckpt_v.append(_p5_to_min(log + ckpt_block, mtbf_h))
+            load_v.append(_p5_to_min(load, mtbf_h))
+            replay_v.append(_p5_to_min(replay, mtbf_h))
+        offset = (bar_idx - (_p5_n_bars - 1) / 2) * width
+        _p5_draw_bars(ax, x, offset, ckpt_v, load_v, replay_v,
+                      _p5_anchor_colors[ki % len(_p5_anchor_colors)], width)
+        bar_idx += 1
+
+    # --- ZOCheck variants ---
+    for mech in _p5_zocheck_mechs:
+        ckpt_v, load_v, replay_v = [], [], []
+        for mtbf_h in decomp_mtbfs:
+            M_val = mtbf_h * 3600 / _p5_t
+            c, l, r = _decompose3_at(mech, M_val, _p5_p)
+            ckpt_v.append(_p5_to_min(c, mtbf_h))
+            load_v.append(_p5_to_min(l, mtbf_h))
+            replay_v.append(_p5_to_min(r, mtbf_h))
+        offset = (bar_idx - (_p5_n_bars - 1) / 2) * width
+        _p5_draw_bars(ax, x, offset, ckpt_v, load_v, replay_v, STYLES[mech]['color'], width)
+        bar_idx += 1
+
+    # --- Print bar values ---
+    print()
+    print("=" * 100)
+    print(f"  E2E WASTE BAR VALUES — {decomp_model}  (unit: minutes)")
+    print("=" * 100)
+    print(f"  {'Mechanism':<30} {'MTBF':>6}  {'checkpoint':>10}  {'load':>10}  {'replay':>10}  {'total':>10}")
+    print(f"  {'-'*90}")
+
+    # Log-Only
+    for i, mtbf_h in enumerate(decomp_mtbfs):
+        M_val = mtbf_h * 3600 / _p5_t
+        c, l, r = _decompose3_at('Log-Only', M_val, _p5_p)
+        cm, lm, rm = _p5_to_min(c, mtbf_h), _p5_to_min(l, mtbf_h), _p5_to_min(r, mtbf_h)
+        print(f"  {'Log-Only':<30} {mtbf_h:>5.0f}h  {cm:>10.4f}  {lm:>10.4f}  {rm:>10.4f}  {cm+lm+rm:>10.4f}")
+
+    # Anchor @ fixed K
+    for K_fixed in anchor_Ks:
+        for i, mtbf_h in enumerate(decomp_mtbfs):
+            M_val = mtbf_h * 3600 / _p5_t
+            log, ckpt_block, load, replay = overhead_anchor_decomposed(K_fixed, M_val, _p5_p)
+            cm = _p5_to_min(log + ckpt_block, mtbf_h)
+            lm = _p5_to_min(load, mtbf_h)
+            rm = _p5_to_min(replay, mtbf_h)
+            print(f"  {f'Anchor K={K_fixed}':<30} {mtbf_h:>5.0f}h  {cm:>10.4f}  {lm:>10.4f}  {rm:>10.4f}  {cm+lm+rm:>10.4f}")
+
+    # ZOCheck variants
+    for mech in _p5_zocheck_mechs:
+        display = _p5_zocheck_map[mech]
+        for i, mtbf_h in enumerate(decomp_mtbfs):
+            M_val = mtbf_h * 3600 / _p5_t
+            c, l, r = _decompose3_at(mech, M_val, _p5_p)
+            cm, lm, rm = _p5_to_min(c, mtbf_h), _p5_to_min(l, mtbf_h), _p5_to_min(r, mtbf_h)
+            print(f"  {display:<30} {mtbf_h:>5.0f}h  {cm:>10.4f}  {lm:>10.4f}  {rm:>10.4f}  {cm+lm+rm:>10.4f}")
+
+    print()
+
+    ax.set_xlabel('MTBF (hours)')
+    ax.set_ylabel('E2E Overhead (min)')
+    ax.set_title(f'{decomp_model} — E2E Time with Failure')
+    ax.set_xticks(x)
+    ax.set_xticklabels([f'{h}h' for h in decomp_mtbfs])
+    ax.grid(True, alpha=0.3, axis='y')
+
+    _p5_legend = []
+    _p5_legend.append(Patch(facecolor=STYLES['Log-Only']['color'], alpha=0.85, label='Log-Only'))
+    for ki, K_fixed in enumerate(anchor_Ks):
+        _p5_legend.append(Patch(facecolor=_p5_anchor_colors[ki % len(_p5_anchor_colors)],
+                                alpha=0.85, label=f'Anchor K={K_fixed}'))
+    for mech in _p5_zocheck_mechs:
+        _p5_legend.append(Patch(facecolor=STYLES[mech]['color'], alpha=0.85,
+                                label=_p5_zocheck_map[mech]))
+    _p5_legend.append(Patch(facecolor='gray', alpha=0.85, label='checkpoint'))
+    _p5_legend.append(Patch(facecolor='gray', alpha=0.55, hatch='...', label='load'))
+    _p5_legend.append(Patch(facecolor='gray', alpha=0.35, hatch='///', label='replay'))
+    ax.legend(handles=_p5_legend, ncol=3, loc='upper center',
+              frameon=True, framealpha=0.9, edgecolor='gray',
+              fontsize=_fs - 1)
+
+    plt.tight_layout()
+    _save_and_show(fig, f'e2e_waste_{decomp_model}')
+
+# ====================================================================
+# Recovery Time Query: given a step count M, print CPU recovery time
+# for each model in param_sets.
+#
+# Usage (set before exec):
+#   query_M = 5000   — number of steps (MTBF in steps)
+# ====================================================================
+
+if 'query_M' not in dir():
+    query_M = 0
+
+if query_M > 0:
+    print()
+    print("=" * 80)
+    print(f"RECOVERY TIME QUERY  (M = {query_M} steps)")
+    print("=" * 80)
+    for p in param_sets:
+        pname = p['name']
+        t = p['t_step'] + p['t_l']
+        mtbf_h = query_M * t / 3600
+        info = compute_N_star(query_M, p)
+
+        print(f"\n  {pname}  (MTBF ≈ {mtbf_h:.2f} h)")
+        if info['N_star'] == np.inf:
+            print(f"    CPU Replay: NOT VIABLE")
+            continue
+
+        N = info['N_star']
+        d_soft = _replay_distance(N, query_M, p)
+        d_hard = _replay_distance_hard(N, query_M, p)
+
+        T_recover_soft = p['L_cpu'] + p['t_r'] * d_soft
+        T_recover_hard = p['L_disk'] + p['t_r'] * d_hard
+
+        print(f"    N* = {N:.0f}  regime = {info['reason']}")
+        print(f"    Soft (CPU memory):  d = {d_soft:8.1f} steps,  T_recover = {T_recover_soft:8.2f} s  (L_cpu={p['L_cpu']:.2f} + replay={p['t_r']*d_soft:.2f})")
+        print(f"    Hard (from disk):   d = {d_hard:8.1f} steps,  T_recover = {T_recover_hard:8.2f} s  (L_disk={p['L_disk']:.2f} + replay={p['t_r']*d_hard:.2f})")

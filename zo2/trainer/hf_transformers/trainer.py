@@ -532,7 +532,9 @@ class ZOTrainer(Trainer):
             phases["T_diag"] = pt.get("T_diag", 0.0)
 
         accounted = sum(phases.values())
-        phases["T_hf_inner"] = max(0.0, total_s - accounted)
+        _residual = max(0.0, total_s - accounted)
+        if _residual > 0.01:  # Only show residual if non-trivial
+            phases["T_other"] = _residual
 
         # Annotations
         annotations = {}
@@ -626,6 +628,7 @@ class ZOTrainer(Trainer):
         # Let parent handle log and evaluate, but intercept the save block
         # --- Log ---
         if self.control.should_log and self.state.global_step > self._globalstep_last_logged:
+            _t_log_start = time_module.time()
             from transformers.integrations.tpu import is_torch_xla_available
             if is_torch_xla_available():
                 import torch_xla.core.xla_model as xm
@@ -656,6 +659,7 @@ class ZOTrainer(Trainer):
                     },
                 )
             self.log(logs, start_time)
+            self._t_logging_total = getattr(self, '_t_logging_total', 0.0) + (time_module.time() - _t_log_start)
 
         # --- Evaluate ---
         metrics = None
@@ -704,6 +708,7 @@ class ZOTrainer(Trainer):
                 raise
             finally:
                 t_ckpt_elapsed = time_module.time() - t_ckpt_start
+                self._t_checkpoint_total = getattr(self, '_t_checkpoint_total', 0.0) + t_ckpt_elapsed
                 trace_end(
                     ckpt_trace_token,
                     step=int(self.state.global_step),
@@ -781,7 +786,7 @@ class ZOTrainer(Trainer):
             log_output_dir = getattr(self, '_log_output_dir', None)
             shadow_keeps_log_only = async_anchor is not None and log_based_callback.enable_shadow
             persist_lightweight_redo = bool(
-                shadow_keeps_log_only and getattr(log_based_callback, "instant_recover", False)
+                getattr(log_based_callback, "instant_recover", False)
             )
             if persist_lightweight_redo:
                 run_dir = self._get_output_dir(trial=trial)
@@ -882,6 +887,12 @@ class ZOTrainer(Trainer):
                     optimizer_state['adam_betas'] = model.opt.betas
                     optimizer_state['adam_eps_value'] = model.opt.adam_eps
                 optimizer_state['zo_method'] = zo_method
+                # SparseMeZO: save ratio and thresholds for replay
+                if hasattr(model, 'opt') and getattr(model.opt, '_sparse_enabled', False):
+                    optimizer_state['sparse_ratio'] = model.opt.sparse_ratio
+                    optimizer_state['sparse_thresholds'] = {
+                        name: float(v) for name, v in model.opt._sparse_thresholds.items()
+                    }
                 log_metadata = {
                     key: value
                     for key, value in optimizer_state.items()
@@ -930,6 +941,11 @@ class ZOTrainer(Trainer):
                     log_metadata['zo_method'] = 'mezo-adam'
                     log_metadata['adam_betas'] = model.opt.betas
                     log_metadata['adam_eps_value'] = model.opt.adam_eps
+                if hasattr(model, 'opt') and getattr(model.opt, '_sparse_enabled', False):
+                    log_metadata['sparse_ratio'] = model.opt.sparse_ratio
+                    log_metadata['sparse_thresholds'] = {
+                        name: float(v) for name, v in model.opt._sparse_thresholds.items()
+                    }
             elif persist_lightweight_redo:
                 # Save scheduler and RNG state to shm (not SSD)
                 shm_dir = log_based_callback.shm_dir
@@ -976,6 +992,11 @@ class ZOTrainer(Trainer):
                     log_metadata['adam_betas'] = model.opt.betas
                     log_metadata['adam_eps_value'] = model.opt.adam_eps
                 log_metadata['zo_method'] = zo_method
+                if hasattr(model, 'opt') and getattr(model.opt, '_sparse_enabled', False):
+                    log_metadata['sparse_ratio'] = model.opt.sparse_ratio
+                    log_metadata['sparse_thresholds'] = {
+                        name: float(v) for name, v in model.opt._sparse_thresholds.items()
+                    }
                 t_opt_build = time.time() - t0
                 trace_end(meta_build_token, step=int(self.state.global_step), counters={"duration_ms": t_opt_build * 1000.0})
 
@@ -1082,10 +1103,45 @@ class ZOTrainer(Trainer):
         # Default behavior: save full checkpoint when log-based checkpointing is disabled
         super()._save_checkpoint(model, trial)
         # Fsync full checkpoint directory for L0 baseline
-        from .log_based_utils import _fsync_directory
+        from .log_based_utils import _fsync_directory, _fsync_file
         run_dir = self._get_output_dir(trial=trial)
         ckpt_dir = os.path.join(run_dir, f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
         _fsync_directory(ckpt_dir)
+
+        # Force log save: save zo_update_history alongside full checkpoint in L0 mode
+        if log_based_callback is not None and getattr(log_based_callback, 'force_log_save', False):
+            with log_based_callback.update_lock:
+                updates = list(log_based_callback.update_history)
+            log_state = {
+                'zo_update_history': updates,
+                'base_checkpoint': '__initial__',
+                'current_step': self.state.global_step,
+                'batch_size': -1,
+                'num_updates': len(updates),
+                'is_full_checkpoint': True,
+                'force_log_save': True,
+                'model_dtype': getattr(log_based_callback, 'model_dtype', None),
+                'pending_grad': getattr(log_based_callback, '_pending_grad', 0.0),
+                'pending_seed': getattr(log_based_callback, '_pending_seed', 0),
+            }
+            # Save zo_eps and rng_device for potential replay
+            if hasattr(model, 'opt'):
+                log_state['zo_eps'] = getattr(model.opt, 'zo_eps', 0.0)
+                log_state['rng_device'] = getattr(model.opt, 'rng_device', 'native')
+                zo_method = 'mezo-sgd'
+                if hasattr(model.opt, 'betas'):
+                    zo_method = 'mezo-adam'
+                    log_state['adam_betas'] = model.opt.betas
+                    log_state['adam_eps_value'] = model.opt.adam_eps
+                log_state['zo_method'] = zo_method
+            log_path = os.path.join(ckpt_dir, "zo_log_checkpoint.pt")
+            torch.save(log_state, log_path)
+            _fsync_file(log_path)
+            logger.info(
+                f"[ZOTrainer] FORCE_LOG_SAVE: saved {len(updates)} updates to {log_path}"
+            )
+            # Do NOT clear history: each log contains all updates from __initial__
+            # so any checkpoint can independently replay from scratch.
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         checkpoint_step = int(getattr(self.state, "global_step", 0))
@@ -1421,6 +1477,9 @@ class ZOTrainer(Trainer):
         model.zero_grad()
         grad_norm: Optional[float] = None
         learning_rate = None
+        # Mark the end of pure loading time (before shadow init / on_train_begin).
+        # L_disk / L_cpu should measure only up to this point.
+        self._t_loading_end = time.time()
         self.control = self.callback_handler.on_train_begin(args, self.state, self.control)
         self._ensure_trainer_trace_runtime()
 
@@ -1458,6 +1517,15 @@ class ZOTrainer(Trainer):
             step=int(self.state.global_step),
         ) if trace_enabled() else None
 
+        # --- T_hf_inner sub-phase accumulators (instance vars for cross-method access) ---
+        import time as _time_mod
+        self._t_train_compute_total = 0.0
+        self._t_checkpoint_total = 0.0
+        self._t_logging_total = 0.0
+        self._t_data_skip_total = 0.0
+        self._t_hf_inner_start = _time_mod.perf_counter()
+        self._n_train_steps = 0
+
         for epoch in range(epochs_trained, num_train_epochs):
             epoch_dataloader = train_dataloader
             if hasattr(epoch_dataloader, "set_epoch"):
@@ -1474,6 +1542,24 @@ class ZOTrainer(Trainer):
             )
             self.control = self.callback_handler.on_epoch_begin(args, self.state, self.control)
 
+            # SparseMeZO: recompute magnitude thresholds at epoch boundary.
+            # Skip for the resumed epoch — thresholds were already restored from
+            # checkpoint and must match the original epoch-start values, not the
+            # mid-epoch recovered model state.
+            if hasattr(model, 'opt') and getattr(model.opt, '_sparse_enabled', False):
+                _is_resumed_epoch = (
+                    epoch == epochs_trained
+                    and steps_trained_in_current_epoch > 0
+                    and model.opt._sparse_thresholds
+                )
+                if _is_resumed_epoch:
+                    logger.info(
+                        f"[SparseMeZO] Skipping threshold recomputation for resumed epoch {epoch} "
+                        f"(using restored thresholds from checkpoint)"
+                    )
+                else:
+                    model.opt.recompute_sparse_thresholds()
+
             resume_epoch_rng_restored = False
             if epoch == epochs_trained and effective_resume_checkpoint is not None and rng_state_available:
                 # Restore RNG before building the iterator so samplers/batch samplers
@@ -1488,7 +1574,9 @@ class ZOTrainer(Trainer):
             rng_to_sync = False
             steps_skipped = 0
             if steps_trained_in_current_epoch > 0:
+                _t_skip_start = _time_mod.perf_counter()
                 epoch_dataloader = skip_first_batches(epoch_dataloader, steps_trained_in_current_epoch)
+                self._t_data_skip_total += _time_mod.perf_counter() - _t_skip_start
                 steps_skipped = steps_trained_in_current_epoch
                 steps_trained_in_current_epoch = 0
                 rng_to_sync = not resume_epoch_rng_restored
@@ -1569,10 +1657,12 @@ class ZOTrainer(Trainer):
                         del self._t_full_resume_start
                         if hasattr(self, '_t_program_start'):
                             t_from_program = now - self._t_program_start
-                            t_setup = self._t_program_start  # will be subtracted below
+                            # Use _t_loading_end for L_cpu breakdown (excludes shadow init + training)
+                            t_loading = getattr(self, '_t_loading_end', now) - self._t_program_start
                             if time_log_enabled():
                                 logger.info(
-                                    f"[Full Resume] Total time from program start to first step: {t_from_program:.3f}s"
+                                    f"[Full Resume] Total time from program start to first step: {t_from_program:.3f}s "
+                                    f"(loading only: {t_loading:.3f}s)"
                                 )
                             if trace_enabled():
                                 trace_instant(
@@ -1587,12 +1677,15 @@ class ZOTrainer(Trainer):
                                     extra={"source": "recovery"},
                                 )
                             self._emit_loading_phase_breakdown(
-                                expected_step, t_from_program, source="recovery")
+                                expected_step, t_loading, source="recovery")
                             del self._t_program_start
                     elif hasattr(self, '_t_program_start'):
                         t_from_program = time.time() - self._t_program_start
+                        # Use _t_loading_end for L_disk breakdown (excludes shadow init + training)
+                        t_loading = getattr(self, '_t_loading_end', time.time()) - self._t_program_start
                         if time_log_enabled():
-                            logger.info(f"[No Resume] Total time from program start to first step: {t_from_program:.3f}s")
+                            logger.info(f"[No Resume] Total time from program start to first step: {t_from_program:.3f}s "
+                                        f"(loading only: {t_loading:.3f}s)")
                         if trace_enabled():
                             trace_instant(
                                 panel="gpu_train",
@@ -1603,7 +1696,7 @@ class ZOTrainer(Trainer):
                                 extra={"source": "fresh"},
                             )
                         self._emit_loading_phase_breakdown(
-                            expected_step, t_from_program, source="fresh")
+                            expected_step, t_loading, source="fresh")
                         del self._t_program_start
 
                     train_compute_token = trace_begin(
@@ -1613,6 +1706,7 @@ class ZOTrainer(Trainer):
                         step=int(expected_step),
                     ) if trace_enabled() else None
                     # ZO2 added -> estimate gradient and updates
+                    _t_compute_start = _time_mod.perf_counter()
                     if self.zo:
                         tr_loss_step = self.zo2_training_step(model, inputs)
                     else:
@@ -1625,6 +1719,8 @@ class ZOTrainer(Trainer):
                         )
                         with context():
                             tr_loss_step = self.training_step(model, inputs, num_items_in_batch)
+                    self._t_train_compute_total += _time_mod.perf_counter() - _t_compute_start
+                    self._n_train_steps += 1
                     trace_end(train_compute_token, step=int(expected_step))
 
                     if (
@@ -1772,6 +1868,41 @@ class ZOTrainer(Trainer):
                 break
 
         trace_end(framework_trace_token, step=int(self.state.global_step))
+
+        # --- T_hf_inner sub-phase summary ---
+        _t_hf_inner_total = _time_mod.perf_counter() - self._t_hf_inner_start
+        _t_framework_total = max(0.0, _t_hf_inner_total - self._t_train_compute_total - self._t_checkpoint_total - self._t_logging_total - self._t_data_skip_total)
+        _inner_parts = {
+            "T_train_compute": self._t_train_compute_total,
+            "T_checkpoint": self._t_checkpoint_total,
+            "T_logging": self._t_logging_total,
+            "T_data_skip": self._t_data_skip_total,
+            "T_framework": _t_framework_total,
+        }
+        _inner_strs = []
+        for _name, _val in _inner_parts.items():
+            _pct = _val / _t_hf_inner_total * 100.0 if _t_hf_inner_total > 0 else 0.0
+            _inner_strs.append(f"{_name}={_val:.3f}s ({_pct:.1f}%)")
+        logger.info(
+            f"[T_hf_inner Breakdown] total={_t_hf_inner_total:.3f}s steps={self._n_train_steps} | "
+            + " ".join(_inner_strs)
+        )
+        if self._n_train_steps > 0:
+            logger.info(
+                f"[T_hf_inner Per-step] "
+                f"train_compute={self._t_train_compute_total/self._n_train_steps*1000:.1f}ms "
+                f"checkpoint={self._t_checkpoint_total/self._n_train_steps*1000:.1f}ms "
+                f"framework={_t_framework_total/self._n_train_steps*1000:.1f}ms"
+            )
+        if trace_enabled():
+            trace_instant(
+                panel="gpu_train",
+                lane="counters",
+                event="hf_inner_breakdown",
+                step=int(self.state.global_step),
+                counters={f"{k}_ms": v * 1000.0 for k, v in _inner_parts.items()},
+                extra={"total_ms": _t_hf_inner_total * 1000.0, "n_steps": self._n_train_steps},
+            )
 
         if args.past_index and hasattr(self, "_past"):
             # Clean the state at the end of training

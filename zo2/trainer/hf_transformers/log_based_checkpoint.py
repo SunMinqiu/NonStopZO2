@@ -115,21 +115,6 @@ logger = logging.getLogger(__name__)
 LOG_METADATA_NAME = "log_metadata.pt"
 
 
-def _find_latest_disk_anchor(output_dir):
-    """Scan $OUTPUT_DIR/shadow_anchor-*/ directories, skip .tmp, return (step, path) with max step."""
-    if not output_dir or not os.path.isdir(output_dir):
-        return None
-    candidates = []
-    for name in os.listdir(output_dir):
-        if name.startswith("shadow_anchor-") and not name.endswith(".tmp"):
-            try:
-                step = int(name[len("shadow_anchor-"):])
-                candidates.append((step, os.path.join(output_dir, name)))
-            except ValueError:
-                continue
-    return max(candidates) if candidates else None
-
-
 class LogBasedCheckpointCallback(TrainerCallback):
     """
     Log-based checkpoint callback.
@@ -153,10 +138,15 @@ class LogBasedCheckpointCallback(TrainerCallback):
             instant_recover: Instantly recover from shadow on GPU failure (requires enable_shadow)
         """
         self.batch_size = batch_size
+        # force_log_save: when True, record and save update_history even in batch_size=-1 mode
+        self.force_log_save = False
         # Shadow is allowed for batch_size>=0 (=0: log-based, >=1: full+log).
         # Only batch_size=-1 (disabled mode) forces shadow off.
         self.enable_shadow = enable_shadow if batch_size >= 0 else False
-        self.instant_recover = instant_recover if self.enable_shadow else False
+        # instant_recover works with or without shadow:
+        # - with shadow: recover from shadow state + short replay
+        # - without shadow: recover from initial/base model + full replay
+        self.instant_recover = instant_recover if batch_size >= 0 else False
 
         # Base checkpoint state (CPU)
         self.base_checkpoint_state: OrderedDict = None
@@ -246,10 +236,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self._trace_run_id = None
         self._trace_resource_process = None
 
-        # Disk anchor + update log
-        self.disk_log_file = None
-        self.disk_log_fd = None
-        self.force_fsync = os.environ.get("FORCE_FSYNC", "0") == "1"
+        # Disk anchor: mp.Value set up in _start_shadow_process, read back by
+        # trainer to know the latest step that has been persisted to disk.
         self.disk_anchor_step_val = None
 
     def _trace_resource_counters(self):
@@ -562,18 +550,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
         self.output_dir = args.output_dir
         self.shm_dir = _ensure_zo_shm_dir()
 
-        # Open persistent update log for inline per-step writes
-        if self.output_dir and self.batch_size >= 0 and self.disk_log_file is None:
-            try:
-                os.makedirs(self.output_dir, exist_ok=True)
-                log_path = os.path.join(self.output_dir, "update_log.jsonl")
-                self.disk_log_file = open(log_path, "a", buffering=1)
-                self.disk_log_fd = self.disk_log_file.fileno()
-                logger.info(f"[UpdateLog] Opened {log_path} (force_fsync={self.force_fsync})")
-            except Exception as exc:
-                logger.warning(f"[UpdateLog] Failed to open update_log.jsonl: {exc}")
-                self.disk_log_file = None
-                self.disk_log_fd = None
         self.shadow_replica_path = self._shadow_replica_path() if self.enable_shadow else None
         self.use_shadow_flat_commit = self.enable_shadow and os.environ.get("SHADOW_FLAT_COMMIT", "1") == "1"
         self.shadow_flat_header_path = (
@@ -632,7 +608,21 @@ class LogBasedCheckpointCallback(TrainerCallback):
             )
 
         # batch_size=-1: disabled, use default Trainer checkpoint — skip all setup
+        # Exception: force_log_save=True still registers the hook to record update_history
         if self.batch_size < 0:
+            if self.force_log_save:
+                logger.info("[LogBased] batch_size=-1 with FORCE_LOG_SAVE: registering hook for update_history")
+                if self.trainer and hasattr(self.trainer, 'zo') and self.trainer.zo:
+                    if not self._hook_registered:
+                        self.trainer.register_zo2_training_step_post_hook(self._zo_update_hook)
+                        self._hook_registered = True
+                        logger.info("[LogBased] Registered post-hook (force_log_save)")
+                # Detect model dtype
+                if model is not None and self.model_dtype is None:
+                    for p in model.parameters():
+                        self.model_dtype = str(p.dtype)
+                        break
+                return
             logger.info("[LogBased] batch_size=-1, disabled (using default Trainer checkpoint)")
             logger.info(f"[LogBased Config] LOG_BASED_CKPT={self.batch_size}")
             return
@@ -884,81 +874,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
             logger.info(f"[LogBased] Initial model cached ({mem_mb:.1f} MB) in {t_elapsed:.3f}s")
         self._log_memory_status()
 
-    def _restore_tmpfs_from_disk_anchor(self, resume_path=None):
-        """
-        Copy disk anchor flat files back to tmpfs for recovery.
-        - resume_path given: copy from specified shadow_anchor-<step>/ directory (manual resume)
-        - resume_path None, tmpfs valid: no-op (soft failure)
-        - resume_path None, tmpfs invalid: find latest shadow_anchor-*/ and copy (hard failure)
-        """
-        source_dir = None
-
-        if resume_path:
-            if (
-                os.path.isdir(resume_path)
-                and os.path.basename(resume_path.rstrip("/")).startswith("shadow_anchor-")
-            ):
-                source_dir = resume_path
-            else:
-                logger.warning(f"[DiskAnchor] SHADOW_ANCHOR_RESUME path invalid: {resume_path}")
-                return None
-        else:
-            flat_storage = getattr(self, "shadow_flat_storage", None)
-            header_path = None
-            if flat_storage:
-                header_path = flat_storage.get("header_path")
-            elif self.shadow_flat_header_path:
-                header_path = self.shadow_flat_header_path
-            if header_path and os.path.isfile(header_path):
-                return None  # soft failure, tmpfs still valid
-            anchor = _find_latest_disk_anchor(self.output_dir)
-            if anchor is None:
-                return None
-            _, source_dir = anchor
-
-        if source_dir is None:
-            return None
-
-        shm_dir = self.shm_dir or _ensure_zo_shm_dir()
-        os.makedirs(shm_dir, exist_ok=True)
-
-        copied = 0
-        for name in os.listdir(source_dir):
-            if ".flat." in name:
-                src = os.path.join(source_dir, name)
-                dst = os.path.join(shm_dir, name)
-                try:
-                    shutil.copy2(src, dst)
-                    copied += 1
-                except Exception as exc:
-                    logger.warning(f"[DiskAnchor] failed to copy {src} -> {dst}: {exc}")
-
-        logger.info(f"[DiskAnchor] Restored tmpfs from {source_dir} ({copied} files)")
-        return source_dir
-
-    def _load_update_log_jsonl(self, log_path, min_step_exclusive=0):
-        """Read JSONL update log, return list of updates with step > min_step_exclusive."""
-        if not os.path.isfile(log_path):
-            return []
-        updates = []
-        with open(log_path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    update = json.loads(line)
-                except json.JSONDecodeError:
-                    logger.warning(f"[UpdateLog] skipping corrupted line: {line[:80]}")
-                    continue
-                try:
-                    step = int(update.get("step", -1))
-                except (TypeError, ValueError):
-                    continue
-                if step > int(min_step_exclusive):
-                    updates.append(update)
-        return updates
-
     def _init_for_resume(self, model, state, log_based_resume):
         """Initialize callback state from an already-reconstructed (resumed) model.
         Unlike _cache_initial_model (for fresh training), this:
@@ -968,22 +883,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
         """
         logger.info("[LogBased Resume] Initializing from resumed model...")
         t_start = time.time()
-
-        # Handle SHADOW_ANCHOR_RESUME or auto soft/hard disk-anchor recovery
-        shadow_anchor_resume = os.environ.get("SHADOW_ANCHOR_RESUME", "").strip()
-        if not shadow_anchor_resume:
-            # Also honor args.shadow_anchor_resume if set on trainer args
-            try:
-                shadow_anchor_resume = getattr(self.trainer.args, "shadow_anchor_resume", "") if self.trainer is not None else ""
-            except Exception:
-                shadow_anchor_resume = ""
-        try:
-            if shadow_anchor_resume:
-                self._restore_tmpfs_from_disk_anchor(shadow_anchor_resume)
-            else:
-                self._restore_tmpfs_from_disk_anchor(None)
-        except Exception as exc:
-            logger.warning(f"[DiskAnchor] restore tmpfs failed (non-fatal): {exc}")
 
         # Detect tied weights
         self._tied_weight_groups = _detect_tied_weights(model)
@@ -1074,6 +973,16 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 _log_adam_checksums(f"train_restored step={state.global_step}", model.opt.get_adam_state())
                 if _step_exact_enabled():
                     _log_adam_exact_fingerprint(f"train_restored step={state.global_step}", model.opt.get_adam_state())
+
+        # Restore SparseMeZO thresholds from checkpoint
+        if hasattr(model, 'opt') and getattr(model.opt, '_sparse_enabled', False) and opt_state:
+            saved_thresholds = opt_state.get('sparse_thresholds', None)
+            if saved_thresholds:
+                import torch as _torch
+                model.opt._sparse_thresholds = {
+                    name: _torch.tensor(v) for name, v in saved_thresholds.items()
+                }
+                logger.info(f"[LogBased Resume] Restored sparse thresholds: {len(saved_thresholds)} params")
 
         if self.enable_shadow:
             self._init_shadow_adam_state(model)
@@ -1185,6 +1094,16 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 'adam_eps': self.shadow_adam_state['adam_eps'],
             }
 
+        # SparseMeZO config (picklable dict)
+        sparse_config = None
+        if self.trainer and hasattr(self.trainer, 'model'):
+            _opt = getattr(self.trainer.model, 'opt', None)
+            if _opt is not None and getattr(_opt, '_sparse_enabled', False):
+                sparse_config = {
+                    'ratio': _opt.sparse_ratio,
+                    'thresholds': {name: float(v) for name, v in _opt._sparse_thresholds.items()},
+                }
+
         param_names = self._trainable_param_names or list(self.base_checkpoint_state.keys())
 
         ctx = mp.get_context('spawn')
@@ -1245,6 +1164,7 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 self.shadow_ready_event,
                 self.output_dir,
                 self.disk_anchor_step_val,
+                sparse_config,
             ),
             daemon=True,
         )
@@ -1356,18 +1276,9 @@ class LogBasedCheckpointCallback(TrainerCallback):
                             'lr': float(lr),
                             'wd': float(wd),
                             'zo_eps': float(zo_eps),
+                            'epoch': int(getattr(self.trainer.state, 'epoch', 0)) if self.trainer else 0,
                         }
                         self.update_history.append(update)
-                        # Inline write to persistent update log
-                        if self.disk_log_file is not None:
-                            try:
-                                self.disk_log_file.write(
-                                    json.dumps(update, separators=(",", ":")) + "\n"
-                                )
-                                if self.force_fsync:
-                                    os.fdatasync(self.disk_log_fd)
-                            except Exception as exc:
-                                logger.warning(f"[UpdateLog] write failed: {exc}")
                         if self.update_queue is not None:
                             try:
                                 t_shadow_send_start = time.perf_counter()
@@ -1575,10 +1486,17 @@ class LogBasedCheckpointCallback(TrainerCallback):
         fallback_zo_eps = 0.0
         rng_device = "native"
         zo2_mode = False
+        sparse_ratio = 1.0
+        sparse_thresholds = None
         if self.trainer and hasattr(self.trainer, 'model') and hasattr(self.trainer.model, 'opt'):
             fallback_zo_eps = getattr(self.trainer.model.opt, 'zo_eps', 0.0)
             rng_device = getattr(self.trainer.model.opt, 'rng_device', 'native')
             zo2_mode = hasattr(self.trainer.model.opt, 'rstate_queue')
+            if getattr(self.trainer.model.opt, '_sparse_enabled', False):
+                sparse_ratio = self.trainer.model.opt.sparse_ratio
+                sparse_thresholds = {
+                    name: float(v) for name, v in self.trainer.model.opt._sparse_thresholds.items()
+                }
 
         # Replay all updates using only trainable param names (matching zo_update iteration)
         with trace_span(
@@ -1596,6 +1514,8 @@ class LogBasedCheckpointCallback(TrainerCallback):
                 rng_device=rng_device,
                 zo2_mode=zo2_mode,
                 initial_prev_seed=self._active_base_pending_seed,
+                sparse_ratio=sparse_ratio,
+                sparse_thresholds=sparse_thresholds,
             )
         if num_updates > 0 and time_log_enabled():
             logger.info(f"[Recovery] Replayed {num_updates} updates")
@@ -1676,18 +1596,6 @@ class LogBasedCheckpointCallback(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         """Called at training end"""
         logger.info("[LogBased] Training ended, cleaning up...")
-        # Flush and close update log
-        if self.disk_log_file is not None:
-            try:
-                os.fdatasync(self.disk_log_fd)
-            except Exception:
-                pass
-            try:
-                self.disk_log_file.close()
-            except Exception:
-                pass
-            self.disk_log_file = None
-            self.disk_log_fd = None
         cleanup_token = trace_begin(
             panel="gpu_train",
             lane="blocking",

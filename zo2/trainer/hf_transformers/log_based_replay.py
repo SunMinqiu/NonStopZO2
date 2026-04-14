@@ -47,6 +47,29 @@ def _is_wd_param(name):
             and 'layernorm' not in name and 'ln' not in name)
 
 
+# ---- SparseMeZO helpers (no-ops when sparse_thresholds is None/empty) ----
+
+def _apply_sparse_mask_to_z_dict(z_dict, state, param_names, sparse_thresholds):
+    """Apply magnitude-based sparsity mask to pre-generated z tensors in-place."""
+    if not sparse_thresholds:
+        return
+    for name in param_names:
+        if name in sparse_thresholds:
+            threshold = sparse_thresholds[name]
+            mask = torch.abs(state[name].data) >= threshold
+            z_dict[name] = z_dict[name] * mask
+
+
+def _recompute_sparse_thresholds(state, param_names, sparse_ratio):
+    """Recompute per-param thresholds from current state (at epoch boundaries during replay)."""
+    thresholds = {}
+    for name in param_names:
+        flat = torch.abs(state[name].data).view(-1)
+        k = max(int(sparse_ratio * flat.size(0)), 1)
+        thresholds[name] = torch.kthvalue(flat, k)[0]
+    return thresholds
+
+
 def _generate_z_for_one_step(seed, param_names, state, rng_device, replay_dtype=None):
     """Generate z for all params for a single step."""
     z_dict = {}
@@ -207,7 +230,7 @@ def _load_adam_state_from_base(base_checkpoint_ref, fallback_optimizer_state=Non
 def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                          simulate_perturbation=True, rng_device="native",
                          zo2_mode=False, prev_seed=None,
-                         adam_state=None):
+                         adam_state=None, sparse_thresholds=None):
     """Apply one ZO update to a state dict in-place."""
     seed = update['seed']
     grad = update['grad']
@@ -223,6 +246,22 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
         torch.manual_seed(s)
         return None
 
+    # SparseMeZO: pre-compute step masks from current (pre-perturbation) state
+    # Stored as bool (1 byte/elem) to avoid doubling GPU memory for large models.
+    _step_masks = None
+    if sparse_thresholds:
+        _step_masks = {}
+        for name in param_names:
+            if name in sparse_thresholds:
+                _step_masks[name] = (
+                    torch.abs(state[name].data) >= sparse_thresholds[name]
+                )
+
+    def _maybe_mask_z(name, z):
+        if _step_masks is not None and name in _step_masks:
+            z.mul_(_step_masks[name])
+        return z
+
     t_start = time.time()
     t_z = 0.0
     t_update = 0.0
@@ -234,7 +273,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                 for name in param_names:
                     param = state[name]
                     _t0 = time.time()
-                    z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    z = _maybe_mask_z(name, _generate_z_for_replay(param, rng_device, zo_gen))
                     t_z += time.time() - _t0
                     _t0 = time.time()
                     param.data.add_(z, alpha=float(scaling_factor * zo_eps))
@@ -242,10 +281,10 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
         adam_state['t'] += 1
 
         zo_gen = _reset_rng()
-        def _get_z(_name, param_tensor):
+        def _get_z(name, param_tensor):
             nonlocal t_z
             _t0 = time.time()
-            z = _generate_z_for_replay(param_tensor, rng_device, zo_gen)
+            z = _maybe_mask_z(name, _generate_z_for_replay(param_tensor, rng_device, zo_gen))
             t_z += time.time() - _t0
             return z
 
@@ -280,7 +319,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
         for name in param_names:
             param = state[name]
             _t0 = time.time()
-            z = _generate_z_for_replay(param, rng_device, zo_gen)
+            z = _maybe_mask_z(name, _generate_z_for_replay(param, rng_device, zo_gen))
             t_z += time.time() - _t0
             _t0 = time.time()
             if wd == 0.0:
@@ -299,7 +338,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                 for name in param_names:
                     param = state[name]
                     _t0 = time.time()
-                    z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    z = _maybe_mask_z(name, _generate_z_for_replay(param, rng_device, zo_gen))
                     t_z += time.time() - _t0
                     _t0 = time.time()
                     param.data.add_(z, alpha=float(scaling_factor * zo_eps))
@@ -311,7 +350,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
                 for name in param_names:
                     param = state[name]
                     _t0 = time.time()
-                    z = _generate_z_for_replay(param, rng_device, zo_gen)
+                    z = _maybe_mask_z(name, _generate_z_for_replay(param, rng_device, zo_gen))
                     t_z += time.time() - _t0
                     _t0 = time.time()
                     param.data.add_(z, alpha=float(scaling_factor * zo_eps))
@@ -322,7 +361,7 @@ def _apply_single_update(state, update, param_names, default_zo_eps=0.0,
             for name in param_names:
                 param = state[name]
                 _t0 = time.time()
-                z = _generate_z_for_replay(param, rng_device, zo_gen)
+                z = _maybe_mask_z(name, _generate_z_for_replay(param, rng_device, zo_gen))
                 t_z += time.time() - _t0
                 _t0 = time.time()
                 if wd == 0.0:
@@ -351,6 +390,8 @@ def _replay_updates_on_state(
     zo2_mode: bool = False,
     initial_prev_seed: int = None,
     adam_state: dict = None,
+    sparse_ratio: float = 1.0,
+    sparse_thresholds: dict = None,
 ) -> OrderedDict:
     """Replay ZO updates on a state dict."""
     if adam_state is not None:
@@ -429,14 +470,23 @@ def _replay_updates_on_state(
     _seq_cpu0, _seq_gpu0 = _log_memory("sequential start", _seq_proc, actual_device) if _seq_proc is not None else (None, None)
     _seq_quarter = max(1, len(updates) // 4)
 
+    # SparseMeZO: track epoch for threshold recomputation during replay
+    _prev_epoch = -1
+
     timings = []
     for i, update in enumerate(updates):
+        # SparseMeZO: recompute thresholds at epoch boundaries
+        if sparse_thresholds and update.get('epoch', -1) != _prev_epoch:
+            _prev_epoch = update.get('epoch', -1)
+            if i > 0:  # first step uses thresholds from checkpoint; subsequent epochs recompute
+                sparse_thresholds = _recompute_sparse_thresholds(state, param_names, sparse_ratio)
+
         prev_seed = (initial_prev_seed if i == 0 else updates[i - 1]['seed']) if zo2_mode else None
         timing = _apply_single_update(
             state, update, param_names, default_zo_eps=default_zo_eps,
             simulate_perturbation=simulate_perturbation, rng_device=rng_device,
             zo2_mode=zo2_mode, prev_seed=prev_seed,
-            adam_state=adam_state
+            adam_state=adam_state, sparse_thresholds=sparse_thresholds
         )
         timings.append(timing)
         trace_instant(

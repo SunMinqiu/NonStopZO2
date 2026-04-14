@@ -114,6 +114,7 @@ class OurArguments(TrainingArguments):
     load_bfloat16: bool = False # load model parameters as bfloat16
     load_int8: bool = False # load model parameters as int8
     max_length: int = 2048 # max length the model can take
+    pad_to_max_length: bool = False # pad all sequences to max_length instead of dynamic padding
     no_auto_device: bool = False # do not load model by auto device; should turn this on when using FSDP
 
     # Calibration
@@ -131,6 +132,7 @@ class OurArguments(TrainingArguments):
 
     # MeZO
     zo_eps: float = 1e-3 # eps in MeZO
+    sparse_ratio: float = 1.0 # SparseMeZO: 1.0 = vanilla MeZO, <1.0 = top ratio% params updated
 
     # MeZO-Adam specific
     adam_beta1: float = 0.9  # Adam beta1
@@ -197,6 +199,7 @@ class OurArguments(TrainingArguments):
     log_based_replay_device: str = "cuda"  # device for replay computation: 'cpu' or 'cuda' (must match training device for correct RNG)
     log_based_simulate_perturbation: bool = True  # simulate fp16 perturbation loop during replay (disable for ~4x speedup)
     log_based_replay_fp32: bool = False  # upcast fp16→fp32 during CPU replay to avoid slow torch.normal(fp16) on CPU (~7x speedup)
+    force_log_save: bool = False  # when True, save log checkpoints (zo_update_history) even in L0 baseline mode (log_based_ckpt=-1)
 
     # Async Anchor Checkpoint (requires log_based_ckpt >= 1)
     # Replaces synchronous full checkpoint with two-phase async pipeline:
@@ -204,8 +207,7 @@ class OurArguments(TrainingArguments):
     #   Phase 2: CPU→disk persist in background thread
     async_anchor: bool = False  # enable async anchor checkpoint
     log_output_dir: str = ""  # separate directory for log checkpoints when shadow is disabled
-    shadow_resume: str = ""  # soft failure: tmpfs shadow safetensors path or flat header path
-    shadow_anchor_resume: str = ""  # path to shadow_anchor-<step>/ for manual disk-anchor recovery
+    shadow_resume: str = ""  # soft failure: tmpfs shadow safetensors path or flat header path (also accepts disk path for shadow_anchor-<step>/*.flat.header.json)
 
     # Deterministic reproducibility
     deterministic: bool = False  # enable torch.use_deterministic_algorithms for cross-process reproducibility
@@ -309,6 +311,8 @@ class Framework:
                 offloading_device=self.args.offloading_device,
                 working_device=self.args.working_device,
                 rng_device=self.args.zo_rng_device,
+                sparse_ratio=self.args.sparse_ratio,
+                seed=self.args.seed,
             )
             if self.args.zo_method == "mezo-adam":
                 zo_kwargs["betas"] = (self.args.adam_beta1, self.args.adam_beta2)
@@ -383,11 +387,17 @@ class Framework:
                             load_in_8bit=self.args.load_int8,
                         )
                     _PHASE_TIMES["T_from_pretrained"] = _time.perf_counter() - _t0_from_pretrained
-                    _PHASE_TIMES["weight_source"] = f"from_pretrained:{model_load_path}"
+                    # Resolve actual HF cache path for logging
+                    try:
+                        from huggingface_hub import snapshot_download
+                        _hf_cache_dir = snapshot_download(model_load_path, local_files_only=True)
+                    except Exception:
+                        _hf_cache_dir = model_load_path
+                    _PHASE_TIMES["weight_source"] = f"from_pretrained:{_hf_cache_dir}"
                     if loading_phase_log_enabled():
                         logger.info(
                             f"[Weight Source] from_pretrained "
-                            f"(HF cache: {model_load_path}), "
+                            f"(path: {_hf_cache_dir}), "
                             f"T={_PHASE_TIMES['T_from_pretrained']:.3f}s"
                         )
                 if self.args.log_based_ckpt >= 0 and not self.args.log_based_resume:
@@ -670,9 +680,49 @@ class Framework:
             train_dataset=train_dataset,
             eval_dataset=eval_dataset,
             processing_class=self.tokenizer,
-            data_collator=DataCollatorWithPaddingAndNesting(self.tokenizer, pad_to_multiple_of=8) if self.args.train_as_classification else collator(self.tokenizer, pad_to_multiple_of=8),
+            data_collator=(
+                DataCollatorWithPaddingAndNesting(
+                    self.tokenizer,
+                    padding="max_length" if self.args.pad_to_max_length else True,
+                    max_length=self.args.max_length if self.args.pad_to_max_length else None,
+                    pad_to_multiple_of=8,
+                ) if self.args.train_as_classification else collator(
+                    self.tokenizer,
+                    padding="max_length" if self.args.pad_to_max_length else True,
+                    max_length=self.args.max_length if self.args.pad_to_max_length else None,
+                    pad_to_multiple_of=8,
+                )
+            ),
         )
         _PHASE_TIMES["T_trainer_init"] = _time.perf_counter() - _t0_trainer_init
+        self._setup_and_run_trainer(trainer)
+
+
+    def train_lm(self, train_dataset, eval_dataset):
+        """
+        Training function for language modeling tasks (e.g., WikiText).
+        Skips Sample/Template/encode_prompt — uses pre-tokenized HF datasets directly.
+        """
+        from transformers import DataCollatorForLanguageModeling
+        collator = DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
+
+        _t0_trainer_init = _time.perf_counter()
+        trainer = ZOTrainer(
+            model=self.model,
+            args=self.args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            processing_class=self.tokenizer,
+            data_collator=collator,
+        )
+        _PHASE_TIMES["T_trainer_init"] = _time.perf_counter() - _t0_trainer_init
+        self._setup_and_run_trainer(trainer)
+
+
+    def _setup_and_run_trainer(self, trainer):
+        """
+        Shared post-init: callbacks, checkpoint/shadow config, resume, and trainer.train().
+        """
         _t0_callback_setup = _time.perf_counter()
         if self.args.save_on_interrupt:
             trainer.add_callback(SIGUSR1Callback())
@@ -770,6 +820,21 @@ class Framework:
         else:
             # L0: Baseline (log_based_ckpt=-1)，也可以单独使用 GPU 故障注入
             logger.info("[LogBased] Disabled (L0 baseline), using default Trainer checkpoint")
+            if getattr(self.args, 'force_log_save', False):
+                # Force log save: create callback in L0 mode but with force_log_save flag
+                # so update_history is recorded and saved alongside full checkpoints
+                log_based_callback = LogBasedCheckpointCallback(
+                    batch_size=-1,
+                    enable_shadow=False,
+                    instant_recover=False,
+                )
+                log_based_callback.force_log_save = True
+                trainer.add_callback(log_based_callback)
+                if hasattr(trainer, 'zo') and trainer.zo:
+                    trainer.register_zo2_training_step_post_hook(log_based_callback._zo_update_hook)
+                    log_based_callback.trainer = trainer
+                    log_based_callback._hook_registered = True
+                logger.info("[LogBased] FORCE_LOG_SAVE=1: will save log checkpoints alongside full checkpoints")
             if gpu_fail_steps:
                 logger.info(f"[GPU Failure] Will simulate failure at step(s) {gpu_fail_schedule} (L0 baseline, no recovery)")
 
@@ -853,6 +918,30 @@ class Framework:
                     f"t={recovery.adam_state.get('t', 0)} shadow_used={recovery.shadow_used}"
                 )
 
+            # Restore SparseMeZO thresholds after recovery
+            if recovery.sparse_thresholds and hasattr(self.model, 'opt') and getattr(self.model.opt, '_sparse_enabled', False):
+                self.model.opt._sparse_thresholds = {
+                    name: torch.tensor(v) for name, v in recovery.sparse_thresholds.items()
+                }
+                logger.info(
+                    f"[LogBased Resume] Restored sparse thresholds: "
+                    f"{len(recovery.sparse_thresholds)} params"
+                )
+
+            # Advance _zo_seed_rng to match the recovered step.
+            # During training, _zo_seed_rng.randint() is called once per step.
+            # After recovery the optimizer is re-initialized so _zo_seed_rng is
+            # back at position 0.  We need to advance it by committed_step so
+            # the next zo_forward() generates the correct seed.
+            if hasattr(self.model, 'opt') and hasattr(self.model.opt, '_zo_seed_rng'):
+                _advance = recovery.committed_step
+                for _ in range(_advance):
+                    self.model.opt._zo_seed_rng.randint(self.model.opt.max_zo_random_seed)
+                logger.info(
+                    f"[LogBased Resume] Advanced _zo_seed_rng by {_advance} steps "
+                    f"to match committed_step={recovery.committed_step}"
+                )
+
             # Diagnostic: verify recovered model CKSUM matches original
             _t0_diag = _time.perf_counter()
             _cksum_recovered = sum(p.data.float().sum().item() for p in self.model.parameters())
@@ -918,6 +1007,16 @@ class Framework:
                 f"[InstantRecover] Using log-based continuation only: "
                 f"global_step={log_based_resumed_step or 0}, checkpoint={last_checkpoint}"
             )
+        # Batch shape probe (set PROBE_BATCH_SHAPE=1 to enable)
+        if os.environ.get('PROBE_BATCH_SHAPE', '') == '1':
+            _probe_dl = trainer.get_train_dataloader()
+            for _step, _batch in enumerate(_probe_dl):
+                _shapes = {k: (v.shape if hasattr(v, 'shape') else type(v).__name__) for k, v in _batch.items()}
+                logger.info(f"[BatchProbe] step {_step}: {_shapes}")
+                if _step >= 2:
+                    break
+            del _probe_dl
+
         trainer.train(resume_from_checkpoint=hf_resume_checkpoint)
 
         # Explicitly save the model
@@ -960,6 +1059,15 @@ def main():
     _t0_main_setup = _time.perf_counter()
     set_seed(args.seed, deterministic=args.deterministic)
     task = get_task(args.task_name)
+
+    # LM tasks (WikiText etc.) skip Sample/Template pipeline entirely
+    if getattr(task, 'is_lm_task', False):
+        _PHASE_TIMES["T_main_setup"] = _time.perf_counter() - _t0_main_setup
+        framework = Framework(args, task)
+        task.prepare(framework.tokenizer, block_size=args.max_length)
+        framework.train_lm(task.train_dataset, task.eval_dataset)
+        return
+
     train_sets = task.sample_train_sets(num_train=args.num_train, num_dev=args.num_dev, num_eval=args.num_eval, num_train_sets=args.num_train_sets, seed=args.train_set_seed)
     _PHASE_TIMES["T_main_setup"] = _time.perf_counter() - _t0_main_setup
 

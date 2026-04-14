@@ -153,6 +153,36 @@ def _run_copy(files, disk_dir, repeats):
     return times, total_bytes
 
 
+def _run_memcpy(files, dram_dir, repeats):
+    """Copy files within tmpfs (DRAM → DRAM), return list of elapsed ms."""
+    total_bytes = sum(os.path.getsize(f) for f in files)
+    os.makedirs(dram_dir, exist_ok=True)
+    times = []
+    for i in range(repeats):
+        for f in files:
+            dst = os.path.join(dram_dir, os.path.basename(f))
+            if os.path.exists(dst):
+                os.remove(dst)
+
+        t0 = time.perf_counter()
+        for f in files:
+            dst = os.path.join(dram_dir, os.path.basename(f))
+            shutil.copy2(f, dst)
+            # No fsync needed for tmpfs (already in DRAM)
+        elapsed_ms = (time.perf_counter() - t0) * 1000
+        bw = total_bytes / (elapsed_ms / 1000) / 1024**3 if elapsed_ms > 0 else 0
+        print(f"    run {i+1}: {elapsed_ms:.0f} ms  ({bw:.2f} GB/s)")
+        times.append(elapsed_ms)
+
+    # cleanup
+    for f in files:
+        dst = os.path.join(dram_dir, os.path.basename(f))
+        if os.path.exists(dst):
+            os.remove(dst)
+
+    return times, total_bytes
+
+
 def measure_persist(model_files, adam_files, meta_files, disk_dir, repeats=3, optimizer="both"):
     """Measure persist time for model-only and/or model+adam."""
     os.makedirs(disk_dir, exist_ok=True)
@@ -171,15 +201,33 @@ def measure_persist(model_files, adam_files, meta_files, disk_dir, repeats=3, op
 
     results = {}
 
+    # --- DRAM (tmpfs → tmpfs) ---
+    dram_dir = "/dev/shm/probe_dram_dest"
     if optimizer in ("sgd", "both"):
-        print("  [model only (SGD)]:")
-        t, _ = _run_copy(model_files + meta_files, disk_dir, repeats)
-        results["model"] = t
+        print("  [DRAM model only (SGD)]:")
+        t, _ = _run_memcpy(model_files + meta_files, dram_dir, repeats)
+        results["dram_model"] = t
 
     if optimizer in ("adam", "both") and adam_files:
-        print("  [model+adam (Adam)]:")
+        print("  [DRAM model+adam (Adam)]:")
+        t, _ = _run_memcpy(model_files + adam_files + meta_files, dram_dir, repeats)
+        results["dram_model_adam"] = t
+
+    if os.path.exists(dram_dir):
+        shutil.rmtree(dram_dir)
+
+    print()
+
+    # --- Disk (tmpfs → disk) ---
+    if optimizer in ("sgd", "both"):
+        print("  [Disk model only (SGD)]:")
+        t, _ = _run_copy(model_files + meta_files, disk_dir, repeats)
+        results["disk_model"] = t
+
+    if optimizer in ("adam", "both") and adam_files:
+        print("  [Disk model+adam (Adam)]:")
         t, _ = _run_copy(model_files + adam_files + meta_files, disk_dir, repeats)
-        results["model_adam"] = t
+        results["disk_model_adam"] = t
 
     return results
 
@@ -275,7 +323,7 @@ def main():
 
     try:
         print("=" * 60)
-        print("1. Disk persist time (tmpfs → disk, with fsync)")
+        print("1. Persist time: DRAM (tmpfs→tmpfs) + Disk (tmpfs→disk, fsync)")
         print("=" * 60)
         results = measure_persist(model_files, adam_files, meta_files,
                                   args.disk_dir, repeats=args.repeats,

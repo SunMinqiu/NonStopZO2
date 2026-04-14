@@ -105,11 +105,17 @@ def apply_mezo_adam_update(
         # the v update path, while m matches exactly. Keeping the math as
         # v = beta2 * v + (1 - beta2) * (g * g) but spelling it out with mul/add
         # lets train/shadow/replay share the exact same operator sequence.
-        g_sq = g.mul(g)
-        v.mul_(beta2).add_(g_sq, alpha=1 - beta2)
+        # NOTE: g_sq is reused via g.mul_(g) to save one param-sized fp32 temp
+        # (bitwise identical to `g_sq = g.mul(g)` since self*self == g*g).
+        g.mul_(g)
+        v.mul_(beta2).add_(g, alpha=1 - beta2)
+        del g  # free the temp fp32 buffer before allocating denom/update
 
+        # Keep the original math exactly to preserve bitwise reproducibility
+        # across train/shadow/replay paths (do NOT refactor to reciprocal_).
         denom = (v / bias_correction2).sqrt_().add_(adam_eps)
         update = m.div(denom).mul_(step_size)
+        del denom  # free denom as soon as update is computed
 
         wd = weight_decay
         if wd is None:
@@ -118,6 +124,7 @@ def apply_mezo_adam_update(
             update.add_(param_tensor, alpha=lr * wd)
 
         param_tensor.sub_(update.to(param_tensor.dtype))
+        del update
 
     if z_tensors is not None:
         _log_z_stats(diag_label, z_tensors, _logger=diag_logger)

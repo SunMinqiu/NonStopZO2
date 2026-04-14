@@ -55,6 +55,7 @@ class LogBasedRecoveryBundle:
     base_pending_seed: int | None
     shadow_used: bool
     inplace: bool = False
+    sparse_thresholds: dict | None = None  # per-param float thresholds for SparseMeZO
 
 
 def _tensor_exact_hash(tensor: torch.Tensor) -> str:
@@ -258,6 +259,24 @@ def _load_base_state(base_checkpoint_ref, pretrained_model_name, tied_groups, mo
 def _flat_storage_from_header_path(header_path, template_state_dict, tied_groups, trainable_param_names, has_adam):
     stem = header_path.removesuffix(".header.json")
     meta_paths = _shadow_flat_meta_paths(header_path)
+
+    # Trust the shadow header's has_adam flag over the caller's hint.
+    # The caller derives has_adam from optimizer_state['zo_method'] which may
+    # be missing (defaults to mezo-sgd).  The header is written by the shadow
+    # writer which always knows whether Adam buffers exist.
+    try:
+        import json
+        with open(header_path, "r") as f:
+            _hdr = json.load(f)
+        if _hdr.get("has_adam", False) and not has_adam:
+            import logging
+            logging.getLogger(__name__).info(
+                "[Resume] Shadow header has has_adam=True but caller said False; "
+                "trusting header (likely zo_method missing from metadata)")
+            has_adam = True
+    except Exception:
+        pass  # fall back to caller's has_adam
+
     storage = {
         "enabled": True,
         # Writer persists the authoritative flat layouts into the shadow header.
@@ -465,6 +484,10 @@ def resume_from_log_based_bundle(
 
     zo_method = optimizer_state.get('zo_method', 'mezo-sgd')
     is_adam = (zo_method == 'mezo-adam')
+
+    # SparseMeZO metadata
+    sparse_ratio = optimizer_state.get('sparse_ratio', 1.0)
+    sparse_thresholds = optimizer_state.get('sparse_thresholds', None)
     adam_state = None
     base_adam_state = None
 
@@ -525,6 +548,10 @@ def resume_from_log_based_bundle(
                 trainable_param_names,
                 has_adam=is_adam,
             )
+            # Update is_adam from flat_storage in case the header corrected it
+            if flat_storage.get("has_adam", False) and not is_adam:
+                is_adam = True
+                adam_source = f"shadow:{shadow_path}"
             try:
                 reconstructed, shadow_adam_state, shadow_base_step, shadow_step = _load_shadow_bundle_flat(
                     flat_storage,
@@ -628,6 +655,8 @@ def resume_from_log_based_bundle(
     # In-place replay: for batch_size=0, self.model IS the initial model.
     # Use direct parameter references so replay modifies the model in-place
     # without allocating a second copy on GPU.
+    # IMPORTANT: when model was created via from_config (skeleton), weights are
+    # uninitialised.  We must load the real pretrained base weights first.
     _inplace_used = False
     if (
         reconstructed is None
@@ -635,6 +664,19 @@ def resume_from_log_based_bundle(
         and batch_size == 0
         and base_checkpoint_ref == "__initial__"
     ):
+        # Load the real initial weights into the skeleton model before replay.
+        base_state, tied_groups = _load_base_state(
+            base_checkpoint_ref, pretrained_model_name, tied_groups, model_dtype,
+            output_dir=output_dir,
+        )
+        # Copy base weights into inplace_model parameters (in-place, no extra GPU copy)
+        _param_map = {n: p for n, p in inplace_model.named_parameters()}
+        _param_map.update({n: b for n, b in inplace_model.named_buffers()})
+        for name, tensor in base_state.items():
+            if name in _param_map:
+                _param_map[name].data.copy_(tensor)
+        del base_state
+
         reconstructed = OrderedDict()
         for name, param in inplace_model.named_parameters():
             reconstructed[name] = param.data
@@ -753,6 +795,8 @@ def resume_from_log_based_bundle(
             zo2_mode=zo2_mode,
             initial_prev_seed=base_pending_seed,
             adam_state=adam_state,
+            sparse_ratio=sparse_ratio,
+            sparse_thresholds=sparse_thresholds,
         )
     if device == 'cuda' and torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -812,6 +856,7 @@ def resume_from_log_based_bundle(
         base_pending_seed=base_pending_seed,
         shadow_used=shadow_used,
         inplace=_inplace_used,
+        sparse_thresholds=sparse_thresholds,
     )
 
 

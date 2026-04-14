@@ -14,6 +14,7 @@ class MeZOSGDConfig:
     weight_decay: float = 1e-1
     eps: float = 1e-3
     max_zo_random_seed = 1000000000
+    seed: int = 0  # seed for ZO perturbation seed generation (isolated from global RNG)
 
     # zo2 config
     zo2: bool = True    # use offloading or not
@@ -33,6 +34,9 @@ class MeZOSGDConfig:
     # RNG device for z generation: "native" (param's device, fast), "cpu" (cross-GPU portable, ~30% slower),
     # or "zo_rng" (cross-device bit-exact via zo_rng library — enables CPU replay of GPU training)
     rng_device: str = "native"
+
+    # SparseMeZO: magnitude-based sparsity masking
+    sparse_ratio: float = 1.0  # 1.0 = vanilla MeZO (no masking), <1.0 = top ratio% params updated
 
     # debug
     debug_mode: bool = False    # set 'True' to disable random noise

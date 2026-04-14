@@ -303,7 +303,16 @@ def _hash_named_tensors(named_tensors):
         digest.update(name.encode("utf-8"))
         digest.update(str(cpu.dtype).encode("utf-8"))
         digest.update(str(tuple(cpu.shape)).encode("utf-8"))
-        digest.update(memoryview(cpu.numpy()).tobytes())
+        # numpy doesn't natively support some torch dtypes (bfloat16,
+        # float8_*, complex32, etc.), so we can't blindly call .numpy().
+        # Reinterpret the underlying bytes as uint8 and hash those — the
+        # dtype is already mixed into the digest above so the raw bytes
+        # alone are sufficient for uniqueness.
+        try:
+            np_arr = cpu.numpy()
+        except TypeError:
+            np_arr = cpu.view(torch.uint8).numpy()
+        digest.update(memoryview(np_arr).tobytes())
         count += 1
     return digest.hexdigest(), count
 
@@ -452,7 +461,15 @@ def _init_shadow_bundle_flat_storage(
     flat_writer = _open_shadow_bundle_flat_writer(flat_storage)
     try:
         generation = _reserve_shadow_epoch(flat_writer, reason="init")
-        integrity_mode = _SHADOW_INTEGRITY_FULL_SHA256
+        # Init runs in the same process that just produced the state in
+        # memory (trainer writes → shadow reads a few ms later on the same
+        # host, all through tmpfs RAM). Corruption is not physically
+        # possible in that window, so we skip the expensive full-sha256
+        # pass. For a 1.7B model in Adam mode this cuts shadow boot by
+        # ~17.5 GB of sha256 (state + adam_m + adam_v, 40-90 s depending
+        # on CPU), which was triggering SHADOW_READY_TIMEOUT=60s failures.
+        # Periodic commits already run in header_only mode.
+        integrity_mode = _SHADOW_INTEGRITY_HEADER_ONLY
         _write_shadow_flat_header(
             flat_writer["header_path"],
             _shadow_bundle_header(
@@ -491,7 +508,13 @@ def _init_shadow_bundle_flat_storage(
             )
         _copy_shadow_flat_views_from_state(flat_writer["views"][0], state_dict)
         flat_writer["mmaps"][0].flush()
-        state_sha256, _ = _hash_named_tensors(flat_writer["views"][0].items())
+        # Only compute state_sha256 when full_sha256 integrity is requested.
+        # header_only skips hashing entirely (meta json has no state_sha256
+        # field, which is fine for header_only verification).
+        state_meta_extra = {}
+        if integrity_mode == _SHADOW_INTEGRITY_FULL_SHA256:
+            state_sha256, _ = _hash_named_tensors(flat_writer["views"][0].items())
+            state_meta_extra["state_sha256"] = state_sha256
         _write_shadow_flat_header(
             flat_writer["state_meta_path"],
             {
@@ -502,7 +525,7 @@ def _init_shadow_bundle_flat_storage(
                     snapshot_state="ready",
                     integrity_mode=integrity_mode,
                 ),
-                "state_sha256": state_sha256,
+                **state_meta_extra,
             },
         )
         if flat_writer.get("has_adam", False):
@@ -510,8 +533,12 @@ def _init_shadow_bundle_flat_storage(
             _copy_shadow_flat_views_from_adam(flat_writer["adam_v_views"][0], (adam_state or {}).get("v"))
             flat_writer["adam_m_mmaps"][0].flush()
             flat_writer["adam_v_mmaps"][0].flush()
-            adam_m_sha256, _ = _hash_named_tensors(flat_writer["adam_m_views"][0].items())
-            adam_v_sha256, _ = _hash_named_tensors(flat_writer["adam_v_views"][0].items())
+            adam_meta_extra = {}
+            if integrity_mode == _SHADOW_INTEGRITY_FULL_SHA256:
+                adam_m_sha256, _ = _hash_named_tensors(flat_writer["adam_m_views"][0].items())
+                adam_v_sha256, _ = _hash_named_tensors(flat_writer["adam_v_views"][0].items())
+                adam_meta_extra["adam_m_sha256"] = adam_m_sha256
+                adam_meta_extra["adam_v_sha256"] = adam_v_sha256
             _write_shadow_flat_header(
                 flat_writer["adam_meta_path"],
                 {
@@ -523,8 +550,7 @@ def _init_shadow_bundle_flat_storage(
                         adam_t=int((adam_state or {}).get("t", 0)),
                         integrity_mode=integrity_mode,
                     ),
-                    "adam_m_sha256": adam_m_sha256,
-                    "adam_v_sha256": adam_v_sha256,
+                    **adam_meta_extra,
                 },
             )
         _write_shadow_flat_header(
@@ -1133,6 +1159,7 @@ def _shadow_process_main(
     ready_event=None,
     output_dir=None,
     disk_anchor_step_val=None,
+    sparse_config=None,
 ):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     _logger = logging.getLogger(__name__ + ".shadow_process")
@@ -1276,11 +1303,38 @@ def _shadow_process_main(
                 f"(non-atomic commit; incomplete snapshot is fatal)"
             )
 
+    # Reuse the load buffer directly as working_state instead of a second
+    # clone. The bytes came from either:
+    #   - Flat-commit path: _load_shadow_bundle_flat already produced a fresh
+    #     heap OrderedDict AND called _tie_state_dict_inplace on it → ready.
+    #   - Spawned path: initial_state came across the spawn pickle; we still
+    #     call the tie helper (idempotent) to guarantee tied weights are set.
+    # After aliasing, drop the other names so only `working_state` holds the
+    # dict. Saves one full model-size clone (~7 GB for Qwen3-1.7B fp32).
+    import gc as _gc
+    t0_alias = time.perf_counter()
+    working_state = initial_state
+    if tied_groups:
+        _tie_state_dict_inplace(working_state, tied_groups)
+    alias_working_s = time.perf_counter() - t0_alias
+    if time_log_enabled():
+        _logger.info(
+            f"[Shadow BootTiming] alias_working={alias_working_s * 1000:.2f}ms "
+            f"(reused load buffer, skipped 2nd clone)"
+        )
+    # Drop the other names so Python can gc everything except working_state.
+    initial_state = None
+    try:
+        del loaded_state  # only defined in the flat-storage branch
+    except NameError:
+        pass
+    _gc.collect()
+
     try:
         if use_pipeline:
             _shadow_process_pipelined(
                 update_queue,
-                initial_state,
+                working_state,
                 initial_base_step,
                 initial_committed_step,
                 shadow_step_val,
@@ -1301,11 +1355,12 @@ def _shadow_process_main(
                 flat_storage,
                 output_dir,
                 disk_anchor_step_val,
+                sparse_config=sparse_config,
             )
         else:
             _shadow_process_serial(
                 update_queue,
-                initial_state,
+                working_state,
                 initial_base_step,
                 initial_committed_step,
                 shadow_step_val,
@@ -1325,6 +1380,7 @@ def _shadow_process_main(
                 flat_storage,
                 output_dir,
                 disk_anchor_step_val,
+                sparse_config=sparse_config,
             )
     finally:
         stop_resource_sampler()
@@ -1334,7 +1390,7 @@ def _shadow_process_main(
 
 def _shadow_process_serial(
     update_queue,
-    initial_state,
+    working_state,
     initial_base_step,
     initial_committed_step,
     shadow_step_val,
@@ -1354,14 +1410,11 @@ def _shadow_process_serial(
     flat_storage=None,
     output_dir=None,
     disk_anchor_step_val=None,
+    sparse_config=None,
 ):
     from . import log_based_replay as _bdc
 
-    t0_clone = time.perf_counter()
-    working_state = _clone_working_state(initial_state, tied_groups)
-    clone_working_s = time.perf_counter() - t0_clone
-    if time_log_enabled():
-        _logger.info(f"[Shadow BootTiming] clone_working={clone_working_s:.3f}s mode=serial")
+    # working_state is now cloned in _shadow_process_main before call.
     if boot_started_at is not None and time_log_enabled():
         _logger.info(
             f"[Shadow BootTiming] ready_for_updates={time.perf_counter() - boot_started_at:.3f}s mode=serial"
@@ -1492,6 +1545,8 @@ def _shadow_process_serial(
 
         t_start = time.time()
         z_dict = _bdc._generate_z_for_one_step(step_seed := update["seed"], param_names, working_state, rng_device)
+        if sparse_config:
+            _bdc._apply_sparse_mask_to_z_dict(z_dict, working_state, param_names, sparse_config.get('thresholds'))
         t_zgen = time.time() - t_start
 
         t0_apply = time.time()
@@ -1577,7 +1632,7 @@ def _shadow_process_serial(
 
 def _shadow_process_pipelined(
     update_queue,
-    initial_state,
+    working_state,
     initial_base_step,
     initial_committed_step,
     shadow_step_val,
@@ -1598,15 +1653,12 @@ def _shadow_process_pipelined(
     flat_storage=None,
     output_dir=None,
     disk_anchor_step_val=None,
+    sparse_config=None,
 ):
     from . import log_based_replay as _bdc
 
-    shadow_bytes = sum(initial_state[nm].numel() * initial_state[nm].element_size() for nm in param_names)
-    t0_clone = time.perf_counter()
-    working_state = _clone_working_state(initial_state, tied_groups)
-    clone_working_s = time.perf_counter() - t0_clone
-    if time_log_enabled():
-        _logger.info(f"[Shadow BootTiming] clone_working={clone_working_s:.3f}s mode=pipeline")
+    shadow_bytes = sum(working_state[nm].numel() * working_state[nm].element_size() for nm in param_names)
+    # working_state is now cloned in _shadow_process_main before call.
     if boot_started_at is not None and time_log_enabled():
         _logger.info(
             f"[Shadow BootTiming] ready_for_updates={time.perf_counter() - boot_started_at:.3f}s mode=pipeline"
@@ -1723,10 +1775,19 @@ def _shadow_process_pipelined(
                 break
 
     def _reseed_internal_updates():
-        with internal_lock:
-            internal_updates.clear()
+        # Reset producer assignment counter so restarted producers re-generate
+        # z for any updates whose earlier z was dropped by drain_result_queue.
+        # NOTE: do NOT clear `internal_updates` — those entries were pulled by
+        # main loop from update_queue and are the ONLY record of them. Clearing
+        # them here (as the legacy rebase path did) causes periodic commit to
+        # silently lose every update that arrived during the commit window,
+        # producing a deadlock where producers wait forever for the dropped
+        # step. internal_updates is safe to keep: producer reassignment via
+        # next_step_to_assign[0] = consumer_step will repick them up.
         next_step_to_assign[0] = consumer_step
-        update_available_event.clear()
+        # Wake any producers waiting on update_available_event so they notice
+        # the new generation / assignment.
+        update_available_event.set()
 
     def _pause_and_commit(target_step, reason):
         nonlocal threads, durable_step, desired_commit_step, pending_since_commit
@@ -1752,13 +1813,20 @@ def _shadow_process_pipelined(
             step=int(target_step),
             extra={"reason": reason, "mode": "pipeline"},
         )
-        _stop_producers(threads)
-        generation[0] += 1
-        pending_results.clear()
-        _drain_result_queue()
-        with internal_lock:
-            internal_updates.clear()
-        update_available_event.clear()
+        # PERIODIC COMMIT ONLY (rebase path was removed in Phase 1 cleanup).
+        # We do NOT stop producers, do NOT clear pending_results, do NOT drain
+        # result_queue, do NOT bump generation, do NOT reseed internal_updates.
+        # All of that was legacy rebase-path cleanup that is actively harmful
+        # here: stopping producers loses the update they already popped from
+        # internal_updates (the update dict is in a local var that gets GC'd),
+        # which deadlocks the pipeline on the next cycle (producer waits for
+        # an internal_updates[consumer_step] that will never re-appear).
+        #
+        # Safe to run producers concurrently with commit because:
+        #   - Commit only *reads* working_state (copy_ into mmap views).
+        #   - Producers also only read working_state (shape template for z).
+        #   - Consumer is blocked (it's this thread, inside _pause_and_commit).
+        # So working_state has only readers during the commit window.
         commit_result = _commit_shadow_state(
             working_state,
             replica_path,
@@ -1777,8 +1845,6 @@ def _shadow_process_pipelined(
         shadow_step_val.value = durable_step
         pending_since_commit = 0
         _log_durable_publish(durable_step, working_state, adam_state, _logger)
-        _reseed_internal_updates()
-        threads = _restart_producers()
         trace_end(
             commit_token,
             step=int(durable_step),
@@ -1871,6 +1937,8 @@ def _shadow_process_pipelined(
         pending_results[step_idx] = (z_dict, update)
         while consumer_step in pending_results:
             z_dict, update = pending_results.pop(consumer_step)
+            if sparse_config:
+                _bdc._apply_sparse_mask_to_z_dict(z_dict, working_state, param_names, sparse_config.get('thresholds'))
             t0_apply = time.monotonic()
             apply_token = trace_begin(
                 panel="cpu_shadow",

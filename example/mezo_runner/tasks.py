@@ -47,6 +47,7 @@ class Dataset:
     mixed_set = False
     train_sep = "\n\n"
     generation = False # whether this is a generation task
+    is_lm_task = False # whether this is a language modeling task (e.g., WikiText)
 
     def __init__(self, subtask=None, **kwargs) -> None:
         self.subtask = subtask
@@ -430,3 +431,46 @@ class DROPDataset(Dataset):
         
     def get_template(self, template_version=0):
         return {0: DROPTemplate}[template_version]()
+
+
+class WikiTextDataset(Dataset):
+    """WikiText language modeling task — tokenize, concat, chunk into fixed-length blocks."""
+    is_lm_task = True
+
+    def __init__(self, subtask=None, **kwargs):
+        self.subtask = subtask or "wikitext-2-raw-v1"
+        self.train_dataset = None
+        self.eval_dataset = None
+
+    def prepare(self, tokenizer, block_size=1024):
+        """Load WikiText, tokenize, and group into fixed-length blocks.
+        Must be called after tokenizer is available."""
+        dataset = load_dataset('wikitext', self.subtask)
+
+        def tokenize_function(examples):
+            return tokenizer(examples["text"])
+
+        tokenized = dataset.map(
+            tokenize_function, batched=True, num_proc=4,
+            remove_columns=["text"],
+        )
+
+        def group_texts(examples):
+            concatenated = {k: sum(examples[k], []) for k in examples.keys()}
+            total_length = len(concatenated[list(examples.keys())[0]])
+            total_length = (total_length // block_size) * block_size
+            result = {
+                k: [t[i : i + block_size] for i in range(0, total_length, block_size)]
+                for k, t in concatenated.items()
+            }
+            result["labels"] = result["input_ids"].copy()
+            return result
+
+        lm_datasets = tokenized.map(
+            group_texts, batched=True, batch_size=1000, num_proc=4,
+        )
+
+        self.train_dataset = lm_datasets["train"]
+        self.eval_dataset = lm_datasets["validation"]
+        logger.info(f"WikiText prepared: {len(self.train_dataset)} train blocks, "
+                     f"{len(self.eval_dataset)} eval blocks (block_size={block_size})")

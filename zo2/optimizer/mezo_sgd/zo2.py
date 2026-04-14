@@ -181,7 +181,7 @@ class MeZO2SGD(MeZOSGD):
             seed (int, optional): Seed for random number generation to ensure reproducibility.
         """
         self._update_lr()
-        self.zo_random_seed = seed if seed else np.random.randint(self.max_zo_random_seed)
+        self.zo_random_seed = seed if seed else self._zo_seed_rng.randint(self.max_zo_random_seed)
         # Save the grad that will actually be applied in this step's zo_update.
         # In ZO2's pipelined design, zo_update runs BEFORE compute_grad, so it uses
         # the projected_grad from the PREVIOUS step. We capture it here for correct

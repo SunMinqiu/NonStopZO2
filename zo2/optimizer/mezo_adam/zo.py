@@ -50,7 +50,11 @@ class MeZOAdam(MeZOSGD):
         """
         apply_mezo_adam_update(
             ((name, param) for name, param in module.named_parameters() if param.requires_grad),
-            get_z=lambda _name, param_tensor: self._generate_z(param_tensor),
+            get_z=lambda name, param_tensor: (
+                self._mask_z(name, self._generate_z(param_tensor))
+                if self._sparse_enabled
+                else self._generate_z(param_tensor)
+            ),
             grad=self.projected_grad,
             lr=self.lr,
             weight_decay=weight_decay,

@@ -47,6 +47,8 @@ FAILURE_TYPE=${FAILURE_TYPE:-soft}
 # Shadow Pipeline: CPU 端 pipelined z 预生成 + ring buffer, 需要 ENABLE_SHADOW=1
 # P 个 producer 线程并行生成 z (释放GIL)，1 个 consumer 串行更新 shadow
 SHADOW_PIPELINE=${SHADOW_PIPELINE:-0}
+# Force log save: save log checkpoints (zo_update_history) even in L0 baseline mode (LOG_BASED_CKPT=-1)
+FORCE_LOG_SAVE=${FORCE_LOG_SAVE:-0}
 SHADOW_PIPELINE_WORKERS=${SHADOW_PIPELINE_WORKERS:-2}
 # Async Anchor: 异步写入 full checkpoint (仅 LOG_BASED_CKPT>=1 时有效)
 # GPU→CPU 异步拷贝 + 后台线程写盘
@@ -108,14 +110,62 @@ if [ "$LOG_BASED_CKPT" != "-1" ]; then
     fi
 fi
 
+# Force log save: 在 L0 baseline 下也保存 log checkpoint
+if [ "$FORCE_LOG_SAVE" == "1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --force_log_save"
+fi
+
 # GPU 故障注入 (旁路，可单独使用或叠加在任意层级)
 if [ "$GPU_FAIL_STEP" != "-1" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --gpu_fail_step $GPU_FAIL_STEP"
 fi
 
-# Shadow anchor resume (highest priority for log-based mode)
+# Shadow anchor resume: translate a shadow_anchor-<step>/ directory into
+# existing --shadow_resume + --log_based_resume arguments so the Python side
+# can reuse the well-trodden `resume_from_log_based_bundle(shadow_path=..., checkpoint_path=...)`
+# path (resume_from_log_based already supports disk-based flat headers).
 if [ -n "$SHADOW_ANCHOR_RESUME" ]; then
-    EXTRA_ARGS="$EXTRA_ARGS --shadow_anchor_resume $SHADOW_ANCHOR_RESUME"
+    if [ ! -d "$SHADOW_ANCHOR_RESUME" ]; then
+        echo "ERROR: SHADOW_ANCHOR_RESUME path is not a directory: $SHADOW_ANCHOR_RESUME" >&2
+        exit 2
+    fi
+    # Glob out the flat header (written by the disk anchor thread)
+    SHADOW_HEADER=$(ls "$SHADOW_ANCHOR_RESUME"/zo_shadow_latest_*.flat.header.json 2>/dev/null | head -1)
+    if [ -z "$SHADOW_HEADER" ]; then
+        echo "ERROR: no flat header found under $SHADOW_ANCHOR_RESUME" >&2
+        echo "       expected: zo_shadow_latest_<hash>.flat.header.json" >&2
+        exit 2
+    fi
+    EXTRA_ARGS="$EXTRA_ARGS --shadow_resume $SHADOW_HEADER"
+
+    # Pair with a checkpoint-<step>/ that has HF metadata (trainer_state / scheduler /
+    # rng / optimizer.pt with zo_update_history). Prefer exact step match; fall back
+    # to the largest step <= anchor step, so replay can catch up deterministically.
+    ANCHOR_STEP=$(basename "${SHADOW_ANCHOR_RESUME%/}" | sed 's/^shadow_anchor-//')
+    PAIRED_CKPT=""
+    if [ -d "$OUTPUT_DIR/checkpoint-$ANCHOR_STEP" ]; then
+        PAIRED_CKPT="$OUTPUT_DIR/checkpoint-$ANCHOR_STEP"
+    else
+        # Find largest checkpoint-<step> with step <= ANCHOR_STEP
+        PAIRED_CKPT=$(ls -d "$OUTPUT_DIR"/checkpoint-* 2>/dev/null \
+            | awk -F'-' -v target="$ANCHOR_STEP" '$NF + 0 <= target + 0 {print}' \
+            | sort -t'-' -k2 -n | tail -1)
+    fi
+    if [ -z "$PAIRED_CKPT" ]; then
+        echo "ERROR: no matching checkpoint-<=$ANCHOR_STEP under $OUTPUT_DIR" >&2
+        echo "       SHADOW_ANCHOR_RESUME requires a paired checkpoint dir for HF metadata" >&2
+        echo "       (trainer_state.json / scheduler.pt / optimizer.pt with zo_update_history)" >&2
+        echo "       hint: set SAVE_STEPS to a divisor of SHADOW_COMMIT_INTERVAL so they align" >&2
+        exit 2
+    fi
+    echo "SHADOW_ANCHOR_RESUME: anchor=$SHADOW_ANCHOR_RESUME (step=$ANCHOR_STEP)"
+    echo "                     paired checkpoint=$PAIRED_CKPT"
+    echo "                     flat header=$SHADOW_HEADER"
+    # Hand off to the existing LOG_BASED_RESUME handling below — it will add
+    # --log_based_resume and skip --overwrite_output_dir. We've already added
+    # --shadow_resume above so the resume_from_log_based_bundle picks up the
+    # shadow flat header path.
+    LOG_BASED_RESUME="$PAIRED_CKPT"
 fi
 
 # Log-Based Resume (优先于 RESUME_CKPT)
@@ -140,6 +190,12 @@ if [ "$DETERMINISTIC" == "1" ]; then
 fi
 if [ "$ZO_RNG_DEVICE" != "native" ]; then
     EXTRA_ARGS="$EXTRA_ARGS --zo_rng_device $ZO_RNG_DEVICE"
+fi
+
+# Pad to max_length
+PAD_TO_MAX_LENGTH=${PAD_TO_MAX_LENGTH:-0}
+if [ "$PAD_TO_MAX_LENGTH" == "1" ]; then
+    EXTRA_ARGS="$EXTRA_ARGS --pad_to_max_length"
 fi
 
 # 跳过训练后的评估阶段
@@ -189,6 +245,13 @@ fi
 
 TASK_ARGS=""
 case $TASK in
+    # LM tasks: skip classification/option pipeline entirely
+    WikiText|WikiText2)
+        TASK_ARGS="--train_as_classification False --only_train_option False"
+        TRAIN=0
+        DEV=""
+        EVAL=0
+        ;;
     # For Copa, ReCoRD, SQuAD, DROP, we set --train_as_classification False; for others, set this flag to True
     CB) # It has <1000 training examples. Only use 100 for dev
         DEV=100

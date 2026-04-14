@@ -526,6 +526,74 @@ def summarize_trace(trace_or_records, spans=None, instants=None):
     train_step_count = len(span_by_event.get("train_step", []))
     derived_t_step_total_ms = max(0.0, total_wall_ms - checkpoint_total_ms - shadow_block_total_ms)
 
+    # Build T_hf_inner sub-phase breakdown from existing span data.
+    # Prefer the explicit hf_inner_breakdown instant if present (new runs),
+    # otherwise derive from span_by_event (works on old traces without retraining).
+    _hf_inner_breakdown = None
+    for record in reversed(records):
+        if record.get("phase") == "I" and record.get("event") == "hf_inner_breakdown":
+            counters = record.get("counters") or {}
+            _hf_inner_breakdown = {k: float(v) for k, v in counters.items()}
+            _hf_inner_breakdown["_extra"] = record.get("extra") or {}
+            break
+    if _hf_inner_breakdown is None and train_step_count > 0:
+        _train_compute_ms = float(sum(span_by_event.get("train_compute", [])))
+        _hf_inner_ms = 0.0
+        for _bd in (_loading_breakdown_fresh, _loading_breakdown_recovery):
+            if _bd and _bd.get("T_hf_inner_ms"):
+                _hf_inner_ms = _bd["T_hf_inner_ms"]
+                break
+        if _hf_inner_ms <= 0.0:
+            _hf_inner_ms = _train_compute_ms + checkpoint_total_ms + framework_overhead_total_ms
+        _framework_ms = max(0.0, _hf_inner_ms - _train_compute_ms - checkpoint_total_ms)
+        _hf_inner_breakdown = {
+            "T_train_compute_ms": _train_compute_ms,
+            "T_checkpoint_ms": checkpoint_total_ms,
+            "T_framework_ms": _framework_ms,
+            "_extra": {"total_ms": _hf_inner_ms, "n_steps": train_step_count},
+        }
+
+    # Warmup: step 1 is dominated by one-time costs (CUDA kernel compile, shadow
+    # process spawn, first forward pass cuBLAS/cuDNN algorithm selection, etc.).
+    # For steady-state per-step averages we skip the first train_step span and
+    # report its cost separately as t_step_warmup.
+    _train_step_spans_sorted = sorted(
+        [
+            span for span in spans
+            if span["event"] == "train_step"
+        ],
+        key=lambda s: s["start_ns"],
+    )
+    if _train_step_spans_sorted:
+        _first_train_step = _train_step_spans_sorted[0]
+        _first_train_step_ms = (
+            (_first_train_step["end_ns"] - _first_train_step["start_ns"]) / 1_000_000.0
+        )
+    else:
+        _first_train_step = None
+        _first_train_step_ms = 0.0
+    # Steady-state t_step: drop the warmup step from both total_ms and count so
+    # the average reflects steps 2..N only.
+    if train_step_count > 1 and _first_train_step is not None:
+        steady_t_step_total_ms = max(0.0, derived_t_step_total_ms - _first_train_step_ms)
+        steady_t_step_count = train_step_count - 1
+    else:
+        # Fall back to including all steps if only one step was run.
+        steady_t_step_total_ms = derived_t_step_total_ms
+        steady_t_step_count = train_step_count
+
+    # Collect per-step durations (excluding warmup) for median/percentile stats.
+    _all_train_step_durations = span_by_event.get("train_step", [])
+    if len(_all_train_step_durations) > 1 and _first_train_step is not None:
+        # Sort spans by start_ns to identify the first span, then exclude it.
+        _first_dur = _first_train_step_ms
+        _steady_step_samples = [
+            float((s["end_ns"] - s["start_ns"]) / 1_000_000.0)
+            for s in _train_step_spans_sorted[1:]
+        ]
+    else:
+        _steady_step_samples = [float(d) for d in _all_train_step_durations]
+
     checkpoint_d2h_samples = _collect_event_samples(
         span_by_event,
         [
@@ -546,11 +614,18 @@ def summarize_trace(trace_or_records, spans=None, instants=None):
     named_time_metrics = {
         "checkpoint_total": {**(_stat_block(span_by_event.get("checkpoint_save", [])) or {}), "status": "exact"} if span_by_event.get("checkpoint_save") else None,
         "t_step": {
-            "count": train_step_count,
-            "total_ms": derived_t_step_total_ms,
-            "avg_ms": (derived_t_step_total_ms / train_step_count) if train_step_count > 0 else 0.0,
-            "status": "derived",
-        } if train_step_count > 0 else None,
+            "count": steady_t_step_count,
+            "total_ms": steady_t_step_total_ms,
+            "avg_ms": (steady_t_step_total_ms / steady_t_step_count) if steady_t_step_count > 0 else 0.0,
+            "p50_ms": float(_percentile(_steady_step_samples, 0.50)) if _steady_step_samples else 0.0,
+            "status": "derived (step 1 warmup excluded)",
+        } if steady_t_step_count > 0 else None,
+        "t_step_warmup": {
+            "count": 1,
+            "total_ms": _first_train_step_ms,
+            "avg_ms": _first_train_step_ms,
+            "status": "derived (step 1 only; CUDA compile + shadow spawn + first forward)",
+        } if _first_train_step is not None else None,
         "t_l": {**(_stat_block(span_by_event.get("log_send_cpu", [])) or {}), "status": "exact"} if span_by_event.get("log_send_cpu") else None,
         "t_d2h": {
             **(_stat_block(checkpoint_d2h_samples) or {}),
@@ -563,6 +638,8 @@ def summarize_trace(trace_or_records, spans=None, instants=None):
         "t_cp": None,  # derived below: commit_avg / commit_interval
         "t_r": {**replay_cuda_stats, "status": "derived"} if replay_cuda_stats is not None else None,
         "t_rc": {**(_stat_block(span_by_event.get("shadow_apply", [])) or {}), "status": "exact"} if span_by_event.get("shadow_apply") else None,
+        "t_rc_generate": None,  # filled below from shadow_apply counters
+        "t_rc_consume": None,   # filled below from shadow_apply counters
         "L_disk": {
             "count": len(first_step_latency_fresh),
             "total_ms": float(sum(first_step_latency_fresh)),
@@ -592,7 +669,82 @@ def summarize_trace(trace_or_records, spans=None, instants=None):
         } if replay_cold_ms > 0.0 else None,
         "L_disk_breakdown": _loading_breakdown_fresh,
         "L_cpu_breakdown": _loading_breakdown_recovery,
+        "T_hf_inner_breakdown": _hf_inner_breakdown,
     }
+
+    # Derive L_disk_real / L_cpu_real: only essential loading phases
+    _REAL_PHASES = ("T_import", "T_from_pretrained", "T_config", "T_zo_init", "T_trainer_init")
+    for _src, _bd_key, _real_key, _real_bd_key in [
+        ("fresh", "L_disk_breakdown", "L_disk_real", "L_disk_real_breakdown"),
+        ("recovery", "L_cpu_breakdown", "L_cpu_real", "L_cpu_real_breakdown"),
+    ]:
+        _bd = named_time_metrics.get(_bd_key)
+        if _bd:
+            _real_phases = {}
+            _real_total_ms = 0.0
+            for p in _REAL_PHASES:
+                v = _bd.get(f"{p}_ms", 0.0)
+                if v:
+                    _real_phases[f"{p}_ms"] = v
+                    _real_total_ms += v
+            # For recovery, also include T_resume_total
+            if _src == "recovery":
+                v = _bd.get("T_resume_total_ms", 0.0)
+                if v:
+                    _real_phases["T_resume_total_ms"] = v
+                    _real_total_ms += v
+            _real_phases["total_ms"] = _real_total_ms
+            _real_phases["_extra"] = _bd.get("_extra", {})
+            named_time_metrics[_real_key] = {
+                "count": 1,
+                "total_ms": _real_total_ms,
+                "avg_ms": _real_total_ms,
+                "status": "derived",
+            }
+            named_time_metrics[_real_bd_key] = _real_phases
+
+    # Derive t_rc_generate and t_rc_consume from shadow_apply counters.
+    # Only report the breakdown if generate and apply are sequential (not pipelined).
+    # Detection: check if shadow_generate spans overlap with shadow_apply spans.
+    _shadow_gen_spans = sorted(
+        [s for s in spans if s["event"] == "shadow_generate"],
+        key=lambda s: s["start_ns"],
+    )
+    _shadow_apply_spans_raw = sorted(
+        [s for s in spans if s["event"] == "shadow_apply"],
+        key=lambda s: s["start_ns"],
+    )
+    # Check overlap: skip the first pair (warmup), count how many generate spans
+    # overlap with their corresponding apply span (same step).
+    _gen_by_step = {s.get("step"): s for s in _shadow_gen_spans}
+    _overlap_count = 0
+    _check_count = 0
+    for apply_s in _shadow_apply_spans_raw[1:]:  # skip first (warmup)
+        gen_s = _gen_by_step.get(apply_s.get("step"))
+        if gen_s is None:
+            continue
+        _check_count += 1
+        # Overlap if generate has not finished before apply starts
+        if gen_s["end_ns"] > apply_s["start_ns"]:
+            _overlap_count += 1
+    _is_pipelined = (_check_count > 0 and _overlap_count < _check_count * 0.5)
+
+    _zgen_samples = []
+    _consume_samples = []
+    for s in _shadow_apply_spans_raw:
+        c = s.get("counters") or {}
+        zgen = c.get("zgen_ms")
+        apply_total = c.get("apply_ms")
+        if zgen is not None:
+            _zgen_samples.append(float(zgen))
+            if apply_total is not None:
+                _consume_samples.append(max(0.0, float(apply_total) - float(zgen)))
+
+    if not _is_pipelined and _zgen_samples:
+        # Sequential: generate + consume = total, report breakdown
+        named_time_metrics["t_rc_generate"] = {**_stat_block(_zgen_samples), "status": "exact (zgen_ms, sequential with consume)"}
+        if _consume_samples:
+            named_time_metrics["t_rc_consume"] = {**_stat_block(_consume_samples), "status": "derived (apply_ms - zgen_ms)"}
 
     # Derive t_cp = amortised shadow commit cost per training step
     shadow_commit_spans = span_by_event.get("shadow_commit", [])
@@ -645,7 +797,10 @@ def print_summary(summary, *, top_n=20):
     print()
 
     print("=== Named Time Metrics ===")
-    for name in ("checkpoint_total", "t_step", "t_l", "t_d2h", "t_persist", "t_r", "t_rc", "t_cp", "L_disk", "L_cpu"):
+    for name in ("checkpoint_total", "t_step", "t_step_warmup", "t_l", "t_d2h", "t_persist", "t_r", "t_rc", "t_rc_generate", "t_rc_consume", "t_cp", "L_disk", "L_cpu", "L_disk_real", "L_cpu_real"):
+        # t_rc_generate / t_rc_consume only present when sequential; skip silently if missing
+        if name in ("t_rc_generate", "t_rc_consume", "L_disk_real", "L_cpu_real") and not summary["named_time_metrics"].get(name):
+            continue
         stats = summary["named_time_metrics"].get(name)
         if not stats:
             print(f"{name}: missing")
@@ -660,6 +815,8 @@ def print_summary(summary, *, top_n=20):
                 f"{name}: total_s={stats['total_ms'] / 1000.0:.3f} "
                 f"avg_s={stats['avg_ms'] / 1000.0:.3f}"
             )
+            if "p50_ms" in stats:
+                line += f" p50_s={stats['p50_ms'] / 1000.0:.3f}"
         if "steady_avg_ms" in stats:
             line += f" steady_avg_s={stats['steady_avg_ms'] / 1000.0:.3f}"
         if "cold_start_ms" in stats:
@@ -667,7 +824,7 @@ def print_summary(summary, *, top_n=20):
         line += f" count={stats['count']}"
         print(line)
         # Print phase breakdown under L_disk / L_cpu
-        breakdown_key = f"{name}_breakdown" if name in ("L_disk", "L_cpu") else None
+        breakdown_key = f"{name}_breakdown" if name in ("L_disk", "L_cpu", "L_disk_real", "L_cpu_real") else None
         breakdown = summary["named_time_metrics"].get(breakdown_key) if breakdown_key else None
         if breakdown:
             total_ms = breakdown.get("total_ms", 0.0)
@@ -675,7 +832,7 @@ def print_summary(summary, *, top_n=20):
                 "T_import", "T_main_setup", "T_config", "T_from_pretrained",
                 "T_zo_init", "T_tokenizer", "T_tokenize_data", "T_trainer_init",
                 "T_callback_setup", "T_resume_total", "T_cpu_to_gpu",
-                "T_diag", "T_hf_inner",
+                "T_diag", "T_other", "T_hf_inner",
             ]
             _extra = breakdown.get("_extra") or {}
             _weight_source = _extra.get("weight_source", "")
@@ -694,6 +851,22 @@ def print_summary(summary, *, top_n=20):
                 elif phase == "T_cpu_to_gpu" and _inplace:
                     ann = " [inplace]"
                 print(f"  {phase:22s} = {phase_ms / 1000.0:7.3f}s ({pct:5.1f}%){ann}")
+
+    # T_hf_inner sub-phase breakdown
+    _hf_inner_bd = summary["named_time_metrics"].get("T_hf_inner_breakdown")
+    if _hf_inner_bd:
+        _hf_extra = _hf_inner_bd.get("_extra") or {}
+        _hf_total_ms = float(_hf_extra.get("total_ms", 0.0))
+        _hf_n_steps = int(_hf_extra.get("n_steps", 0))
+        print()
+        print(f"=== T_hf_inner Breakdown (total={_hf_total_ms / 1000.0:.3f}s, steps={_hf_n_steps}) ===")
+        for _phase in ("T_train_compute", "T_checkpoint", "T_logging", "T_data_skip", "T_framework"):
+            _phase_ms = _hf_inner_bd.get(f"{_phase}_ms")
+            if _phase_ms is None:
+                continue
+            _pct = _phase_ms / _hf_total_ms * 100.0 if _hf_total_ms > 0 else 0.0
+            _per_step = f" ({_phase_ms / _hf_n_steps:.1f}ms/step)" if _hf_n_steps > 0 else ""
+            print(f"  {_phase:22s} = {_phase_ms / 1000.0:7.3f}s ({_pct:5.1f}%){_per_step}")
     print()
 
     print("=== Resource Stats ===")
@@ -1305,6 +1478,69 @@ def plot_loss(trace_or_records, *, figsize=(18, 4)):
     ax.set_ylabel("Loss")
     ax.grid(axis="x", linestyle="--", alpha=0.35)
     fig.tight_layout()
+    return fig, ax
+
+
+def plot_loss_multi(traces, *, labels=None, width=10, figsize=None, save=None, xlim=None):
+    """Plot loss curves from multiple trace files on the same figure.
+
+    Parameters
+    ----------
+    traces : list
+        List of trace dicts, record lists, or file paths (str/Path).
+    labels : list[str], optional
+        Legend label for each trace. Defaults to "trace 0", "trace 1", ...
+    width : float
+        Figure width in inches. Height is derived from golden ratio (w / 1.618).
+    figsize : tuple, optional
+        Explicit (width, height) override; ignores *width* if given.
+    save : str or Path, optional
+        If given, save the figure to this path (e.g. "loss.pdf").
+    xlim : tuple, optional
+        (xmin, xmax) to set the x-axis range for zoom-in. e.g. xlim=(100, 300).
+    """
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required to plot loss figures") from exc
+
+    _GOLDEN = 1.618
+    if figsize is None:
+        figsize = (width, width / _GOLDEN)
+
+    if labels is None:
+        labels = [f"trace {i}" for i in range(len(traces))]
+
+    _fs = plt.rcParams['font.size'] + 5
+    _fw = 'bold'
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+
+    for i, trace in enumerate(traces):
+        if isinstance(trace, (str, Path)):
+            trace = load_trace(str(trace))
+        if isinstance(trace, dict):
+            records = trace["records"]
+        else:
+            records = trace
+        loss_xs, loss_ys = _extract_step_series(records, "train_scalar", "loss", panel="gpu_train")
+        if loss_xs:
+            color = colors[i % len(colors)]
+            ax.plot(loss_xs, loss_ys, color=color, label=labels[i])
+
+    ax.set_xlabel("Global Step", fontsize=_fs+3, fontweight=_fw)
+    ax.set_ylabel("Loss", fontsize=_fs+3, fontweight=_fw)
+    ax.legend(loc="upper left", prop={'size': _fs-1, 'weight': _fw})
+    ax.tick_params(axis='both', labelsize=_fs+2)
+    for lbl in ax.get_xticklabels() + ax.get_yticklabels():
+        lbl.set_fontweight(_fw)
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    ax.grid(axis="x", linestyle="--", alpha=0.35)
+    fig.tight_layout()
+    if save is not None:
+        fig.savefig(str(save), bbox_inches='tight')
     return fig, ax
 
 

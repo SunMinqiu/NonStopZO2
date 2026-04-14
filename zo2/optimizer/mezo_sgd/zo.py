@@ -56,9 +56,17 @@ class MeZOSGD(BaseOptimizer):
         self.weight_decay = config.weight_decay
         self.zo_eps = config.eps
         self.max_zo_random_seed = config.max_zo_random_seed
+        # Isolated RNG for zo_random_seed generation — immune to global
+        # numpy state pollution from dataloader / checkpoint / callbacks.
+        self._zo_seed_rng = np.random.RandomState(config.seed)
         self.debug_mode = config.debug_mode
         self.rng_device = getattr(config, 'rng_device', 'native')  # "native" or "cpu"
         self.use_fma = os.environ.get('ZO_FMA', '1') == '1'
+        # SparseMeZO: magnitude-based sparsity masking
+        self.sparse_ratio = config.sparse_ratio
+        self._sparse_enabled = config.sparse_ratio < 1.0
+        self._sparse_thresholds = {}  # per-param kth-value threshold, recomputed per epoch
+        self._sparse_masks = {}       # per-param binary mask, recomputed per step
         defaults = dict(
             lr=self.lr,
             weight_decay=self.weight_decay,
@@ -92,6 +100,40 @@ class MeZOSGD(BaseOptimizer):
         else:
             return torch.normal(mean=0, std=1, size=param.data.size(), device=param.data.device, dtype=param.data.dtype)
 
+    # ---- SparseMeZO mask helpers (all no-ops when _sparse_enabled is False) ----
+
+    def recompute_sparse_thresholds(self):
+        """Recompute magnitude thresholds for sparsity masking (call once per epoch)."""
+        if not self._sparse_enabled:
+            return
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                flat = torch.abs(param.data).view(-1)
+                k = max(int(self.sparse_ratio * flat.size(0)), 1)
+                self._sparse_thresholds[name] = torch.kthvalue(flat, k)[0]
+
+    def _recompute_step_masks(self):
+        """Cache boolean masks on CPU for current step (before perturbations).
+
+        Masks must reflect pre-perturbation parameter magnitudes and are reused
+        across 4 passes (3 perturbation + 1 update).  Storing them on CPU
+        avoids ~8 GB GPU overhead for 8B-param models; each mask is transferred
+        to GPU on-the-fly in _mask_z() (a few MB per parameter, negligible).
+        """
+        self._sparse_masks.clear()
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self._sparse_thresholds:
+                self._sparse_masks[name] = (
+                    torch.abs(param.data) >= self._sparse_thresholds[name]
+                ).cpu()
+
+    def _mask_z(self, name, z):
+        """Apply cached sparse mask to z tensor (CPU→GPU transfer per param)."""
+        mask = self._sparse_masks.get(name)
+        if mask is not None:
+            return z * mask.to(device=z.device, non_blocking=True)
+        return z
+
     @torch.inference_mode
     def zo_perturb_parameters(self, module: nn.Module, scaling_factor: float=1):
         """
@@ -101,9 +143,11 @@ class MeZOSGD(BaseOptimizer):
             module (nn.Module): Module whose parameters will be perturbed.
             scaling_factor (float): Scaling factor for the noise applied to the parameters.
         """
-        for _, param in module.named_parameters():
+        for name, param in module.named_parameters():
             if param.requires_grad:
                 z = self._generate_z(param)
+                if self._sparse_enabled:
+                    z = self._mask_z(name, z)
                 if self.use_fma:
                     param.data.add_(z, alpha=float(scaling_factor * self.zo_eps))
                 else:
@@ -121,6 +165,8 @@ class MeZOSGD(BaseOptimizer):
         for name, param in module.named_parameters():
             if param.requires_grad:
                 z = self._generate_z(param)
+                if self._sparse_enabled:
+                    z = self._mask_z(name, z)
                 if self.use_fma:
                     wd = weight_decay if weight_decay is not None else (
                         self.weight_decay if all(x not in name for x in ["bias", "layer_norm", "layernorm", "ln"]) else 0.0
@@ -245,7 +291,9 @@ class MeZOSGD(BaseOptimizer):
             zo_random_seed (int, optional): Random seed for reproducibility of perturbations.
         """
         self._update_lr()
-        self.zo_random_seed = zo_random_seed if zo_random_seed else np.random.randint(self.max_zo_random_seed)
+        self.zo_random_seed = zo_random_seed if zo_random_seed else self._zo_seed_rng.randint(self.max_zo_random_seed)
+        if self._sparse_enabled:
+            self._recompute_step_masks()
         self._reset_rng(self.zo_random_seed)
         self.zo_perturb_parameters(self.model, scaling_factor=self.zo_perturb_shifts()[0])
         self._log_rng_diag("before_loss1")
